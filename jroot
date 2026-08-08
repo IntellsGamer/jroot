@@ -116,6 +116,7 @@ list_images() {
     printf '%bSupported images:%b\n' "$C_CYA" "$C_NC"
     printf '  %bubuntu:<version>%b  - Ubuntu Linux versions:\n' "$C_GRN" "$C_NC"
     printf '    16.04, 18.04, 20.04, 22.04, 23.04, 23.10, 24.04, 24.10, 25.04, 25.10, 26.04, 26.10\n'
+    printf '\n'
     printf '  %balpine:<version>%b  - Alpine Linux versions:\n' "$C_GRN" "$C_NC"
     printf '    3.18, 3.19, 3.20, 3.21, 3.22, edge\n'
     printf '\n'
@@ -935,6 +936,26 @@ PS1="\[\033[01;32m\]\$(get_prompt_username)@\$(cat /etc/jailname 2>/dev/null || 
 EOF
     chmod 644 "$rootfs/root/.bashrc" 2>/dev/null || true
 
+    # Alpine's /root/.profile doesn't source .bashrc by default. Fix that.
+    cat > "$rootfs/root/.profile" << 'EOF'
+# ~/.profile: executed by Bourne-compatible login shells.
+if [ -n "$BASH" ] && [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+EOF
+    chmod 644 "$rootfs/root/.profile" 2>/dev/null || true
+
+    # Also set up .profile for /home/jail if it exists (unroot mode)
+    if [ -d "$rootfs/home/jail" ]; then
+        cat > "$rootfs/home/jail/.profile" << 'EOF'
+# ~/.profile: executed by Bourne-compatible login shells.
+if [ -n "$BASH" ] && [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+EOF
+        chmod 644 "$rootfs/home/jail/.profile" 2>/dev/null || true
+    fi
+
     # Present the jail by its own name, not the host's hostname.
     printf '%s\n' "$name" > "$rootfs/etc/jailname" 2>/dev/null || true
     printf '%s\n' "$name" > "$rootfs/etc/hostname" 2>/dev/null || true
@@ -1520,7 +1541,9 @@ setup_unroot_user() {
         mkdir -p /home/jail 2>/dev/null || true
         chown $host_uid:$host_gid /home/jail 2>/dev/null || true
         cp -f /root/.bashrc /home/jail/.bashrc 2>/dev/null || true
+        cp -f /root/.profile /home/jail/.profile 2>/dev/null || true
         chown $host_uid:$host_gid /home/jail/.bashrc 2>/dev/null || true
+        chown $host_uid:$host_gid /home/jail/.profile 2>/dev/null || true
         passwd -l root 2>/dev/null || true
         echo UNROOT-READY
     " || warn "Could not create non-root user in '$name'."
@@ -1544,6 +1567,14 @@ setup_unroot_alpine() {
         cp -f /root/.bashrc /home/jail/.bashrc 2>/dev/null || true
         chown $host_uid:$host_gid /home/jail/.profile 2>/dev/null || true
         chown $host_uid:$host_gid /home/jail/.bashrc 2>/dev/null || true
+        # Also ensure /home/jail/.profile sources .bashrc
+        cat > /home/jail/.profile << 'EOFPROFILE'
+# ~/.profile: executed by Bourne-compatible login shells.
+if [ -n \"\$BASH\" ] && [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+EOFPROFILE
+        chown $host_uid:$host_gid /home/jail/.profile 2>/dev/null || true
         # Lock root (Alpine uses /etc/shadow)
         passwd -l root 2>/dev/null || true
         echo UNROOT-READY
