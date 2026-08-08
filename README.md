@@ -5,7 +5,8 @@
 > **Run Ubuntu. Install packages. Get a root-like environment.**
 >
 > **The host stays unprivileged.**
-> *Root is not real and some capacities may be limited from kernel directly.
+> 
+> *While JRoot provides access to sudo inside a semi-container, the root is not real and some capacities may be limited from kernel directly.
 
 [![Rootless](https://img.shields.io/badge/ROOTLESS-100%25-2ea44f?style=for-the-badge)](#)
 [![PRoot](https://img.shields.io/badge/POWERED%20BY-PROOT-6f42c1?style=for-the-badge)](#)
