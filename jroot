@@ -83,6 +83,8 @@ case "$ARCH" in
 esac
 
 UBUNTU_VERSIONS="16.04:xenial 18.04:bionic 20.04:focal 22.04:jammy 23.04:lunar 23.10:mantic 24.04:noble 24.10:oracular 25.04:plucky 25.10:questing 26.04:resolute 26.10:stonking"
+ALPINE_VERSIONS="3.18 3.19 3.20 3.21 3.22 edge"
+SUPPORTED_IMAGES="ubuntu alpine"
 
 version_to_codename() {
     local v c
@@ -100,6 +102,26 @@ codename_to_version() {
         [ "$c" = "$1" ] && { echo "$v"; return 0; }
     done
     return 1
+}
+
+alpine_version_exists() {
+    local ver
+    for ver in $ALPINE_VERSIONS; do
+        [ "$ver" = "$1" ] && return 0
+    done
+    return 1
+}
+
+list_images() {
+    printf '%bSupported images:%b\n' "$C_CYA" "$C_NC"
+    printf '  %bubuntu:<version>%b  - Ubuntu Linux versions:\n' "$C_GRN" "$C_NC"
+    printf '    16.04, 18.04, 20.04, 22.04, 23.04, 23.10, 24.04, 24.10, 25.04, 25.10, 26.04, 26.10\n'
+    printf '  %balpine:<version>%b  - Alpine Linux versions:\n' "$C_GRN" "$C_NC"
+    printf '    3.18, 3.19, 3.20, 3.21, 3.22, edge\n'
+    printf '\n'
+    printf '%bExamples:%b\n' "$C_CYA" "$C_NC"
+    printf '  %bjroot init ubuntu:22.04%b\n' "$C_GRN" "$C_NC"
+    printf '  %bjroot init alpine:3.20%b\n' "$C_GRN" "$C_NC"
 }
 
 ask() {
@@ -722,6 +744,72 @@ get_ubuntu() {
     log "Rootfs extracted to $rootfs"
 }
 
+get_alpine() {
+    local name="$1" version="$2"
+    local rootfs="$ROOTS_DIR/$name"
+
+    if [ -f "$rootfs/etc/os-release" ] && [ -f "$rootfs/bin/sh" ]; then
+        log "Rootfs already present for '$name'"
+        return
+    fi
+    if [ -d "$rootfs" ]; then
+        warn "Incomplete rootfs found for '$name', removing and re-downloading..."
+        rm -rf "$rootfs"
+    fi
+    mkdir -p "$rootfs"
+
+    local alpine_arch
+    case "$ROOTFS_ARCH" in
+        amd64)  alpine_arch="x86_64" ;;
+        arm64)  alpine_arch="aarch64" ;;
+        *)      err "Unsupported Alpine arch: $ROOTFS_ARCH" ;;
+    esac
+
+    if [ "$version" = "edge" ]; then
+        local url="https://dl-cdn.alpinelinux.org/alpine/edge/releases/${alpine_arch}/alpine-minirootfs-${version}-${alpine_arch}.tar.gz"
+        local tarball="$CACHE_DIR/alpine-${version}-${alpine_arch}.tar.gz"
+        if [ ! -f "$tarball" ]; then
+            log "Downloading Alpine edge rootfs..."
+            curl -fsSL --connect-timeout 15 -o "$tarball" "$url" \
+                || err "Failed to download Alpine edge rootfs"
+        fi
+        log "Extracting rootfs..."
+        tar -xzf "$tarball" -C "$rootfs"
+    else
+        # Alpine tarballs include patch version (e.g., 3.20.3, 3.20.8, 3.20.9)
+        # Try to discover the latest patch version by listing the directory
+        local base_url="https://dl-cdn.alpinelinux.org/alpine/v${version}/releases/${alpine_arch}/"
+        local tarball_name
+        tarball_name="$(curl -fsSL --connect-timeout 15 "$base_url" 2>/dev/null \
+            | grep -oE "alpine-minirootfs-${version}\.[0-9]+-${alpine_arch}\.tar\.gz" \
+            | sort -Vu | tail -n1 || true)"
+        
+        if [ -z "$tarball_name" ]; then
+            # Fallback: try common patch versions
+            for patch in 9 8 7 6 5 4 3 2 1 0; do
+                if curl -fsSI --connect-timeout 10 "${base_url}alpine-minirootfs-${version}.${patch}-${alpine_arch}.tar.gz" >/dev/null 2>&1; then
+                    tarball_name="alpine-minirootfs-${version}.${patch}-${alpine_arch}.tar.gz"
+                    break
+                fi
+            done
+        fi
+        
+        [ -n "$tarball_name" ] || err "Failed to find a minirootfs tarball for Alpine ${version} (${alpine_arch})"
+        
+        local url="${base_url}${tarball_name}"
+        local tarball="$CACHE_DIR/${tarball_name}"
+        if [ ! -f "$tarball" ]; then
+            log "Downloading Alpine ${version} rootfs: ${tarball_name}..."
+            curl -fsSL --connect-timeout 15 -o "$tarball" "$url" \
+                || err "Failed to download Alpine ${version} rootfs"
+        fi
+        log "Extracting rootfs..."
+        tar -xzf "$tarball" -C "$rootfs"
+    fi
+    [ -f "$rootfs/bin/sh" ] || err "Rootfs extraction failed - /bin/sh not found"
+    log "Rootfs extracted to $rootfs"
+}
+
 # ---------------------------------------------------------------------------
 # apt config: HTTPS repos (port 80 often blocked) + proot-safe dpkg/apt
 # ---------------------------------------------------------------------------
@@ -788,6 +876,36 @@ EOF
     if [ -d /etc/ca-certificates ]; then
         cp -r /etc/ca-certificates "$rootfs/etc/" 2>/dev/null || true
     fi
+    cp /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
+
+    local hostname
+    hostname="$(hostname 2>/dev/null || echo localhost)"
+    cat > "$rootfs/etc/hosts" << EOF
+127.0.0.1 localhost
+127.0.1.1 ${hostname}
+::1 localhost ip6-localhost ip6-loopback
+EOF
+}
+
+config_apk() {
+    local name="$1" version="$2"
+    local rootfs="$ROOTS_DIR/$name"
+
+    mkdir -p "$rootfs/etc/apk"
+    
+    if [ "$version" = "edge" ]; then
+        cat > "$rootfs/etc/apk/repositories" << EOF
+https://dl-cdn.alpinelinux.org/alpine/edge/main
+https://dl-cdn.alpinelinux.org/alpine/edge/community
+https://dl-cdn.alpinelinux.org/alpine/edge/testing
+EOF
+    else
+        cat > "$rootfs/etc/apk/repositories" << EOF
+https://dl-cdn.alpinelinux.org/alpine/v${version}/main
+https://dl-cdn.alpinelinux.org/alpine/v${version}/community
+EOF
+    fi
+
     cp /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
 
     local hostname
@@ -1246,7 +1364,7 @@ run_in_jail() {
 # ---------------------------------------------------------------------------
 # Bootstrap: apt update + core packages + node + /run layout
 # ---------------------------------------------------------------------------
-bootstrap() {
+bootstrap_ubuntu() {
     local name="$1" codename="$2"
     local cfg="$CONFIGS_DIR/$name.json"
     local build_essential extras extra_py
@@ -1302,17 +1420,72 @@ bootstrap() {
     "
 }
 
+bootstrap_alpine() {
+    local name="$1" version="$2"
+    local cfg="$CONFIGS_DIR/$name.json"
+    local build_essential
+    build_essential="$(config_field "$cfg" build_essential)"
+
+    log "Installing core packages inside '$name' (first run, several minutes)..."
+    run_in_jail --root "$name" /bin/sh -c "
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        apk update
+        apk add --no-cache \\
+            sudo curl wget vim nano less \\
+            bash bash-completion htop tmux openssh-client rsync tree unzip zip \\
+            python3 py3-pip man-db \\
+            net-tools bind-tools iputils file \\
+            xz
+        if [ \"$build_essential\" = \"1\" ]; then
+            apk add --no-cache build-base gcc g++ make
+        fi
+        # Install node (x86_64 only for now)
+        case \"$ARCH\" in
+            x86_64)
+                wget -q --timeout=30 --tries=3 https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz \\
+                    && tar -xJf node-v22.23.2-linux-x64.tar.xz --strip-components=1 -C /usr/local \\
+                    && rm node-v22.23.2-linux-x64.tar.xz \\
+                    || echo 'node-install-skipped'
+                ;;
+            *) echo 'node-install-skipped' ;;
+        esac
+        # Create /run for compatibility
+        mkdir -p /run /run/systemd /run/user /run/lock
+        chmod 755 /run /run/systemd /run/user /run/lock
+        echo BOOTSTRAP-DONE
+    "
+}
+
+bootstrap() {
+    local name="$1" distro="$2" version="$3"
+    if [ "$distro" = "ubuntu" ]; then
+        bootstrap_ubuntu "$name" "$version"
+    elif [ "$distro" = "alpine" ]; then
+        bootstrap_alpine "$name" "$version"
+    else
+        err "Unknown distro: $distro"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Post-init verification: run inside the jail and print what actually works
 # ---------------------------------------------------------------------------
 verify_jail() {
     local name="$1" out line
     log "Verifying jail '$name' works..."
+    # Detect package manager based on os-release
+    local pkg_cmd="dpkg -l 2>/dev/null | grep -c \"^ii\" | sed \"s/^/packages=/\""
     out="$(run_in_jail "$name" /bin/sh -c '
         whoami 2>/dev/null | sed "s/^/user=/"
         . /etc/os-release 2>/dev/null && printf "os=%s\n" "$PRETTY_NAME"
         uname -m 2>/dev/null | sed "s/^/arch=/"
-        dpkg -l 2>/dev/null | grep -c "^ii" | sed "s/^/packages=/"
+        if command -v dpkg >/dev/null 2>&1; then
+            dpkg -l 2>/dev/null | grep -c "^ii" | sed "s/^/packages=/"
+        elif command -v apk >/dev/null 2>&1; then
+            apk info 2>/dev/null | wc -l | sed "s/^/packages=/"
+        else
+            echo "packages=unknown"
+        fi
         python3 --version 2>/dev/null | sed "s/^Python //; s/^/python3=/"
         node --version 2>/dev/null | sed "s/^/node=/" || echo "node=not installed"
         gcc --version 2>/dev/null | head -n1 | sed "s/^/gcc=/" || echo "gcc=not installed"
@@ -1356,41 +1529,83 @@ setup_unroot_user() {
     log "Admin: 'jroot enter $name --root <cmd>' or 'jroot update $name' for root."
 }
 
+setup_unroot_alpine() {
+    local name="$1"
+    local host_uid host_gid
+    host_uid="$(id -u)"; host_gid="$(id -g)"
+    log "Setting up non-root user for '$name' (uid $host_uid, root gets locked)..."
+    run_in_jail --root "$name" /bin/sh -c "
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        # Alpine uses adduser (busybox or shadow)
+        adduser -D -u $host_uid -s /bin/bash jail 2>/dev/null || true
+        mkdir -p /home/jail 2>/dev/null || true
+        chown $host_uid:$host_gid /home/jail 2>/dev/null || true
+        cp -f /root/.profile /home/jail/.profile 2>/dev/null || true
+        cp -f /root/.bashrc /home/jail/.bashrc 2>/dev/null || true
+        chown $host_uid:$host_gid /home/jail/.profile 2>/dev/null || true
+        chown $host_uid:$host_gid /home/jail/.bashrc 2>/dev/null || true
+        # Lock root (Alpine uses /etc/shadow)
+        passwd -l root 2>/dev/null || true
+        echo UNROOT-READY
+    " || warn "Could not create non-root user in '$name'."
+
+    log "Non-root user 'jail' ready. 'jroot enter $name' now logs in as 'jail'."
+    log "Admin: 'jroot enter $name --root <cmd>' or 'jroot update $name' for root."
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 cmd_init() {
-    local image="" repo tag version codename name user_mode response
+    local image="" repo tag version codename name user_mode response distro=""
     local mount_host=0 mount_home=0 build_essential=1
     local cli_name="" cli_user="" cli_be="" cli_mh="" cli_mhomedir=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
+            --list|list|-l)         list_images; return 0 ;;
             --name=*)               cli_name="${1#*=}" ;;
             --user=*)               cli_user="${1#*=}" ;;
             --build-essential=*)    cli_be="${1#*=}" ;;
             --mount-host=*)         cli_mh="${1#*=}" ;;
             --mount-home=*)         cli_mhomedir="${1#*=}" ;;
-            -h|--help)              err "Usage: jroot init <image> [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1]" ;;
+            -h|--help)              err "Usage: jroot init <image> [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1]\n       jroot init --list  (show available images)" ;;
             *)                      [ -z "$image" ] && image="$1" || err "Unexpected argument: $1" ;;
         esac
         shift
     done
-    [ -n "$image" ] || err "Usage: jroot init <image>"
+    [ -n "$image" ] || err "Usage: jroot init <image>\n       jroot init --list  (show available images)"
 
     repo="${image%%:*}"
     tag="${image#*:}"
-    [ "$repo" = "ubuntu" ] || err "jroot currently only supports ubuntu images (e.g. ubuntu:22.04)"
     [ -n "$tag" ] || tag="latest"
 
-    if version="$(codename_to_version "$tag")"; then
-        codename="$tag"
-    elif codename="$(version_to_codename "$tag")"; then
-        version="$tag"
-    elif [ "$tag" = "latest" ]; then
-        version="24.04"; codename="noble"
-    else
-        err "Unknown Ubuntu version '$tag'. Supported: $UBUNTU_VERSIONS"
+    # Determine distro
+    case "$repo" in
+        ubuntu) distro="ubuntu" ;;
+        alpine) distro="alpine" ;;
+        *) err "Unsupported image '$repo'. Run 'jroot init --list' for supported images." ;;
+    esac
+
+    # Version parsing
+    if [ "$distro" = "ubuntu" ]; then
+        if version="$(codename_to_version "$tag")"; then
+            codename="$tag"
+        elif codename="$(version_to_codename "$tag")"; then
+            version="$tag"
+        elif [ "$tag" = "latest" ]; then
+            version="24.04"; codename="noble"
+        else
+            err "Unknown Ubuntu version '$tag'. Run 'jroot init --list' for supported versions."
+        fi
+    elif [ "$distro" = "alpine" ]; then
+        if [ "$tag" = "latest" ]; then
+            version="3.21"
+        elif alpine_version_exists "$tag"; then
+            version="$tag"
+        else
+            err "Unknown Alpine version '$tag'. Run 'jroot init --list' for supported versions."
+        fi
     fi
 
     local default_name
@@ -1451,25 +1666,34 @@ cmd_init() {
 
     ensure_runtime
     install_proot
-    get_ubuntu "$name" "$version"
-    config_apt "$name" "$codename"
+
+    if [ "$distro" = "ubuntu" ]; then
+        get_ubuntu "$name" "$version"
+        config_apt "$name" "$codename"
+        write_sudoers "$name"
+    elif [ "$distro" = "alpine" ]; then
+        get_alpine "$name" "$version"
+        config_apk "$name" "$version"
+    fi
+
     write_rootfs_niceties "$name"
-    write_sudoers "$name"
     write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
 
     local bootstrapped=1
     if [ "${JROOT_SKIP_APT:-}" = "1" ] || [ "${JROOT_SKIP_BOOTSTRAP:-}" = "1" ]; then
-        warn "Skipping apt bootstrap (env JROOT_SKIP_APT/JROOT_SKIP_BOOTSTRAP)."
+        warn "Skipping bootstrap (env JROOT_SKIP_APT/JROOT_SKIP_BOOTSTRAP)."
         bootstrapped=0
-    elif bootstrap "$name" "$codename"; then
+    elif bootstrap "$name" "$distro" "$version"; then
         log "Core packages installed."
     else
         warn "Bootstrap exited non-zero - finishing configures may still be needed."
         bootstrapped=0
     fi
 
-    if [ "$user_mode" = "unroot" ]; then
+    if [ "$user_mode" = "unroot" ] && [ "$distro" = "ubuntu" ]; then
         setup_unroot_user "$name"
+    elif [ "$user_mode" = "unroot" ] && [ "$distro" = "alpine" ]; then
+        setup_unroot_alpine "$name"
     fi
 
     log ""
@@ -1689,39 +1913,68 @@ cmd_install() {
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
     [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
 
+    local image_tag distro
+    image_tag="$(config_field "$CONFIGS_DIR/$name.json" image)"
+    distro="${image_tag%%:*}"
+
     local user_mode
     user_mode="$(config_field "$CONFIGS_DIR/$name.json" user)"; [ -n "$user_mode" ] || user_mode="root"
 
     # For unroot jails, we need to temporarily unlock root before install, then lock it again after
     if [ "$user_mode" = "unroot" ]; then
         log "Unroot jail detected. Temporarily unlocking root for install..."
+        if [ "$distro" = "ubuntu" ]; then
+            run_in_jail --root "$name" /bin/sh -c "
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+                export DEBIAN_FRONTEND=noninteractive
+                dpkg --configure -a 2>/dev/null || true
+                apt-get update || true
+                sed -i 's/^root:!:/root:*/' /etc/shadow 2>/dev/null || true
+            " || warn "Failed to unlock root for install."
+        elif [ "$distro" = "alpine" ]; then
+            run_in_jail --root "$name" /bin/sh -c "
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+                apk update
+                passwd -u root 2>/dev/null || true
+            " || warn "Failed to unlock root for install."
+        fi
+    fi
+
+    log "Installing in '$name': $*"
+    if [ "$distro" = "ubuntu" ]; then
+        write_policy_rcd "$name"
         run_in_jail --root "$name" /bin/sh -c "
             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
             export DEBIAN_FRONTEND=noninteractive
             dpkg --configure -a 2>/dev/null || true
             apt-get update || true
-            sed -i 's/^root:!:/root:*/' /etc/shadow 2>/dev/null || true
-        " || warn "Failed to unlock root for install."
+            apt-get install -y --allow-unauthenticated $*
+        " || { warn "Install failed inside '$name'."; return 1; }
+    elif [ "$distro" = "alpine" ]; then
+        run_in_jail --root "$name" /bin/sh -c "
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+            apk update
+            apk add --no-cache $*
+        " || { warn "Install failed inside '$name'."; return 1; }
+    else
+        err "Unknown distro: $distro"
     fi
-
-    log "Installing in '$name': $*"
-    write_policy_rcd "$name"
-    run_in_jail --root "$name" /bin/sh -c "
-        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
-        export DEBIAN_FRONTEND=noninteractive
-        dpkg --configure -a 2>/dev/null || true
-        apt-get update || true
-        apt-get install -y --allow-unauthenticated $*
-    " || { warn "Install failed inside '$name'."; return 1; }
     log "Installed in '$name': $*"
 
     # For unroot jails, lock root again after install
     if [ "$user_mode" = "unroot" ]; then
         log "Locking root again for unroot jail..."
-        run_in_jail --root "$name" /bin/sh -c "
-            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
-            passwd -l root 2>/dev/null || true
-        " || warn "Failed to lock root after install."
+        if [ "$distro" = "ubuntu" ]; then
+            run_in_jail --root "$name" /bin/sh -c "
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+                passwd -l root 2>/dev/null || true
+            " || warn "Failed to lock root after install."
+        elif [ "$distro" = "alpine" ]; then
+            run_in_jail --root "$name" /bin/sh -c "
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+                passwd -l root 2>/dev/null || true
+            " || warn "Failed to lock root after install."
+        fi
     fi
 }
 
@@ -2052,25 +2305,48 @@ cmd_update() {
 
     if [ -n "$name" ]; then
         [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
-        local codename image_tag
+        local image_tag distro version
         image_tag="$(config_field "$CONFIGS_DIR/$name.json" image)"
-        image_tag="${image_tag#*:}"
-        codename="$(version_to_codename "$image_tag" 2>/dev/null || true)"
-        [ -n "$codename" ] || codename="noble"
-        log "Refreshing apt config for '$name'..."
-        config_apt "$name" "$codename"
-        write_sudoers "$name"
+        distro="${image_tag%%:*}"
+        version="${image_tag#*:}"
+        
         write_rootfs_niceties "$name"
-        log "Updating packages inside '$name' (apt-get update && upgrade)..."
-        run_in_jail --root "$name" /bin/sh -c "
-            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-            export DEBIAN_FRONTEND=noninteractive
-            dpkg --configure -a 2>/dev/null || true
-            apt-get update || true
-            apt-get upgrade -y --allow-unauthenticated || true
-        " || { warn "Package upgrade inside '$name' failed (network?)."; return 1; }
+        
+        # Update based on distro
+        if [ "$distro" = "ubuntu" ]; then
+            local codename
+            codename="$(version_to_codename "$version" 2>/dev/null || true)"
+            [ -n "$codename" ] || codename="noble"
+            log "Refreshing apt config for '$name'..."
+            config_apt "$name" "$codename"
+            write_sudoers "$name"
+            log "Updating packages inside '$name' (apt-get update && upgrade)..."
+            run_in_jail --root "$name" /bin/sh -c "
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                export DEBIAN_FRONTEND=noninteractive
+                dpkg --configure -a 2>/dev/null || true
+                apt-get update || true
+                apt-get upgrade -y --allow-unauthenticated || true
+            " || { warn "Package upgrade inside '$name' failed (network?)."; return 1; }
+        elif [ "$distro" = "alpine" ]; then
+            log "Refreshing apk config for '$name'..."
+            config_apk "$name" "$version"
+            log "Updating packages inside '$name' (apk update && upgrade)..."
+            run_in_jail --root "$name" /bin/sh -c "
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                apk update
+                apk upgrade --no-cache
+            " || { warn "Package upgrade inside '$name' failed (network?)."; return 1; }
+        else
+            err "Unknown distro: $distro"
+        fi
+        
         if [ "$(config_field "$CONFIGS_DIR/$name.json" user)" = "unroot" ]; then
-            setup_unroot_user "$name"
+            if [ "$distro" = "ubuntu" ]; then
+                setup_unroot_user "$name"
+            elif [ "$distro" = "alpine" ]; then
+                setup_unroot_alpine "$name"
+            fi
         fi
         log "Jail '$name' is up to date."
         return 0
@@ -2255,15 +2531,19 @@ cmd_help_cmd() {
     local cmd="$1"; shift
     case "$cmd" in
         init)
-            printf '%bjroot init%b - create a jail from an Ubuntu image\n\n' "$H" "$N"
+            printf '%bjroot init%b - create a jail from an Ubuntu or Alpine image\n\n' "$H" "$N"
             printf '    %bjroot init <image> [--name=<n>] [flags]%b\n' "$G" "$N"
-            help_row "image" "ubuntu:22.04|20.04|24.04|24.10" "Ubuntu release to use"
+            printf '    %bjroot init --list%b\n' "$G" "$N"
+            help_row "image" "ubuntu:22.04|20.04|24.04|24.10|alpine:3.20|3.21|3.22|edge" "Linux distribution to use"
+            help_row "--list" "" "Show all supported images and versions"
             help_row "--name=<n>" "" "Jail name (default: derived from image)"
             help_row "--user=root|unroot" "" "root=fake root, unroot=non-root jail user"
             help_row "--build-essential=0/1" "" "Install gcc/g++/make (default 1)"
             help_row "--mount-host=0/1" "" "Bind host / to /mnt/host (default 0)"
             help_row "--mount-home=0/1" "" "Bind host \$HOME to /mnt/home (default 0)"
             printf '\n    %bExample:%b jroot init ubuntu:22.04 --name=dev --user=unroot\n' "$G" "$N"
+            printf '    %bExample:%b jroot init alpine:3.20 --name=alpine-dev\n' "$G" "$N"
+            printf '    %bExample:%b jroot init --list\n' "$G" "$N"
             ;;
         enter)
             printf '%bjroot enter%b - open a shell, or run a command, inside a jail\n\n' "$H" "$N"
@@ -2403,6 +2683,7 @@ cmd_help() {
 
     printf '%bCREATE & USE%b\n' "$H" "$N"
     help_row "jroot init" "<image> [flags]"        "Create a jail (see FLAGS below)"
+    help_row "jroot init" "--list"                 "List available images"
     help_row "jroot enter" "<name>"                "Open a shell inside a jail"
     help_row "jroot shell" ""                      "Interactive jroot command shell (jroot> prompt)"
     help_row "jroot enter" "<name> <cmd...>"       "Run one command inside a jail"
@@ -2412,7 +2693,7 @@ cmd_help() {
     printf '                                      %b (prefix jail paths with %b:%b, e.g. %b:/root/file%b)\n' "$B" "$G" "$N" "$G" "$N"
     help_row "jroot port" "list|add|rm <name>"    "Control which jailed ports may bind publicly"
     help_row "jroot mnt" "<name> <label> <dir>"   "Bind-mount a host directory at /mnt/<label>"
-    help_row "jroot install" "<name> <pkg...>"     "Install packages inside a jail (apt)"
+    help_row "jroot install" "<name> <pkg...>"     "Install packages inside a jail (apt/apk)"
     help_row "jroot config" "<name>"               "View or change a jail's settings"
     help_row "jroot list" "[--json]"               "List all jails (JSON with --json)"
     help_row "jroot info" "[name]"                 "Show a jail's details and disk usage"
@@ -2436,6 +2717,7 @@ cmd_help() {
     printf '\n'
 
     printf '%bFLAGS for init%b\n' "$H" "$N"
+    help_row "--list" ""                  "List available images (ubuntu & alpine versions)"
     help_row "--name=<n>" ""              "Jail name (default: derived from the image)"
     help_row "--user=root|unroot" ""      "root = fake root (default). unroot = daily use"
     printf '                                      %b as the non-root user %bjail%b, root locked;\n' "$B" "$H" "$N"
@@ -2445,6 +2727,12 @@ cmd_help() {
     help_row "--mount-home=0/1" ""        "Bind host \$HOME to /mnt/home (default 0)"
     printf '\n'
 
+    printf '%bSUPPORTED IMAGES%b\n' "$H" "$N"
+    printf '    %bubuntu%b  <version>  Ubuntu versions: 16.04, 18.04, 20.04, 22.04, 24.04, etc.\n' "$G" "$N"
+    printf '    %balpine%b  <version>  Alpine versions: 3.18, 3.19, 3.20, 3.21, 3.22, edge\n' "$G" "$N"
+    printf '    Run %bjroot init --list%b for the full list.\n' "$G" "$N"
+    printf '\n'
+
     printf '%bSTORAGE (under ~/.jroot)%b\n' "$H" "$N"
     help_row "roots/<name>" ""              "rootfs"
     help_row "configs/<name>.json" ""       "jail config"
@@ -2452,12 +2740,11 @@ cmd_help() {
     printf '\n'
 
     printf '%bEXAMPLES%b\n' "$H" "$N"
-    printf '    %b$%b %s\n' "$G" "$N" "jroot init ubuntu:22.04"
-    printf '    %b$%b %s\n' "$G" "$N" "jroot enter dev apt-get --version"
-    printf '    %b$%b %s\n' "$G" "$N" "jroot install dev git curl"
-    printf '    %b$%b %s\n' "$G" "$N" "jroot snapshot dev before-upgrade"
-    printf '    %b$%b %s\n' "$G" "$N" "jroot revert dev before-upgrade"
-    printf '    %b$%b %s\n' "$G" "$N" "jroot list --json"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot init ubuntu:22.04 --name=dev --user=unroot"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot init alpine:3.20 --name=alpine-dev"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot init --list"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot enter dev apk add htop  # for Alpine"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot enter dev apt-get install htop  # for Ubuntu"
 }
 
 jroot_cmd() {
