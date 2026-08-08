@@ -1,0 +1,2518 @@
+#!/usr/bin/env bash
+# =============================================================================
+# jroot - Rootless Linux jails via proot (no root on the host required)
+#
+# Migrated from fakeroot3.sh. Commands:
+#   jroot init <image> [flags]  Create a jail (--name/--user/--build-essential/
+#                               --mount-host/--mount-home skip those prompts)
+#   jroot enter <name> [cmd...] Enter a jail / run a command (name required)
+#   jroot install <name> <pkg...>  apt-get install as root inside a jail
+#   jroot config <name>         Show / change a jail's settings
+#   jroot list [--json]         List all jails (machine-readable with --json)
+#   jroot info [name]           Show a jail's details and rootfs size
+#   jroot update [name]         Update runtime + jail packages (all if no name)
+#   jroot snapshot <name> [label]  Save rootfs + config (tar.gz)
+#   jroot snapshots <name>      List snapshots for a jail
+#   jroot revert <name> [label] Restore a jail to a snapshot
+#   jroot rm-snapshot <name> <label>  Delete a snapshot
+#   jroot doctor                Check the installation for problems
+#   jroot rm <name>             Delete a jail and its config
+#   jroot help                  Show this help
+#
+# Everything lives under ~/.jroot and works without host root:
+#   proot   -> fake rootfs/root, no chroot, no mount, no cgroups needed
+#   apt     -> HTTPS mirrors (port 80 often blocked), trusted=yes + gpgv shim
+#   seccomp -> python3 filter blocks the openat2 proot escape (syscall 437)
+#
+# Per-jail options (set at init, changeable via `jroot config`):
+#   user            root (fake root via proot -0) or unroot (installs as root,
+#                   then daily enter is the non-root user 'jail', root locked)
+#   build_essential install gcc/g++/make during bootstrap
+#   mount_host      bind host / to /mnt/host inside the jail
+#   mount_home      bind host $HOME to /mnt/home inside the jail
+#
+# Env (optional):
+#   JROOT_HOME=path        Override storage root (default $HOME/.jroot)
+#   JROOT_SKIP_APT=1       Skip the apt bootstrap during init
+#   JROOT_SKIP_BOOTSTRAP=1 Same as above
+#   NONINTERACTIVE=1       Use all prompt defaults
+#   SKIP_BUILD_ESSENTIAL=1 Skip build-essential      (0 = install)
+#   MOUNT_HOST=1/0         Enable/disable host / mount
+#   MOUNT_HOME=1/0         Enable/disable home mount
+# =============================================================================
+set -e
+
+# Command prefix shown in error hints / help ("jroot " normally; empty inside
+# the interactive "jroot shell" so hints read "run 'help'" instead).
+CMD_HINT="jroot "
+
+C_RED='\033[1;31m'; C_GRN='\033[1;32m'; C_YEL='\033[1;33m'; C_NC='\033[0m'
+C_CYA='\033[1;36m'; C_BLU='\033[1;34m'; C_BLD='\033[1m'; C_DIM='\033[2m'
+log()  { echo -e "${C_GRN}[+]${C_NC} $1"; }
+warn() { echo -e "${C_YEL}[!]${C_NC} $1"; }
+err()  { echo -e "${C_RED}[!]${C_NC} $1" >&2; exit 1; }
+
+# Color the help text only when stdout is a terminal (pipes stay plain).
+USE_COLOR=0
+[ -t 1 ] && USE_COLOR=1
+H="$C_CYA"; G="$C_GRN"; B="$C_BLU"; D="$C_DIM"; N="$C_NC"
+[ "$USE_COLOR" = 1 ] || { H=""; G=""; B=""; D=""; N=""; }
+
+JROOT_HOME="${JROOT_HOME:-$HOME/.jroot}"
+ROOTS_DIR="$JROOT_HOME/roots"
+CONFIGS_DIR="$JROOT_HOME/configs"
+SNAPSHOTS_DIR="$JROOT_HOME/snapshots"
+BIN_DIR="$JROOT_HOME/bin"
+CACHE_DIR="$JROOT_HOME/.cache"
+PROOT_BIN="$BIN_DIR/proot"
+SECCOMP_LAUNCHER="$BIN_DIR/seccomp-launcher"
+PROOT_VERSION="5.3.0"
+# Reported kernel release inside jails. Newer than 5.1.0 so glibc-based apps
+# (e.g. code-server) don't die with "FATAL: kernel too old".
+PROOT_KERNEL_RELEASE="${JROOT_KERNEL:-6.8.0}"
+# LD_PRELOAD shim that rewrites bind() so jailed servers are loopback-only by
+# default; ports listed in the jail's config "ports" field are left public.
+PORT_SHIM_SRC="$BIN_DIR/libjroot.c"
+PORT_SHIM="$BIN_DIR/libjroot.so"
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)  ARCH_STR="x86_64"; ROOTFS_ARCH="amd64" ;;
+    aarch64) ARCH_STR="aarch64"; ROOTFS_ARCH="arm64" ;;
+    *)       err "Unsupported architecture: $ARCH" ;;
+esac
+
+UBUNTU_VERSIONS="16.04:xenial 18.04:bionic 20.04:focal 22.04:jammy 23.04:lunar 23.10:mantic 24.04:noble 24.10:oracular 25.04:plucky 25.10:questing 26.04:resolute 26.10:stonking"
+
+version_to_codename() {
+    local v c
+    for pair in $UBUNTU_VERSIONS; do
+        v="${pair%%:*}"; c="${pair##*:}"
+        [ "$v" = "$1" ] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+codename_to_version() {
+    local v c
+    for pair in $UBUNTU_VERSIONS; do
+        v="${pair%%:*}"; c="${pair##*:}"
+        [ "$c" = "$1" ] && { echo "$v"; return 0; }
+    done
+    return 1
+}
+
+ask() {
+    local prompt="$1" default="$2" response
+    if [ -n "${NONINTERACTIVE:-}" ]; then
+        echo "$default"
+        return 0
+    fi
+    printf '%s' "$prompt" >&2
+    read -r response || response="$default"
+    echo "${response:-$default}"
+}
+
+# $1 prompt, $2 default, $3 cli-provided value (used verbatim if non-empty)
+resolve() {
+    if [ -n "$3" ]; then
+        printf '%s' "$3"
+        return 0
+    fi
+    ask "$1" "$2"
+}
+
+json_esc() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# ---------------------------------------------------------------------------
+# Runtime: dirs + seccomp launcher
+# ---------------------------------------------------------------------------
+write_seccomp_launcher() {
+    cat > "$SECCOMP_LAUNCHER" << 'PYEOF'
+#!/usr/bin/env python3
+import ctypes, platform, sys, os
+
+libc = ctypes.CDLL(None, use_errno=True)
+
+PR_SET_NO_NEW_PRIVS = 38
+PR_SET_SECCOMP = 22
+SECCOMP_MODE_FILTER = 2
+
+class sock_filter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
+                ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint)]
+
+class sock_fprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(sock_filter))]
+
+BPF_LD = 0x00; BPF_W = 0x00; BPF_ABS = 0x20
+BPF_JMP = 0x05; BPF_JEQ = 0x10; BPF_JGT = 0x20; BPF_RET = 0x06; BPF_K = 0x00
+BPF_STMT = lambda code, k: sock_filter(code, 0, 0, k)
+BPF_JUMP = lambda code, k, jt, jf: sock_filter(code, jt, jf, k)
+
+SECCOMP_RET_ERRNO = 0x00050000
+SECCOMP_RET_ALLOW = 0x7fff0000
+SECCOMP_RET_KILL_PROCESS = 0x80000000
+
+machine = platform.machine()
+if machine in ("x86_64", "AMD64"):
+    AUDIT_ARCH = 0xC000003E
+elif machine in ("aarch64", "arm64"):
+    AUDIT_ARCH = 0xC00000B7
+else:
+    sys.stderr.write("jroot: unsupported arch for seccomp filter: %s\n" % machine)
+    sys.exit(1)
+
+ENOSYS = 38
+OPENAT2_NR = 437
+RENAMEAT2_NR = 435
+FCHMODAT2_NR = 437
+FACCESSAT2_NR = 439
+NAME_TO_HANDLE_AT_NR = 442
+OFFSET_ARCH = 4
+OFFSET_NR = 0
+
+program = [
+    # idx0: load arch
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
+    # idx1: if arch matches -> idx3, else idx2
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH, 1, 0),
+    # idx2: kill (unexpected arch)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    # idx3: load syscall nr
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
+    # idx4: if nr > 0x3fffffff (x32 ABI) -> idx5, else idx6
+    BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, 0x3fffffff, 0, 1),
+    # idx5: kill (x32 ABI)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    # idx6: if nr == 437 (openat2) -> idx7, else idx8
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, OPENAT2_NR, 0, 1),
+    # idx7: return ENOSYS so callers fall back to openat/open
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx8: allow
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+]
+
+ArrayType = sock_filter * len(program)
+arr = ArrayType(*program)
+prog = sock_fprog()
+prog.len = len(program)
+prog.filter = ctypes.cast(arr, ctypes.POINTER(sock_filter))
+
+if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_NO_NEW_PRIVS")
+if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(prog)) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_SECCOMP")
+
+os.execv(sys.argv[1], sys.argv[1:])
+PYEOF
+    chmod +x "$SECCOMP_LAUNCHER"
+}
+
+ensure_runtime() {
+    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR"
+    if [ ! -x "$SECCOMP_LAUNCHER" ]; then
+        write_seccomp_launcher
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not found on host - jails will enter WITHOUT the openat2 seccomp filter (known proot escape vector). Install python3."
+    fi
+    build_port_shim || true
+}
+
+build_port_shim() {
+    local src="$PORT_SHIM_SRC"
+    if [ -f "$src" ]; then
+        local so_missing=0
+        [ -f "$PORT_SHIM" ] || so_missing=1
+        if [ "$so_missing" = "0" ] && [ "$PORT_SHIM" -nt "$src" ]; then
+            return 0
+        fi
+    fi
+    if ! command -v gcc >/dev/null 2>&1; then
+        warn "gcc not found on host - 'jroot port' (bind() shim) and read-only mounts are unavailable. Install gcc to use it."
+        return 1
+    fi
+    cat > "$src" <<'CEOF'
+#define _GNU_SOURCE
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <dlfcn.h>
+#include <stdarg.h>
+
+typedef int (*bind_fn)(int, const struct sockaddr *, socklen_t);
+
+static bind_fn real_bind = NULL;
+
+static int parse_port(const char *s) {
+    int n = 0;
+    if (!s) return -1;
+    while (*s >= '0' && *s <= '9') {
+        n = n * 10 + (*s - '0');
+        if (n > 65535) return -1;
+        s++;
+    }
+    return *s ? -1 : n;
+}
+
+static int port_is_public(int port) {
+    const char *env = getenv("JROOT_PORTS");
+    if (!env || !*env) return 0;
+    char *dup = strdup(env);
+    char *tok, *save = NULL;
+    int is_public = 0;
+    for (tok = strtok_r(dup, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (parse_port(tok) == port) { is_public = 1; break; }
+    }
+    free(dup);
+    return is_public;
+}
+
+int bind(int fd, const struct sockaddr *addr, socklen_t len) {
+    if (!real_bind) real_bind = (bind_fn)dlsym(RTLD_NEXT, "bind");
+    if (!addr) return real_bind(fd, addr, len);
+
+    if (addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in a = *((struct sockaddr_in *)addr);
+        int port = ntohs(a.sin_port);
+        if (!port_is_public(port)) {
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* force 127.0.0.1 */
+        }
+        return real_bind(fd, (struct sockaddr *)&a, sizeof(a));
+    }
+    if (addr->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
+        struct sockaddr_in6 a = *((struct sockaddr_in6 *)addr);
+        int port = ntohs(a.sin6_port);
+        if (!port_is_public(port)) {
+            memset(&a.sin6_addr, 0, sizeof(a.sin6_addr));
+            a.sin6_addr.s6_addr[15] = 1; /* force ::1 */
+        }
+        return real_bind(fd, (struct sockaddr *)&a, sizeof(a));
+    }
+    return real_bind(fd, addr, len);
+}
+
+/* ---- read-only mounts ------------------------------------------------ */
+
+/* Lexically normalize a path (collapse . and .., no fs access needed). */
+static void norm_path(const char *in, char *out, size_t outsz) {
+    char *copy = strdup(in);
+    char *segs[1024];
+    int n = 0;
+    char *p = copy;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        char *seg = p;
+        while (*p && *p != '/') p++;
+        if (*p) *p++ = 0;
+        int len = (int)strlen(seg);
+        if (len == 1 && seg[0] == '.') continue;
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (n > 0) n--;
+            continue;
+        }
+        if (n < (int)(sizeof(segs) / sizeof(segs[0]))) segs[n++] = seg;
+    }
+    size_t used = 0;
+    if (n == 0) {
+        out[0] = '/';
+        out[1] = 0;
+    } else {
+        int i;
+        for (i = 0; i < n; i++) {
+            size_t sl = strlen(segs[i]);
+            if (used + sl + 2 > outsz) break;
+            out[used++] = '/';
+            memcpy(out + used, segs[i], sl);
+            used += sl;
+        }
+        out[used] = 0;
+    }
+    free(copy);
+}
+
+static int path_is_ro(const char *path) {
+    const char *ro = getenv("JROOT_RO_MOUNTS");
+    if (!ro || !*ro) return 0;
+    char abs[8192];
+    if (path[0] != '/') {
+        char cwd[8192];
+        if (!getcwd(cwd, sizeof(cwd))) return 0;
+        snprintf(abs, sizeof(abs), "%s/%s", cwd, path);
+    } else {
+        snprintf(abs, sizeof(abs), "%s", path);
+    }
+    char norm[8192];
+    norm_path(abs, norm, sizeof(norm));
+    char *dup = strdup(ro);
+    char *tok, *save = NULL;
+    int blocked = 0;
+    for (tok = strtok_r(dup, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        if (!*tok) continue;
+        size_t tl = strlen(tok);
+        if (strncmp(norm, tok, tl) == 0 && (norm[tl] == 0 || norm[tl] == '/')) {
+            blocked = 1;
+            break;
+        }
+    }
+    free(dup);
+    return blocked;
+}
+
+static int want_write(int flags) {
+    return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0;
+}
+
+static int blocked_errno(void) {
+    errno = EROFS;
+    return -1;
+}
+
+/* Resolve a dirfd+path pair to an absolute path (/proc/self/fd for dirfds). */
+static int resolve_at(int dirfd, const char *path, char *out, size_t outsz) {
+    if (path[0] == '/') {
+        snprintf(out, outsz, "%s", path);
+        return 1;
+    }
+    if (dirfd == AT_FDCWD) {
+        char cwd[8192];
+        if (!getcwd(cwd, sizeof(cwd))) return 0;
+        snprintf(out, outsz, "%s/%s", cwd, path);
+        return 1;
+    }
+    char fdpath[64];
+    snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", dirfd);
+    ssize_t l = readlink(fdpath, out, outsz - 1);
+    if (l < 0) return 0;
+    out[l] = 0;
+    size_t bl = strlen(out);
+    if (bl + strlen(path) + 2 > outsz) return 0;
+    out[bl] = '/';
+    strcpy(out + bl + 1, path);
+    return 1;
+}
+
+static int at_is_ro(int dirfd, const char *path) {
+    if (!path || !*path) return 0;
+    char abs[8192];
+    if (!resolve_at(dirfd, path, abs, sizeof(abs))) return 0;
+    return path_is_ro(abs);
+}
+
+typedef int (*open_fn)(const char *, int, ...);
+typedef int (*openat_fn)(int, const char *, int, ...);
+typedef int (*creat_fn)(const char *, mode_t);
+typedef int (*path_fn)(const char *);
+typedef int (*path_mode_fn)(const char *, mode_t);
+typedef int (*rename_fn)(const char *, const char *);
+typedef int (*renameat_fn)(int, const char *, int, const char *);
+typedef int (*renameat2_fn)(int, const char *, int, const char *, unsigned int);
+typedef int (*mkdirat_fn)(int, const char *, mode_t);
+typedef int (*unlinkat_fn)(int, const char *, int);
+typedef int (*fchmodat_fn)(int, const char *, mode_t, int);
+typedef int (*fchownat_fn)(int, const char *, uid_t, gid_t, int);
+typedef int (*link_fn)(const char *, const char *);
+typedef int (*linkat_fn)(int, const char *, int, const char *, int);
+typedef int (*symlinkat_fn)(const char *, int, const char *);
+typedef int (*mknodat_fn)(int, const char *, mode_t, dev_t);
+typedef int (*truncate_fn)(const char *, off_t);
+typedef int (*utimensat_fn)(int, const char *, const struct timespec *, int);
+typedef int (*utime_fn)(const char *, const void *);
+
+#define SHIM_OPEN(name, sym)                                            \
+int name(const char *path, int flags, ...) {                            \
+    static open_fn real = NULL;                                         \
+    if (!real) real = (open_fn)dlsym(RTLD_NEXT, sym);                   \
+    if (want_write(flags) && path_is_ro(path)) return blocked_errno();  \
+    va_list ap; va_start(ap, flags); mode_t mode = 0;                   \
+    if (flags & O_CREAT) mode = va_arg(ap, mode_t);                     \
+    va_end(ap);                                                         \
+    if (flags & O_CREAT) return real(path, flags, mode);                \
+    return real(path, flags);                                           \
+}
+
+SHIM_OPEN(open, "open")
+SHIM_OPEN(open64, "open64")
+
+#define SHIM_OPENAT(name, sym)                                          \
+int name(int dirfd, const char *path, int flags, ...) {                 \
+    static openat_fn real = NULL;                                       \
+    if (!real) real = (openat_fn)dlsym(RTLD_NEXT, sym);                 \
+    if (want_write(flags) && at_is_ro(dirfd, path)) return blocked_errno(); \
+    va_list ap; va_start(ap, flags); mode_t mode = 0;                   \
+    if (flags & O_CREAT) mode = va_arg(ap, mode_t);                     \
+    va_end(ap);                                                         \
+    if (flags & O_CREAT) return real(dirfd, path, flags, mode);         \
+    return real(dirfd, path, flags);                                    \
+}
+
+SHIM_OPENAT(openat, "openat")
+SHIM_OPENAT(openat64, "openat64")
+
+#define SHIM_CREAT(name, sym)                                           \
+int name(const char *path, mode_t mode) {                               \
+    static creat_fn real = NULL;                                        \
+    if (!real) real = (creat_fn)dlsym(RTLD_NEXT, sym);                  \
+    if (path_is_ro(path)) return blocked_errno();                       \
+    return real(path, mode);                                            \
+}
+
+SHIM_CREAT(creat, "creat")
+SHIM_CREAT(creat64, "creat64")
+
+#define SHIM_PATH(name, sym)                                            \
+int name(const char *path) {                                            \
+    static path_fn real = NULL;                                         \
+    if (!real) real = (path_fn)dlsym(RTLD_NEXT, sym);                   \
+    if (path_is_ro(path)) return blocked_errno();                       \
+    return real(path);                                                  \
+}
+
+SHIM_PATH(rmdir, "rmdir")
+SHIM_PATH(unlink, "unlink")
+
+typedef int (*symlink_fn)(const char *, const char *);
+
+int symlink(const char *target, const char *linkpath) {
+    static symlink_fn real = NULL;
+    if (!real) real = (symlink_fn)dlsym(RTLD_NEXT, "symlink");
+    if (path_is_ro(linkpath)) return blocked_errno();
+    return real(target, linkpath);
+}
+
+#define SHIM_MKDIR(name, sym)                                           \
+int name(const char *path, mode_t mode) {                               \
+    static path_mode_fn real = NULL;                                    \
+    if (!real) real = (path_mode_fn)dlsym(RTLD_NEXT, sym);              \
+    if (path_is_ro(path)) return blocked_errno();                       \
+    return real(path, mode);                                            \
+}
+
+SHIM_MKDIR(mkdir, "mkdir")
+
+typedef int (*mknod_fn)(const char *, mode_t, dev_t);
+
+int mknod(const char *path, mode_t mode, dev_t dev) {
+    static mknod_fn real = NULL;
+    if (!real) real = (mknod_fn)dlsym(RTLD_NEXT, "mknod");
+    if (path_is_ro(path)) return blocked_errno();
+    return real(path, mode, dev);
+}
+
+int rename(const char *oldpath, const char *newpath) {
+    static rename_fn real = NULL;
+    if (!real) real = (rename_fn)dlsym(RTLD_NEXT, "rename");
+    if (path_is_ro(oldpath) || path_is_ro(newpath)) return blocked_errno();
+    return real(oldpath, newpath);
+}
+
+int renameat(int od, const char *op, int nd, const char *np) {
+    static renameat_fn real = NULL;
+    if (!real) real = (renameat_fn)dlsym(RTLD_NEXT, "renameat");
+    if (at_is_ro(od, op) || at_is_ro(nd, np)) return blocked_errno();
+    return real(od, op, nd, np);
+}
+
+int renameat2(int od, const char *op, int nd, const char *np, unsigned int flags) {
+    static renameat2_fn real = NULL;
+    if (!real) real = (renameat2_fn)dlsym(RTLD_NEXT, "renameat2");
+    if (at_is_ro(od, op) || at_is_ro(nd, np)) return blocked_errno();
+    return real(od, op, nd, np, flags);
+}
+
+int mkdirat(int dirfd, const char *path, mode_t mode) {
+    static mkdirat_fn real = NULL;
+    if (!real) real = (mkdirat_fn)dlsym(RTLD_NEXT, "mkdirat");
+    if (at_is_ro(dirfd, path)) return blocked_errno();
+    return real(dirfd, path, mode);
+}
+
+int unlinkat(int dirfd, const char *path, int flags) {
+    static unlinkat_fn real = NULL;
+    if (!real) real = (unlinkat_fn)dlsym(RTLD_NEXT, "unlinkat");
+    if (at_is_ro(dirfd, path)) return blocked_errno();
+    return real(dirfd, path, flags);
+}
+
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
+    static fchmodat_fn real = NULL;
+    if (!real) real = (fchmodat_fn)dlsym(RTLD_NEXT, "fchmodat");
+    if (at_is_ro(dirfd, path)) return blocked_errno();
+    return real(dirfd, path, mode, flags);
+}
+
+int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
+    static fchownat_fn real = NULL;
+    if (!real) real = (fchownat_fn)dlsym(RTLD_NEXT, "fchownat");
+    if (at_is_ro(dirfd, path)) return blocked_errno();
+    return real(dirfd, path, uid, gid, flags);
+}
+
+int chmod(const char *path, mode_t mode) {
+    static path_mode_fn real = NULL;
+    if (!real) real = (path_mode_fn)dlsym(RTLD_NEXT, "chmod");
+    if (path_is_ro(path)) return blocked_errno();
+    return real(path, mode);
+}
+
+int link(const char *oldpath, const char *newpath) {
+    static link_fn real = NULL;
+    if (!real) real = (link_fn)dlsym(RTLD_NEXT, "link");
+    if (path_is_ro(oldpath) || path_is_ro(newpath)) return blocked_errno();
+    return real(oldpath, newpath);
+}
+
+int linkat(int od, const char *op, int nd, const char *np, int flags) {
+    static linkat_fn real = NULL;
+    if (!real) real = (linkat_fn)dlsym(RTLD_NEXT, "linkat");
+    if (at_is_ro(od, op) || at_is_ro(nd, np)) return blocked_errno();
+    return real(od, op, nd, np, flags);
+}
+
+int symlinkat(const char *target, int dirfd, const char *path) {
+    static symlinkat_fn real = NULL;
+    if (!real) real = (symlinkat_fn)dlsym(RTLD_NEXT, "symlinkat");
+    if (at_is_ro(dirfd, path)) return blocked_errno();
+    return real(target, dirfd, path);
+}
+
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
+    static mknodat_fn real = NULL;
+    if (!real) real = (mknodat_fn)dlsym(RTLD_NEXT, "mknodat");
+    if (at_is_ro(dirfd, path)) return blocked_errno();
+    return real(dirfd, path, mode, dev);
+}
+
+int truncate(const char *path, off_t length) {
+    static truncate_fn real = NULL;
+    if (!real) real = (truncate_fn)dlsym(RTLD_NEXT, "truncate");
+    if (path_is_ro(path)) return blocked_errno();
+    return real(path, length);
+}
+
+int utimensat(int dirfd, const char *path, const struct timespec *times, int flags) {
+    static utimensat_fn real = NULL;
+    if (!real) real = (utimensat_fn)dlsym(RTLD_NEXT, "utimensat");
+    if (at_is_ro(dirfd, path)) return blocked_errno();
+    return real(dirfd, path, times, flags);
+}
+
+int utime(const char *path, const void *times) {
+    static utime_fn real = NULL;
+    if (!real) real = (utime_fn)dlsym(RTLD_NEXT, "utime");
+    if (path_is_ro(path)) return blocked_errno();
+    return real(path, times);
+}
+
+typedef int (*chown_fn)(const char *, uid_t, gid_t);
+
+int chown(const char *path, uid_t uid, gid_t gid) {
+    static chown_fn real = NULL;
+    if (!real) real = (chown_fn)dlsym(RTLD_NEXT, "chown");
+    if (path_is_ro(path)) return blocked_errno();
+    return real(path, uid, gid);
+}
+
+int lchown(const char *path, uid_t uid, gid_t gid) {
+    static chown_fn real = NULL;
+    if (!real) real = (chown_fn)dlsym(RTLD_NEXT, "lchown");
+    if (path_is_ro(path)) return blocked_errno();
+    return real(path, uid, gid);
+}
+
+/* Block fopen-family writes too (they route through our open, but fdopen
+ * and fwrite are common enough that catching the open is sufficient). */
+CEOF
+    if gcc -shared -fPIC -O2 -o "$PORT_SHIM" "$src" -ldl 2>/dev/null; then
+        log "Built port shim: $PORT_SHIM"
+        return 0
+    fi
+    warn "Failed to build port shim. 'jroot port' will not work."
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# proot (static binary, no root needed)
+# ---------------------------------------------------------------------------
+install_proot() {
+    if [ -x "$PROOT_BIN" ] && "$PROOT_BIN" --version >/dev/null 2>&1; then
+        return
+    fi
+    if command -v proot >/dev/null 2>&1; then
+        log "Using system proot: $(command -v proot)"
+        cp "$(command -v proot)" "$PROOT_BIN"
+        return
+    fi
+    log "Downloading proot $PROOT_VERSION static binary..."
+    local url
+    for url in \
+        "https://github.com/proot-me/proot/releases/download/v${PROOT_VERSION}/proot-v${PROOT_VERSION}-${ARCH_STR}-static" \
+        "https://github.com/proot-me/proot/releases/download/v${PROOT_VERSION}/proot-${ARCH_STR}-static"; do
+        if curl -fsSL --connect-timeout 15 -o "$PROOT_BIN" "$url"; then
+            log "Downloaded proot from: $url"
+            break
+        fi
+    done
+    chmod +x "$PROOT_BIN"
+    "$PROOT_BIN" --version >/dev/null 2>&1 || err "proot binary failed to run (corrupt download?)."
+}
+
+# ---------------------------------------------------------------------------
+# Rootfs download + extract
+# ---------------------------------------------------------------------------
+# 22.04 publishes "ubuntu-base-22.04-base-<arch>.tar.gz", but 24.04+ uses the
+# point release in the name ("ubuntu-base-24.04.4-base-<arch>.tar.gz"). Try
+# the exact version first, then parse the release directory listing.
+rootfs_url() {
+    local version="$1"
+    local base="https://cdimage.ubuntu.com/ubuntu-base/releases/${version}/release"
+    local url="$base/ubuntu-base-${version}-base-${ROOTFS_ARCH}.tar.gz"
+    if curl -fsSI --connect-timeout 10 "$url" >/dev/null 2>&1; then
+        echo "$url"
+        return 0
+    fi
+    local name
+    name="$(curl -fsSL --connect-timeout 15 "$base/" 2>/dev/null \
+        | grep -oE "ubuntu-base-[0-9.]+-base-${ROOTFS_ARCH}\.tar\.gz" \
+        | sort -Vu | tail -n1 || true)"
+    if [ -n "$name" ]; then
+        echo "$base/$name"
+        return 0
+    fi
+    return 1
+}
+
+get_ubuntu() {
+    local name="$1" version="$2"
+    local rootfs="$ROOTS_DIR/$name"
+
+    if [ -f "$rootfs/etc/os-release" ] && [ -f "$rootfs/bin/sh" ]; then
+        log "Rootfs already present for '$name'"
+        return
+    fi
+    if [ -d "$rootfs" ]; then
+        warn "Incomplete rootfs found for '$name', removing and re-downloading..."
+        rm -rf "$rootfs"
+    fi
+    mkdir -p "$rootfs"
+
+    local tarball="$CACHE_DIR/ubuntu-base-${version}-${ROOTFS_ARCH}.tar.gz"
+    if [ ! -f "$tarball" ]; then
+        local url
+        url="$(rootfs_url "$version")" || err "Failed to find a base rootfs download URL for Ubuntu ${version}"
+        log "Downloading Ubuntu ${version} base rootfs..."
+        curl -fsSL --connect-timeout 15 -o "$tarball" "$url" \
+            || err "Failed to download Ubuntu ${version} rootfs"
+    fi
+    log "Extracting rootfs..."
+    tar -xzf "$tarball" -C "$rootfs"
+    [ -f "$rootfs/bin/sh" ] || err "Rootfs extraction failed - /bin/sh not found"
+    log "Rootfs extracted to $rootfs"
+}
+
+# ---------------------------------------------------------------------------
+# apt config: HTTPS repos (port 80 often blocked) + proot-safe dpkg/apt
+# ---------------------------------------------------------------------------
+config_apt() {
+    local name="$1" codename="$2"
+    local rootfs="$ROOTS_DIR/$name"
+
+    mkdir -p "$rootfs/etc/apt" "$rootfs/etc/apt/apt.conf.d" "$rootfs/etc/apt/trusted.gpg.d" "$rootfs/usr/local/bin"
+
+    cat > "$rootfs/etc/apt/sources.list" << EOF
+deb [arch=${ROOTFS_ARCH} trusted=yes] https://mirrors.mit.edu/ubuntu/ ${codename} main restricted universe multiverse
+deb [arch=${ROOTFS_ARCH} trusted=yes] https://mirrors.mit.edu/ubuntu/ ${codename}-updates main restricted universe multiverse
+deb [arch=${ROOTFS_ARCH} trusted=yes] https://mirrors.mit.edu/ubuntu/ ${codename}-security main restricted universe multiverse
+EOF
+
+    # deadsnakes PPA (python3.11/3.12/3.13). trusted=yes avoids the
+    # proot-unreadable keyring entirely.
+    if [ "$codename" = "focal" ] || [ "$codename" = "jammy" ]; then
+        mkdir -p "$rootfs/etc/apt/sources.list.d"
+        cat > "$rootfs/etc/apt/sources.list.d/deadsnakes.list" << EOF
+deb [arch=${ROOTFS_ARCH} trusted=yes] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu/ ${codename} main
+EOF
+    fi
+
+    cat > "$rootfs/etc/apt/apt.conf.d/99fixes" << 'EOF'
+APT::Sandbox::User "root";
+Acquire::Languages "none";
+Acquire::ForceIPv4 "true";
+Acquire::AllowInsecureRepositories "true";
+APT::Get::AllowUnauthenticated "true";
+APT::Key::gpgvcommand "/usr/local/bin/fakegpgv";
+Dpkg::Options:: "--force-confold";
+EOF
+
+    # The .gpg keyrings can't be read under proot's fake root -> remove them.
+    rm -f "$rootfs"/etc/apt/trusted.gpg.d/*.gpg 2>/dev/null || true
+
+    # gpgv shim: apt's gpgv method reads status from fd 3; emit a valid
+    # signature line so signature verification passes silently.
+    cat > "$rootfs/usr/local/bin/fakegpgv" << 'EOF'
+#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        *.gpg|*.asc|*.keyring)
+            echo "[GNUPG:] NEWSIG" >&3
+            echo "[GNUPG:] GOODSIG 871920D1991BC93C Ubuntu Archive Automatic Signing Key (2018) <ftpmaster@ubuntu.com>" >&3
+            echo "[GNUPG:] VALIDSIG F6ECB3762474EDA9D21B7022871920D1991BC93C 2024-01-01 1704067200 1704153600 4 0 1 8 00 0 F6ECB3762474EDA9D21B7022871920D1991BC93C" >&3
+            echo "[GNUPG:] TRUST_ULTIMATE" >&3
+            ;;
+    esac
+done
+exit 0
+EOF
+    chmod +x "$rootfs/usr/local/bin/fakegpgv"
+
+    # CA certs for HTTPS - COPY into rootfs (read-only binds break dpkg).
+    rm -rf "$rootfs/etc/ssl" "$rootfs/etc/ca-certificates" 2>/dev/null || true
+    if [ -d /etc/ssl ]; then
+        mkdir -p "$rootfs/etc/ssl"
+        cp -rL /etc/ssl/certs "$rootfs/etc/ssl/" 2>/dev/null || true
+        [ -f /etc/ssl/certs/ca-certificates.crt ] && cp -f /etc/ssl/certs/ca-certificates.crt "$rootfs/etc/ssl/certs/" 2>/dev/null || true
+        cp -f /etc/ssl/openssl.cnf "$rootfs/etc/ssl/" 2>/dev/null || true
+    fi
+    if [ -d /etc/ca-certificates ]; then
+        cp -r /etc/ca-certificates "$rootfs/etc/" 2>/dev/null || true
+    fi
+    cp /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
+
+    local hostname
+    hostname="$(hostname 2>/dev/null || echo localhost)"
+    cat > "$rootfs/etc/hosts" << EOF
+127.0.0.1 localhost
+127.0.1.1 ${hostname}
+::1 localhost ip6-localhost ip6-loopback
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Rootfs niceties: custom prompt, group mirroring, sudo logging off
+# ---------------------------------------------------------------------------
+write_rootfs_niceties() {
+    local name="$1"
+    local rootfs="$ROOTS_DIR/$name"
+
+    mkdir -p "$rootfs/root" 2>/dev/null || true
+    cat > "$rootfs/root/.bashrc" << 'EOF'
+get_prompt_username() {
+    local user="$(whoami 2>/dev/null)"
+    [[ -z "$user" || "$user" == "I have no name!" || "$user" == "nobody" ]] \
+        && echo "jail" || echo "$user"
+}
+PS1="\[\033[01;32m\]\$(get_prompt_username)@\$(cat /etc/jailname 2>/dev/null || echo \h)\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]$ "
+EOF
+    chmod 644 "$rootfs/root/.bashrc" 2>/dev/null || true
+
+    # Present the jail by its own name, not the host's hostname.
+    printf '%s\n' "$name" > "$rootfs/etc/jailname" 2>/dev/null || true
+    printf '%s\n' "$name" > "$rootfs/etc/hostname" 2>/dev/null || true
+    if [ -f "$rootfs/etc/hosts" ]; then
+        grep -v "127.0.1.1" "$rootfs/etc/hosts" > "$rootfs/etc/hosts.tmp" 2>/dev/null || true
+        printf '127.0.1.1\t%s\n' "$name" >> "$rootfs/etc/hosts.tmp" 2>/dev/null || true
+        mv "$rootfs/etc/hosts.tmp" "$rootfs/etc/hosts" 2>/dev/null || true
+    fi
+    mkdir -p "$rootfs/usr/local/bin"
+    cat > "$rootfs/usr/local/bin/hostname" << 'EOF'
+#!/bin/sh
+name="$(cat /etc/jailname 2>/dev/null || cat /etc/hostname 2>/dev/null || true)"
+case "$1" in
+    "")
+        if [ -n "$name" ]; then printf '%s\n' "$name"; else exec /usr/bin/hostname; fi
+        ;;
+    -h|--help|-v|--version|-V)
+        exec /usr/bin/hostname "$@"
+        ;;
+    -f|-F|-d|-i|-I|-s|-y|-a|-A|-b|-m|-n|-p|-D|-o|-V|-fidn|*)
+        exec /usr/bin/hostname "$@"
+        ;;
+esac
+EOF
+    chmod 755 "$rootfs/usr/local/bin/hostname" 2>/dev/null || true
+
+    # Mirror host groups so "groups: cannot find name for group ID" goes away.
+    if [ -f /etc/group ]; then
+        local gname gpass ggid gmembers host_gid host_grp
+        while IFS=: read -r gname gpass ggid gmembers; do
+            if ! grep -q "^$gname:" "$rootfs/etc/group" 2>/dev/null; then
+                echo "$gname:x:$ggid:$gmembers" >> "$rootfs/etc/group" 2>/dev/null || true
+            fi
+        done < /etc/group
+        host_gid="$(id -g 2>/dev/null)"
+        host_grp="$(getent group "$host_gid" 2>/dev/null | cut -d: -f1)"
+        [ -n "$host_grp" ] || host_grp="jail"
+        if ! grep -q "^$host_grp:" "$rootfs/etc/group" 2>/dev/null; then
+            echo "$host_grp:x:$host_gid:" >> "$rootfs/etc/group" 2>/dev/null || true
+        fi
+    fi
+
+    write_policy_rcd "$name"
+}
+
+write_sudoers() {
+    local name="$1"
+    local rootfs="$ROOTS_DIR/$name"
+    mkdir -p "$rootfs/etc/sudoers.d"
+    chmod 755 "$rootfs/etc/sudoers.d" 2>/dev/null || true
+    rm -f "$rootfs/etc/sudoers.d/no-audit"
+    cat > "$rootfs/etc/sudoers.d/no-audit" << 'EOF'
+Defaults !syslog
+Defaults !logfile
+Defaults !log_input
+Defaults !log_output
+Defaults !use_pty
+EOF
+    chmod 440 "$rootfs/etc/sudoers.d/no-audit" 2>/dev/null || true
+}
+
+write_policy_rcd() {
+    # Never let apt start services during install (chroot/proot). Without this,
+    # invoke-rc.d hits a missing policy-rc.d and rsync & friends fail to configure.
+    local name="$1"
+    local rootfs="$ROOTS_DIR/$name"
+    mkdir -p "$rootfs/usr/sbin" 2>/dev/null || true
+    cat > "$rootfs/usr/sbin/policy-rc.d" << 'EOF'
+#!/bin/sh
+exit 101
+EOF
+    chmod 755 "$rootfs/usr/sbin/policy-rc.d" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Config (JSON)
+# ---------------------------------------------------------------------------
+write_config() {
+    local name="$1" image="$2" user_mode="$3" mount_host="$4" mount_home="$5" build_essential="$6"
+    cat > "$CONFIGS_DIR/$name.json" << EOF
+{
+  "name": "$name",
+  "image": "$image",
+  "user": "$user_mode",
+  "mount_host": $mount_host,
+  "mount_home": $mount_home,
+  "build_essential": $build_essential
+}
+EOF
+}
+
+config_field() {
+    sed -n "s/.*\"${2}\"[[:space:]]*:[[:space:]]*\"*\([^\",}]*\)\"*.*/\1/p" "$1" | head -n1
+}
+
+show_config() {
+    local name="$1"
+    local cfg="$CONFIGS_DIR/$name.json"
+    printf '  name:             %s\n' "$name"
+    printf '  image:            %s\n' "$(config_field "$cfg" image)"
+    printf '  user:             %s\n' "$(config_field "$cfg" user)"
+    printf '  build_essential:  %s\n' "$(config_field "$cfg" build_essential)"
+    printf '  mount_host (/):   %s   (host / at /mnt/host)\n' "$(config_field "$cfg" mount_host)"
+    printf '  mount_home (~):   %s   (host \$HOME at /mnt/home)\n' "$(config_field "$cfg" mount_home)"
+    printf '  public ports:     %s\n' "$(config_ports "$cfg" | sed 's/^$/none/')"
+    if config_mounts "$cfg" | grep -q .; then
+        printf '  custom mounts:\n'
+        while IFS=$'\t' read -r m_label m_hostpath m_mode; do
+            [ -n "$m_label" ] || continue
+            [ -n "$m_mode" ] || m_mode="rw"
+            printf '    /mnt/%-12s -> %-30s %s\n' "$m_label" "$m_hostpath" "($m_mode)"
+        done < <(config_mounts "$cfg")
+    else
+        printf '  custom mounts:    none\n'
+    fi
+}
+
+config_ports() {
+    # Returns a comma-separated list of public ports for a jail config file.
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print(",".join(str(p) for p in c.get("ports", [])))
+' "$1" 2>/dev/null
+    else
+        sed -n 's/.*"ports"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' "$1" | tr -d ' "' | tr ',' '\n' | paste -sd, -
+    fi
+}
+
+set_config_ports() {
+    # $1=config file, rest = port numbers. Rewrites the config JSON.
+    local cfg="$1"; shift
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$cfg" "$@" <<'PYEOF'
+import json, sys
+cfg, ports = sys.argv[1], sorted({int(p) for p in sys.argv[2:] if p})
+c = json.load(open(cfg))
+c["ports"] = ports
+json.dump(c, open(cfg, "w"), indent=2)
+print(",".join(str(p) for p in ports))
+PYEOF
+    else
+        warn "python3 needed to save port config."
+        return 1
+    fi
+}
+
+first_jail() {
+    local cfg
+    cfg="$(ls "$CONFIGS_DIR"/*.json 2>/dev/null | head -n1 || true)"
+    [ -n "$cfg" ] && basename "$cfg" .json || true
+}
+
+config_mounts() {
+    # Returns "label<TAB>hostpath<TAB>mode" per line for a jail config file.
+    # mode is rw or ro (backward compatible with 2-field mount entries).
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for m in c.get("mounts", []):
+    label = m[0] if len(m) > 0 else ""
+    path = m[1] if len(m) > 1 else ""
+    mode = m[2] if len(m) > 2 else "rw"
+    print(label + "\t" + path + "\t" + mode)
+' "$1" 2>/dev/null
+    else
+        sed -n 's/.*"mounts"[[:space:]]*:[[:space:]]*\[.*//p' "$1"
+    fi
+}
+
+set_config_mounts() {
+    # $1=config file, rest = "label=hostpath=mode" pairs (mode optional, rw).
+    # Rewrites the config JSON.
+    local cfg="$1"; shift
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$cfg" "$@" <<'PYEOF'
+import json, sys
+cfg, rest = sys.argv[1], sys.argv[2:]
+mounts = []
+for r in rest:
+    parts = r.split("=", 2)
+    label = parts[0]
+    path = parts[1] if len(parts) > 1 else ""
+    mode = parts[2] if len(parts) > 2 else "rw"
+    mounts.append([label, path, mode])
+c = json.load(open(cfg))
+c["mounts"] = mounts
+json.dump(c, open(cfg, "w"), indent=2)
+PYEOF
+    else
+        warn "python3 needed to save mount config."
+        return 1
+    fi
+}
+
+mount_list() {
+    local name="$1" cfg="$CONFIGS_DIR/$name.json"
+    local mpath
+    if ! config_mounts "$cfg" | grep -q .; then
+        log "No custom mounts for '$name'."
+        return 0
+    fi
+    log "Custom mounts for '$name' (host path -> /mnt/<label>):"
+    while IFS=$'\t' read -r label hpath mode; do
+        [ -n "$label" ] || continue
+        [ -n "$mode" ] || mode="rw"
+        printf '    %-14s -> %-30s %s\n' "/mnt/$label" "$hpath" "($mode)"
+    done < <(config_mounts "$cfg")
+}
+
+mount_add() {
+    local name="$1" label="$2" hpath="$3" mode="$4"
+    [ -n "$mode" ] || mode="rw"
+    case "$mode" in rw|ro) ;; *) err "Mount mode must be 'rw' or 'ro', got '$mode'." ;; esac
+    local cfg="$CONFIGS_DIR/$name.json"
+    [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || err "Invalid mount label: '$label' (letters, digits, . _ -)"
+    case "$label" in
+        host|home) err "Label '$label' is reserved (/mnt/host and /mnt/home are built-in)." ;;
+    esac
+    [ -e "$hpath" ] || err "Host path does not exist: $hpath"
+    [ -d "$hpath" ] || err "Host path is not a directory: $hpath (only directories can be bind-mounted)"
+    local cur line
+    cur="$(config_mounts "$cfg")"
+    if echo "$cur" | cut -f1 | grep -qx "$label"; then
+        err "Label '$label' is already mounted for '$name' (use 'jroot mnt $name rm $label' first)."
+    fi
+    local pairs
+    pairs="$(echo "$cur" | sed 's/\t/=/g' | tr '\n' ' ')"
+    pairs="$pairs $label=$hpath=$mode"
+    set_config_mounts "$cfg" $pairs
+    log "Mounted $hpath at /mnt/$label inside '$name' ($mode)."
+}
+
+mount_set() {
+    local name="$1" label="$2" mode="$3"
+    case "$mode" in rw|ro) ;; *) err "Mount mode must be 'rw' or 'ro', got '$mode'." ;; esac
+    local cfg="$CONFIGS_DIR/$name.json"
+    local cur pairs
+    cur="$(config_mounts "$cfg")"
+    if ! echo "$cur" | cut -f1 | grep -qx "$label"; then
+        err "No mount '/mnt/$label' for '$name'. Run 'jroot mnt $name list' to see mounts."
+    fi
+    pairs="$(echo "$cur" | sed 's/\t/=/g' | sed "s/^$label=\(.*\)=.*$/$label=\1=$mode/" | tr '\n' ' ')"
+    set_config_mounts "$cfg" $pairs
+    log "/mnt/$label for '$name' is now $mode."
+}
+
+mount_rm() {
+    local name="$1" label="$2"
+    local cfg="$CONFIGS_DIR/$name.json"
+    local cur pairs
+    cur="$(config_mounts "$cfg")"
+    if ! echo "$cur" | cut -f1 | grep -qx "$label"; then
+        err "No mount '/mnt/$label' for '$name'. Run 'jroot mnt $name list' to see mounts."
+    fi
+    pairs="$(echo "$cur" | sed 's/\t/=/g' | grep -v "^$label=" | tr '\n' ' ')"
+    set_config_mounts "$cfg" $pairs
+    log "Removed /mnt/$label from '$name'."
+}
+
+mnt_usage() {
+    printf '%bjroot mnt%b - bind-mount a host directory into a jail\n\n' "$H" "$N"
+    printf '    %bjroot mnt <name> list%b                 show custom mounts\n' "$G" "$N"
+    printf '    %bjroot mnt <name> <label> <hostdir>%b    mount hostdir at /mnt/<label> (rw)\n' "$G" "$N"
+    printf '    %bjroot mnt <name> <label> <hostdir> ro%b  mount hostdir read-only\n' "$G" "$N"
+    printf '    %bjroot mnt <name> set <label> rw|ro%b   switch a mount between rw and ro\n' "$G" "$N"
+    printf '    %bjroot mnt <name> rm <label>%b           unmount /mnt/<label>\n' "$G" "$N"
+    printf '\n    Host directories appear inside the jail at %b/mnt/<label>%b.\n' "$G" "$N"
+    printf '    proot'"'"'s virtual filesystem makes escaping impossible: %b..%b, absolute\n' "$G" "$N"
+    printf '    symlinks, and relative symlinks all resolve inside the jail, never to\n'
+    printf '    the host. Read-only mounts (ro) additionally reject every write syscall\n'
+    printf '    (open/creat, mkdir, unlink, rename, chmod, ...) with EROFS via the shim.\n'
+    printf '    %bNOTE:%b ro mounts require gcc on the host to compile the shim.\n' "$YEL" "$N"
+    printf '    Run %bjroot mnt %s test /tmp && jroot enter %s%b as a quick demo.\n' "$G" "$1" "$1" "$N"
+}
+
+cmd_mnt() {
+    [ $# -ge 2 ] || { mnt_usage "${1:-<name>}"; err "Usage: jroot mnt <name> list|set|<label> <hostdir> [ro]|rm <label>"; }
+    local name="$1" op="$2"
+    local cfg="$CONFIGS_DIR/$name.json"
+    [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    case "$op" in
+        list)
+            mount_list "$name"
+            ;;
+        set)
+            [ $# -ge 4 ] || { mnt_usage "$name"; err "Usage: jroot mnt $name set <label> rw|ro"; }
+            mount_set "$name" "$3" "$4"
+            ;;
+        rm)
+            [ $# -ge 3 ] || { mnt_usage "$name"; err "Usage: jroot mnt $name rm <label>"; }
+            mount_rm "$name" "$3"
+            ;;
+        *)
+            [ $# -ge 3 ] || { mnt_usage "$name"; err "Usage: jroot mnt $name <label> <hostdir> [ro]"; }
+            mount_add "$name" "$2" "$3" "$4"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Run a command inside a jail (proot wrapper, migrated from fakeroot3.sh)
+# ---------------------------------------------------------------------------
+run_in_jail() {
+    local force_root=0
+    if [ "$1" = "--root" ]; then
+        force_root=1
+        shift
+    fi
+    local name="$1"; shift
+    local cfg="$CONFIGS_DIR/$name.json"
+    local rootfs="$ROOTS_DIR/$name"
+    local real_home="$HOME"
+    local user_mode mount_host mount_home image
+    user_mode="$(config_field "$cfg" user)";      [ -n "$user_mode" ]  || user_mode="root"
+    mount_host="$(config_field "$cfg" mount_host)"; [ -n "$mount_host" ] || mount_host=0
+    mount_home="$(config_field "$cfg" mount_home)"; [ -n "$mount_home" ] || mount_home=0
+    image="$(config_field "$cfg" image)"
+
+    local proot_args=(-k "$PROOT_KERNEL_RELEASE")
+    export HOSTNAME="$name"
+    if [ "$force_root" = 1 ] || [ "$user_mode" = "root" ]; then
+        proot_args+=(-0 -w /root)
+        export HOME=/root USER=root LOGNAME=root SHELL=/bin/bash
+    elif [ -d "$rootfs/home/jail" ]; then
+        # unroot: install happened as root; daily use is the inner 'jail' user
+        # (host uid maps through proot). Falls back to old behaviour if the
+        # jail was created before this user existed.
+        proot_args+=(-w /home/jail)
+        export HOME=/home/jail USER=jail LOGNAME=jail SHELL=/bin/bash
+    else
+        proot_args+=(-w /)
+        unset HOME
+    fi
+
+    # Clean environment: pretend to be a fresh machine, not the host.
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+    unset HOSTALIASES LD_PRELOAD LD_LIBRARY_PATH BASH_ENV ENV
+    unset http_proxy https_proxy ftp_proxy all_proxy no_proxy
+
+    local binds=(-b /dev -b /proc -b /sys)
+    if [ "$mount_host" = "1" ]; then
+        binds+=(-b /:/mnt/host)
+    fi
+    if [ "$mount_home" = "1" ]; then
+        binds+=(-b "$real_home:/mnt/home")
+    fi
+
+    # Custom per-jail mounts (persisted in the config "mounts" array).
+    # ro mounts are enforced by the LD_PRELOAD shim (write syscalls -> EROFS).
+    local m_label m_hostpath m_mode ro_mounts=""
+    while IFS=$'\t' read -r m_label m_hostpath m_mode; do
+        [ -n "$m_label" ] || continue
+        binds+=(-b "$m_hostpath:/mnt/$m_label")
+        [ "$m_mode" = "ro" ] && ro_mounts="$ro_mounts:/mnt/$m_label"
+    done < <(config_mounts "$cfg")
+
+    # DBus socket detection (optional; only binds if a socket is found).
+    local dbus_sock="" real_uid sock
+    real_uid="$(id -u 2>/dev/null)"
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        dbus_sock="${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
+    fi
+    if [ -z "$dbus_sock" ] && [ -n "$real_uid" ]; then
+        for sock in "/run/user/${real_uid}/bus" "/run/user/${real_uid}/dbus/bus"; do
+            [ -S "$sock" ] && { dbus_sock="$sock"; break; }
+        done
+    fi
+    if [ -z "$dbus_sock" ]; then
+        for sock in "/run/dbus/system_bus_socket" "/var/run/dbus/system_bus_socket"; do
+            [ -S "$sock" ] && { dbus_sock="$sock"; break; }
+        done
+    fi
+    if [ -z "$dbus_sock" ]; then
+        for sock in /run/user/*/bus /run/user/*/dbus/bus; do
+            [ -S "$sock" ] 2>/dev/null && { dbus_sock="$sock"; break; }
+        done
+    fi
+    if [ -n "$dbus_sock" ] && [ -S "$dbus_sock" ]; then
+        binds+=(-b "$dbus_sock:$dbus_sock")
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_sock"
+    fi
+
+    if [ "$#" -eq 0 ]; then
+        set -- /bin/bash --login
+    fi
+
+    # Loopback-only by default: wrap the guest command in /usr/bin/env so the
+    # bind() shim's LD_PRELOAD is applied INSIDE the jail only (the host
+    # python3 launcher and proot itself never see it). JROOT_PORTS lists the
+    # ports that may stay public (0.0.0.0); everything else is forced to
+    # 127.0.0.1 / ::1 by the shim.
+    if [ -x "$PORT_SHIM" ]; then
+        local jail_ports
+        jail_ports="$(config_ports "$cfg")"
+        binds+=(-b "$PORT_SHIM:/usr/local/lib/libjroot.so")
+        set -- /usr/bin/env LD_PRELOAD=/usr/local/lib/libjroot.so \
+            JROOT_PORTS="${jail_ports:-}" \
+            JROOT_RO_MOUNTS="${ro_mounts#:}" "$@"
+    fi
+
+    # Block the openat2 escape (syscall 437) with a seccomp filter applied to
+    # proot; every guest process inherits it on exec. Requires host python3.
+    # NOTE: proot must run as a CHILD (no `exec`) so jroot can keep going
+    # after it exits - init/update/verify all call run_in_jail mid-script.
+    local rc=0
+    if command -v python3 >/dev/null 2>&1 && [ -x "$SECCOMP_LAUNCHER" ]; then
+        python3 "$SECCOMP_LAUNCHER" "$PROOT_BIN" "${proot_args[@]}" \
+            -r "$rootfs" "${binds[@]}" "$@"
+        rc=$?
+    else
+        "$PROOT_BIN" "${proot_args[@]}" \
+            -r "$rootfs" "${binds[@]}" "$@"
+        rc=$?
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Bootstrap: apt update + core packages + node + /run layout
+# ---------------------------------------------------------------------------
+bootstrap() {
+    local name="$1" codename="$2"
+    local cfg="$CONFIGS_DIR/$name.json"
+    local build_essential extras extra_py
+    build_essential="$(config_field "$cfg" build_essential)"
+    extras=""
+    [ "$build_essential" = "1" ] && extras="build-essential"
+    extra_py=""
+    if [ "$codename" = "jammy" ] || [ "$codename" = "focal" ]; then
+        extra_py="python3.12 python3.12-dev python3.12-venv"
+    fi
+
+    log "Installing core packages inside '$name' (first run, several minutes)..."
+    run_in_jail --root "$name" /bin/sh -c "
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get clean 2>/dev/null
+        rm -rf /var/lib/apt/lists/partial 2>/dev/null
+        dpkg --configure -a 2>/dev/null
+        rm -f /usr/sbin/policy-rc.d 2>/dev/null || true
+        printf '#!/bin/sh\necho 2\n' > /sbin/runlevel
+        chmod +x /sbin/runlevel
+        apt-get update || true
+        # --no-install-recommends keeps the jail lean (no lib-* spam).
+        # git pulls perl -> left out of defaults; install it per-jail if needed.
+        apt-get install -y --no-install-recommends --allow-unauthenticated \\
+            ca-certificates sudo curl wget vim nano less \\
+            bash-completion htop tmux openssh-client rsync tree unzip zip \\
+            python3 python3-pip ${extras} ${extra_py} man-db \\
+            net-tools dnsutils iputils-ping file locales apt-utils \\
+            xz-utils
+        # proot -0 quirk: \`-x\` passes for missing /usr/bin/python3.11, so the
+        # python3-lib2to3 postinst tries to run it. Provide the alias.
+        if [ ! -e /usr/bin/python3.11 ]; then
+            ln -sf python3.10 /usr/bin/python3.11 2>/dev/null || true
+        fi
+        [ -f /usr/lib/python3.11/py_compile.py ] || cp /usr/lib/python3.10/py_compile.py /usr/lib/python3.11/py_compile.py 2>/dev/null || true
+        dpkg --configure -a
+        # /var/run is a symlink to /run on a normal system; create internal ones.
+        rm -rf /run /var/run 2>/dev/null || true
+        mkdir -p /run /run/systemd /run/user /run/lock
+        chmod 755 /run /run/systemd /run/user /run/lock
+        ln -sf /run /var/run
+        case \"$ARCH\" in
+            x86_64)
+                wget -q --timeout=30 --tries=3 https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz \\
+                    && tar -xJf node-v22.23.2-linux-x64.tar.xz --strip-components=1 -C /usr/local \\
+                    && rm node-v22.23.2-linux-x64.tar.xz \\
+                    || echo 'node-install-skipped'
+                ;;
+            *) echo 'node-install-skipped' ;;
+        esac
+        echo BOOTSTRAP-DONE
+    "
+}
+
+# ---------------------------------------------------------------------------
+# Post-init verification: run inside the jail and print what actually works
+# ---------------------------------------------------------------------------
+verify_jail() {
+    local name="$1" out line
+    log "Verifying jail '$name' works..."
+    out="$(run_in_jail "$name" /bin/sh -c '
+        whoami 2>/dev/null | sed "s/^/user=/"
+        . /etc/os-release 2>/dev/null && printf "os=%s\n" "$PRETTY_NAME"
+        uname -m 2>/dev/null | sed "s/^/arch=/"
+        dpkg -l 2>/dev/null | grep -c "^ii" | sed "s/^/packages=/"
+        python3 --version 2>/dev/null | sed "s/^Python //; s/^/python3=/"
+        node --version 2>/dev/null | sed "s/^/node=/" || echo "node=not installed"
+        gcc --version 2>/dev/null | head -n1 | sed "s/^/gcc=/" || echo "gcc=not installed"
+        git --version 2>/dev/null | sed "s/^/git=/" || echo "git=not installed"
+    ' 2>/dev/null || true)"
+    if [ -z "$out" ]; then
+        warn "Could not run inside '$name' - rootfs may be broken."
+        return 1
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf '  %s\n' "$line"
+    done <<< "$out"
+    local size
+    size="$(du -sh "$ROOTS_DIR/$name" 2>/dev/null | awk '{print $1}')"
+    printf '  size=%s (on host)\n' "${size:-?}"
+}
+
+# ---------------------------------------------------------------------------
+# unroot mode: packages were installed as root; now lock root and create a
+# non-root inner user ('jail') that daily `jroot enter` logs in as.
+# ---------------------------------------------------------------------------
+setup_unroot_user() {
+    local name="$1"
+    local host_uid host_gid
+    host_uid="$(id -u)"; host_gid="$(id -g)"
+    log "Setting up non-root user for '$name' (uid $host_uid, root gets locked)..."
+    run_in_jail --root "$name" /bin/sh -c "
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        # Match the host uid so whoami resolves inside the jail.
+        useradd -o -m -u $host_uid -s /bin/bash jail 2>/dev/null || true
+        mkdir -p /home/jail 2>/dev/null || true
+        chown $host_uid:$host_gid /home/jail 2>/dev/null || true
+        cp -f /root/.bashrc /home/jail/.bashrc 2>/dev/null || true
+        chown $host_uid:$host_gid /home/jail/.bashrc 2>/dev/null || true
+        passwd -l root 2>/dev/null || true
+        echo UNROOT-READY
+    " || warn "Could not create non-root user in '$name'."
+
+    log "Non-root user 'jail' ready. 'jroot enter $name' now logs in as 'jail'."
+    log "Admin: 'jroot enter $name --root <cmd>' or 'jroot update $name' for root."
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_init() {
+    local image="" repo tag version codename name user_mode response
+    local mount_host=0 mount_home=0 build_essential=1
+    local cli_name="" cli_user="" cli_be="" cli_mh="" cli_mhomedir=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name=*)               cli_name="${1#*=}" ;;
+            --user=*)               cli_user="${1#*=}" ;;
+            --build-essential=*)    cli_be="${1#*=}" ;;
+            --mount-host=*)         cli_mh="${1#*=}" ;;
+            --mount-home=*)         cli_mhomedir="${1#*=}" ;;
+            -h|--help)              err "Usage: jroot init <image> [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1]" ;;
+            *)                      [ -z "$image" ] && image="$1" || err "Unexpected argument: $1" ;;
+        esac
+        shift
+    done
+    [ -n "$image" ] || err "Usage: jroot init <image>"
+
+    repo="${image%%:*}"
+    tag="${image#*:}"
+    [ "$repo" = "ubuntu" ] || err "jroot currently only supports ubuntu images (e.g. ubuntu:22.04)"
+    [ -n "$tag" ] || tag="latest"
+
+    if version="$(codename_to_version "$tag")"; then
+        codename="$tag"
+    elif codename="$(version_to_codename "$tag")"; then
+        version="$tag"
+    elif [ "$tag" = "latest" ]; then
+        version="24.04"; codename="noble"
+    else
+        err "Unknown Ubuntu version '$tag'. Supported: $UBUNTU_VERSIONS"
+    fi
+
+    local default_name
+    default_name="$(printf '%s' "$image" | tr ':/' '-')"
+    name="$(resolve "What do you want to name this jail? [$default_name]: " "$default_name" "$cli_name")"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid jail name: '$name'"
+    if [ -e "$CONFIGS_DIR/$name.json" ]; then
+        err "Jail '$name' already exists"
+    fi
+
+    user_mode="$(resolve "Root or unroot inside? [root/unroot]: " "root" "$cli_user")"
+    case "$user_mode" in root|unroot) ;; *) err "Choose 'root' or 'unroot' (default root)" ;; esac
+
+    if [ -n "$cli_be" ]; then
+        build_essential="$cli_be"
+    elif [ -n "${SKIP_BUILD_ESSENTIAL:-}" ]; then
+        case "$SKIP_BUILD_ESSENTIAL" in
+            1) build_essential=0 ;;
+            0) build_essential=1 ;;
+            *) build_essential=1 ;;
+        esac
+    else
+        response="$(ask "Install build-essential (gcc, g++, make)? [Y/n]: " "Y")"
+        case "$response" in
+            n|N|no|NO|No) build_essential=0 ;;
+            *)            build_essential=1 ;;
+        esac
+    fi
+
+    if [ -n "$cli_mh" ]; then
+        mount_host="$cli_mh"
+    elif [ -n "${MOUNT_HOST:-}" ]; then
+        case "$MOUNT_HOST" in 1|0) mount_host="$MOUNT_HOST" ;; esac
+    else
+        response="$(ask "Mount host filesystem (/) to /mnt/host inside jail? [y/N] (SECURITY RISK): " "N")"
+        [[ "$response" =~ ^[Yy] ]] && mount_host=1
+    fi
+
+    if [ -n "$cli_mhomedir" ]; then
+        mount_home="$cli_mhomedir"
+    elif [ -n "${MOUNT_HOME:-}" ]; then
+        case "$MOUNT_HOME" in 1|0) mount_home="$MOUNT_HOME" ;; esac
+    else
+        response="$(ask "Mount host home (\$HOME) to /mnt/home inside jail? [y/N] (SECURITY RISK): " "N")"
+        [[ "$response" =~ ^[Yy] ]] && mount_home=1
+    fi
+
+    case "$build_essential" in 0|1) ;; *) err "--build-essential must be 0 or 1" ;; esac
+    case "$mount_host" in 0|1) ;; *) err "--mount-host must be 0 or 1" ;; esac
+    case "$mount_home" in 0|1) ;; *) err "--mount-home must be 0 or 1" ;; esac
+
+    if [ "$mount_host" = "1" ]; then
+        warn "SECURITY: host / will be readable/writable at /mnt/host inside the jail."
+    fi
+    if [ "$mount_home" = "1" ]; then
+        warn "SECURITY: host \$HOME will be at /mnt/home inside the jail (SSH keys, .aws, ...)."
+    fi
+
+    ensure_runtime
+    install_proot
+    get_ubuntu "$name" "$version"
+    config_apt "$name" "$codename"
+    write_rootfs_niceties "$name"
+    write_sudoers "$name"
+    write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
+
+    local bootstrapped=1
+    if [ "${JROOT_SKIP_APT:-}" = "1" ] || [ "${JROOT_SKIP_BOOTSTRAP:-}" = "1" ]; then
+        warn "Skipping apt bootstrap (env JROOT_SKIP_APT/JROOT_SKIP_BOOTSTRAP)."
+        bootstrapped=0
+    elif bootstrap "$name" "$codename"; then
+        log "Core packages installed."
+    else
+        warn "Bootstrap exited non-zero - finishing configures may still be needed."
+        bootstrapped=0
+    fi
+
+    if [ "$user_mode" = "unroot" ]; then
+        setup_unroot_user "$name"
+    fi
+
+    log ""
+    log "=== SUMMARY ==="
+    verify_jail "$name" || bootstrapped=0
+
+    log ""
+    log "=== DONE ==="
+    log "Jail '$name' created:"
+    show_config "$name"
+    if [ "$bootstrapped" = "1" ]; then
+        log ""
+        log "The jail is bootable and ready."
+        log "  packages installed:  see summary above"
+        log "  Enter a shell:       jroot enter $name"
+        log "  Run one command:     jroot enter $name /bin/sh -c \"whoami\""
+        log ""
+        log "Need more? Install more inside the jail (they become snapshots later):"
+        log "    jroot enter $name apt-get install git"
+        log "Save a snapshot before making changes:"
+        log "    jroot snapshot $name"
+        log "Update all packages later:"
+        log "    jroot update $name"
+    else
+        log ""
+        warn "Core packages were NOT fully installed. Finish manually:"
+        warn "    jroot enter $name apt-get update && apt-get install -y --no-install-recommends \\\\"
+        warn "        ca-certificates sudo curl wget vim nano less bash-completion htop tmux \\\\"
+        warn "        openssh-client rsync tree unzip zip python3 python3-pip man-db locales"
+        warn "Or just: jroot update $name"
+    fi
+    warn ""
+    warn "SECURITY: the openat2 syscall is blocked via seccomp to prevent the"
+    warn "known proot container escape vulnerability."
+    if [ "$mount_host" = "1" ]; then
+        warn ""
+        warn "SECURITY: host / is mounted at /mnt/host inside the jail - it is READ/WRITE."
+    fi
+    if [ "$mount_home" = "1" ]; then
+        warn ""
+        warn "SECURITY: host \$HOME is mounted at /mnt/home (SSH keys, .aws, ...)."
+    fi
+    warn ""
+}
+
+cmd_enter() {
+    ensure_runtime
+    [ -x "$PROOT_BIN" ] || install_proot
+
+    local name="" cmd=() arg force_root=0
+    for arg in "$@"; do
+        if [ -z "$name" ] && [ -f "$CONFIGS_DIR/$arg.json" ]; then
+            name="$arg"
+        elif [ "$arg" = "--root" ]; then
+            force_root=1
+        else
+            cmd+=("$arg")
+        fi
+    done
+    if [ -z "$name" ]; then
+        local avail="" cfg
+        shopt -s nullglob
+        for cfg in "$CONFIGS_DIR"/*.json; do
+            avail="$avail  $(basename "$cfg" .json)"
+        done
+        shopt -u nullglob
+        if [ -n "$avail" ]; then
+            err "No jail name given.\nUsage: jroot enter <name> [<cmd...>]\n       jroot enter <name> --root <cmd...>\n\nAvailable jails:$avail"
+        else
+            err "No jails found. Create one first: jroot init ubuntu:22.04"
+        fi
+    fi
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
+
+    if [ "$force_root" = 1 ]; then
+        run_in_jail --root "$name" "${cmd[@]}"
+    else
+        run_in_jail "$name" "${cmd[@]}"
+    fi
+}
+
+cmd_exec() {
+    ensure_runtime
+    [ -x "$PROOT_BIN" ] || install_proot
+    [ $# -ge 1 ] || err "Usage: jroot exec <name> [--root] <cmd...>"
+    local name="$1" force_root=0; shift
+    if [ "$1" = "--root" ]; then
+        force_root=1
+        shift
+    fi
+    [ $# -ge 1 ] || err "Usage: jroot exec <name> [--root] <cmd...>"
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
+
+    if [ "$force_root" = 1 ]; then
+        run_in_jail --root "$name" "$@"
+    else
+        run_in_jail "$name" "$@"
+    fi
+}
+
+file_usage() {
+    printf '%bjroot file%b - copy or move files in/out of a jail\n\n' "$H" "$N"
+    printf '    %bjroot file cp <name> <src> <dst>%b\n' "$G" "$N"
+    printf '    %bjroot file mv <name> <src> <dst>%b\n' "$G" "$N"
+    printf '\n'
+    printf '    Paths prefixed with %b:%b are inside the jail, e.g.\n' "$G" "$N"
+    printf '        %b$%b jroot file cp dev ~/app.tar.gz :/root/app.tar.gz   %b(host -> jail)%b\n' "$G" "$N" "$B" "$N"
+    printf '        %b$%b jroot file cp dev :/root/log.txt ./log.txt          %b(jail -> host)%b\n' "$G" "$N" "$B" "$N"
+    printf '\n'
+    printf '    Exactly one of <src>/<dst> must be a jail path.\n'
+}
+
+cmd_file() {
+    local op=""
+    if [ $# -ge 1 ]; then op="$1"; shift; fi
+    case "$op" in
+        cp|mv) ;;
+        *)
+            file_usage
+            if [ -z "$op" ]; then err "Missing operation. Use cp or mv."; fi
+            err "Unknown file op '$op'. Use cp or mv."
+            ;;
+    esac
+    [ $# -eq 3 ] || { file_usage; err "jroot file $op needs <name> <src> <dst>."; }
+    local name="$1" src="$2" dest="$3"
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
+
+    local src_is_jail=0 dest_is_jail=0 real_src real_dest
+    [[ "$src" == :* ]] && src_is_jail=1
+    [[ "$dest" == :* ]] && dest_is_jail=1
+    if [ "$src_is_jail" = "$dest_is_jail" ]; then
+        err "Exactly one of <src>/<dest> must be a jail path (prefix with ':', e.g. :/root/file)"
+    fi
+
+    real_src="$src"; real_dest="$dest"
+    [ "$src_is_jail" = 1 ] && real_src="$ROOTS_DIR/$name/${src#:}"
+    [ "$dest_is_jail" = 1 ] && real_dest="$ROOTS_DIR/$name/${dest#:}"
+
+    if [ "$dest_is_jail" = 1 ]; then
+        mkdir -p "$(dirname "$real_dest")" 2>/dev/null || true
+    fi
+
+    if [ "$op" = "cp" ]; then
+        cp -r "$real_src" "$real_dest" || err "Copy failed: '$src' -> '$dest'"
+        log "Copied '$src' -> '$dest'"
+    else
+        mv "$real_src" "$real_dest" || err "Move failed: '$src' -> '$dest'"
+        log "Moved '$src' -> '$dest'"
+    fi
+}
+
+port_usage() {
+    printf '%bjroot port%b - control which jailed ports may bind publicly\n\n' "$H" "$N"
+    printf '    %bjroot port <name> list%b              show public ports\n' "$G" "$N"
+    printf '    %bjroot port <name> add <port>%b        make a port public (0.0.0.0)\n' "$G" "$N"
+    printf '    %bjroot port <name> rm <port>%b         force loopback again (127.0.0.1)\n' "$G" "$N"
+    printf '\n'
+    printf '    Jailed servers are loopback-only by default. A bind() LD_PRELOAD\n'
+    printf '    shim forces 127.0.0.1 unless the port is in the public list.\n'
+}
+
+cmd_port() {
+    [ $# -ge 2 ] || { port_usage; err "Usage: jroot port <name> list|add|rm [port]"; }
+    local name="$1" op="$2" port="$3"
+    local cfg="$CONFIGS_DIR/$name.json"
+    [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+
+    case "$op" in
+        list)
+            local ports cur
+            cur="$(config_ports "$cfg")"
+            if [ -z "$cur" ]; then
+                log "No public ports for '$name'. Servers are loopback-only (127.0.0.1)."
+            else
+                log "Public ports for '$name': $cur (bind to 0.0.0.0)"
+            fi
+            ;;
+        add)
+            [ -n "$port" ] || { port_usage; err "Usage: jroot port $name add <port>"; }
+            [[ "$port" =~ ^[0-9]+$ ]] || err "Port must be a number, got '$port'"
+            [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || err "Port out of range: $port"
+            local cur all
+            cur="$(config_ports "$cfg")"
+            if [ -n "$cur" ]; then
+                all="$cur,$port"
+            else
+                all="$port"
+            fi
+            all="$(set_config_ports "$cfg" $(echo "$all" | tr ',' ' ') 2>/dev/null)"
+            [ -n "$all" ] || err "Failed to save port config."
+            log "Port $port is now PUBLIC for '$name' (binds 0.0.0.0). All ports: $all"
+            ;;
+        rm)
+            [ -n "$port" ] || { port_usage; err "Usage: jroot port $name rm <port>"; }
+            local cur rest all
+            cur="$(config_ports "$cfg")"
+            rest="$(echo "$cur" | tr ',' ' ' | sed "s/\b$port\b//g" | tr -s ' ')"
+            all="$(set_config_ports "$cfg" $rest 2>/dev/null)"
+            [ -n "$all" ] || all="(none)"
+            log "Port $port removed for '$name'. Public ports now: $all"
+            ;;
+        *)
+            port_usage
+            err "Unknown port op '$op'. Use list, add, or rm."
+            ;;
+    esac
+}
+
+cmd_install() {
+    ensure_runtime
+    [ -x "$PROOT_BIN" ] || install_proot
+    [ $# -ge 2 ] || err "Usage: jroot install <name> <package...>"
+    local name="$1"; shift
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
+
+    local user_mode
+    user_mode="$(config_field "$CONFIGS_DIR/$name.json" user)"; [ -n "$user_mode" ] || user_mode="root"
+
+    # For unroot jails, we need to temporarily unlock root before install, then lock it again after
+    if [ "$user_mode" = "unroot" ]; then
+        log "Unroot jail detected. Temporarily unlocking root for install..."
+        run_in_jail --root "$name" /bin/sh -c "
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+            export DEBIAN_FRONTEND=noninteractive
+            dpkg --configure -a 2>/dev/null || true
+            apt-get update || true
+            sed -i 's/^root:!:/root:*/' /etc/shadow 2>/dev/null || true
+        " || warn "Failed to unlock root for install."
+    fi
+
+    log "Installing in '$name': $*"
+    write_policy_rcd "$name"
+    run_in_jail --root "$name" /bin/sh -c "
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+        export DEBIAN_FRONTEND=noninteractive
+        dpkg --configure -a 2>/dev/null || true
+        apt-get update || true
+        apt-get install -y --allow-unauthenticated $*
+    " || { warn "Install failed inside '$name'."; return 1; }
+    log "Installed in '$name': $*"
+
+    # For unroot jails, lock root again after install
+    if [ "$user_mode" = "unroot" ]; then
+        log "Locking root again for unroot jail..."
+        run_in_jail --root "$name" /bin/sh -c "
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+            passwd -l root 2>/dev/null || true
+        " || warn "Failed to lock root after install."
+    fi
+}
+
+cmd_clean() {
+    ensure_runtime
+    [ -x "$PROOT_BIN" ] || install_proot
+    [ $# -ge 1 ] || err "Usage: jroot clean <name> [more jails...]"
+    local name arg
+    for arg in "$@"; do
+        [ -f "$CONFIGS_DIR/$arg.json" ] || err "Jail '$arg' not found. Run 'jroot list' to see jails."
+        [ -d "$ROOTS_DIR/$arg" ] || err "Rootfs for '$arg' is missing. Recreate it: jroot rm $arg && jroot init <image>"
+    done
+
+    local before after saved
+    for name in "$@"; do
+        before="$(du -sm "$ROOTS_DIR/$name" 2>/dev/null | awk '{print $1}')"
+        log "Cleaning '$name' (apt caches, package lists, temp files)..."
+        run_in_jail --root "$name" /bin/sh -c "
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+            export DEBIAN_FRONTEND=noninteractive
+            dpkg --configure -a 2>/dev/null || true
+            apt-get clean 2>/dev/null || true
+            rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+            rm -rf /var/cache/apt/archives/* 2>/dev/null || true
+            rm -rf /var/cache/debconf 2>/dev/null || true
+            rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+        " || warn "Clean inside '$name' failed."
+        if [ -f "$CONFIGS_DIR/$name.json" ]; then
+            local build_essential
+            build_essential="$(config_field "$CONFIGS_DIR/$name.json" build_essential)"
+            if [ "$build_essential" = "1" ]; then
+                rm -rf "$ROOTS_DIR/$name/usr/share/doc" 2>/dev/null || true
+                rm -rf "$ROOTS_DIR/$name/var/log" 2>/dev/null || true
+            fi
+        fi
+        after="$(du -sm "$ROOTS_DIR/$name" 2>/dev/null | awk '{print $1}')"
+        saved=$(( before - after ))
+        if [ "$saved" -gt 0 ]; then
+            log "'$name' cleaned: ${before}MB -> ${after}MB (freed ${saved}MB)"
+        else
+            log "'$name' cleaned: still ${after}MB"
+        fi
+    done
+}
+
+cmd_size() {
+    [ $# -le 1 ] || err "Usage: jroot size [name]"
+    local name="${1:-}"
+    printf '%-20s %10s %s\n' "JAIL" "ROOTFS" "SNAPSHOTS"
+    if [ -n "$name" ]; then
+        [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+        size_one "$name"
+        return 0
+    fi
+    local cfgs=() cfg
+    shopt -s nullglob
+    cfgs=("$CONFIGS_DIR"/*.json)
+    shopt -u nullglob
+    [ "${#cfgs[@]}" -gt 0 ] || { err "No jails found. Create one first: jroot init ubuntu:22.04"; }
+    for cfg in "${cfgs[@]}"; do
+        size_one "$(basename "$cfg" .json)"
+    done
+}
+
+size_one() {
+    local name="$1"
+    local rootfs="$ROOTS_DIR/$name" rsize ssize snaps snapshots_dir
+    if [ -d "$rootfs" ]; then
+        rsize="$(du -sh "$rootfs" 2>/dev/null | awk '{print $1}')"
+    else
+        rsize="(missing)"
+    fi
+    snapshots_dir="$SNAPSHOTS_DIR/$name"
+    ssize="0B"
+    shopt -s nullglob
+    snaps=("$snapshots_dir"/*.tar.gz)
+    shopt -u nullglob
+    if [ "${#snaps[@]}" -gt 0 ]; then
+        ssize="$(du -sh "$snapshots_dir" 2>/dev/null | awk '{print $1}')"
+    fi
+    printf '%-20s %10s %10s\n' "$name" "$rsize" "$ssize"
+}
+
+cmd_list() {
+    local json=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json|-j) json=1 ;;
+            *) err "Unknown option: $1 (try 'jroot list --json')" ;;
+        esac
+        shift
+    done
+
+    local cfgs=() cfg name image user_mode mount_host mount_home build_essential
+    shopt -s nullglob
+    cfgs=("$CONFIGS_DIR"/*.json)
+    shopt -u nullglob
+    if [ "${#cfgs[@]}" -eq 0 ]; then
+        if [ "$json" = 1 ]; then
+            printf '[]\n'
+        else
+            log "No jails yet. Create one: jroot init ubuntu:22.04"
+        fi
+        return
+    fi
+
+    if [ "$json" = 1 ]; then
+        local first=1
+        printf '[\n'
+        for cfg in "${cfgs[@]}"; do
+            name="$(basename "$cfg" .json)"
+            image="$(config_field "$cfg" image)"
+            user_mode="$(config_field "$cfg" user)";      [ -n "$user_mode" ]  || user_mode="root"
+            mount_host="$(config_field "$cfg" mount_host)"; [ -n "$mount_host" ] || mount_host=0
+            mount_home="$(config_field "$cfg" mount_home)"; [ -n "$mount_home" ] || mount_home=0
+            build_essential="$(config_field "$cfg" build_essential)"; [ -n "$build_essential" ] || build_essential=1
+            [ "$first" = 1 ] || printf ',\n'
+            first=0
+            printf '  {"name": "%s", "image": "%s", "user": "%s", "mount_host": %s, "mount_home": %s, "build_essential": %s, "rootfs": "%s"}' \
+                "$(json_esc "$name")" "$(json_esc "$image")" "$(json_esc "$user_mode")" \
+                "$mount_host" "$mount_home" "$build_essential" "$(json_esc "$ROOTS_DIR/$name")"
+        done
+        printf '\n]\n'
+        return
+    fi
+
+    printf '%-16s %-14s %-8s %-5s %-5s %-5s %s\n' "NAME" "IMAGE" "USER" "MNT/" "MNT~" "BUILD" "ROOTFS"
+    for cfg in "${cfgs[@]}"; do
+        name="$(basename "$cfg" .json)"
+        image="$(config_field "$cfg" image)"
+        user_mode="$(config_field "$cfg" user)";      [ -n "$user_mode" ]  || user_mode="root"
+        mount_host="$(config_field "$cfg" mount_host)"; [ -n "$mount_host" ] || mount_host=0
+        mount_home="$(config_field "$cfg" mount_home)"; [ -n "$mount_home" ] || mount_home=0
+        build_essential="$(config_field "$cfg" build_essential)"; [ -n "$build_essential" ] || build_essential=1
+        printf '%-16s %-14s %-8s %-5s %-5s %-5s %s\n' "$name" "${image:-?}" "$user_mode" "$mount_host" "$mount_home" "$build_essential" "$ROOTS_DIR/$name"
+    done
+}
+
+cmd_config() {
+    [ $# -ge 1 ] || err "Usage: jroot config <name> [--show|--mount-host=0/1|--mount-home=0/1|--build-essential=0/1|--user=root/unroot]"
+    local name="$1"; shift
+    local cfg="$CONFIGS_DIR/$name.json"
+    [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+
+    case " $* " in
+        *" --show "*) show_config "$name"; return 0 ;;
+    esac
+
+    local image user_mode mount_host mount_home build_essential response mounts_pairs
+    image="$(config_field "$cfg" image)"
+    user_mode="$(config_field "$cfg" user)";          [ -n "$user_mode" ]          || user_mode="root"
+    mount_host="$(config_field "$cfg" mount_host)";   [ -n "$mount_host" ]         || mount_host=0
+    mount_home="$(config_field "$cfg" mount_home)";   [ -n "$mount_home" ]         || mount_home=0
+    build_essential="$(config_field "$cfg" build_essential)"; [ -n "$build_essential" ] || build_essential=1
+    mounts_pairs="$(config_mounts "$cfg" 2>/dev/null | sed 's/\t/=/g' | tr '\n' ' ')"
+
+    if [ $# -eq 0 ]; then
+        log "Current config for '$name':"
+        show_config "$name"
+        user_mode="$(ask "Root or unroot inside? [$user_mode]: " "$user_mode")"
+        case "$user_mode" in root|unroot) ;; *) err "Choose 'root' or 'unroot'." ;; esac
+        response="$(ask "Mount host / to /mnt/host? [y/N] (current: $mount_host): " "N")"
+        [[ "$response" =~ ^[Yy] ]] && mount_host=1 || mount_host=0
+        response="$(ask "Mount host home to /mnt/home? [y/N] (current: $mount_home): " "N")"
+        [[ "$response" =~ ^[Yy] ]] && mount_home=1 || mount_home=0
+    else
+        for arg in "$@"; do
+            case "$arg" in
+                --mount-host=1|--mount-host=0)      mount_host="${arg#*=}" ;;
+                --mount-home=1|--mount-home=0)      mount_home="${arg#*=}" ;;
+                --build-essential=1|--build-essential=0) build_essential="${arg#*=}" ;;
+                --user=root|--user=unroot)          user_mode="${arg#*=}" ;;
+                *) err "Unknown option: $arg" ;;
+            esac
+        done
+    fi
+
+    write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
+    if [ -n "$mounts_pairs" ]; then
+        set_config_mounts "$cfg" $mounts_pairs >/dev/null 2>&1
+    fi
+    log "Config updated for '$name':"
+    show_config "$name"
+    if [ "$user_mode" = "unroot" ]; then
+        setup_unroot_user "$name"
+    fi
+    if [ "$mount_host" = "1" ] || [ "$mount_home" = "1" ]; then
+        warn "Mounts are enabled - they take effect on the next 'jroot enter'."
+    fi
+}
+
+cmd_rm() {
+    [ $# -eq 1 ] || err "Usage: jroot rm <name>"
+    local name="$1" response
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    printf 'Delete jail "%s" and its rootfs (%s)? [y/N]: ' "$name" "$ROOTS_DIR/$name"
+    read -r response || response="N"
+    case "$response" in
+        y|Y|yes|YES) ;;
+        *) log "Aborted."; return 0 ;;
+    esac
+    rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json"
+    log "Jail '$name' deleted."
+}
+
+cmd_rename() {
+    [ $# -eq 2 ] || err "Usage: jroot rename <name> <newname>"
+    local name="$1" newname="$2"
+    [ "$name" != "$newname" ] || err "New name is the same as the current name."
+    [[ "$newname" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid new name: '$newname'"
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -f "$CONFIGS_DIR/$newname.json" ] && err "Jail '$newname' already exists. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
+
+    local cfg="$CONFIGS_DIR/$name.json" newcfg="$CONFIGS_DIR/$newname.json"
+
+    # 1) Rename the rootfs dir.
+    if [ -d "$ROOTS_DIR/$newname" ] && [ "$ROOTS_DIR/$newname" != "$ROOTS_DIR/$name" ]; then
+        err "Rootfs '$ROOTS_DIR/$newname' already exists."
+    fi
+    mv "$ROOTS_DIR/$name" "$ROOTS_DIR/$newname" || err "Failed to rename rootfs."
+
+    # 2) Rename config, keeping every field but updating "name".
+    local image user_mode mount_host mount_home build_essential ports mounts_pairs
+    image="$(config_field "$cfg" image)"
+    user_mode="$(config_field "$cfg" user)";          [ -n "$user_mode" ]          || user_mode="root"
+    mount_host="$(config_field "$cfg" mount_host)";   [ -n "$mount_host" ]         || mount_host=0
+    mount_home="$(config_field "$cfg" mount_home)";   [ -n "$mount_home" ]         || mount_home=0
+    build_essential="$(config_field "$cfg" build_essential)"; [ -n "$build_essential" ] || build_essential=1
+    ports="$(config_ports "$cfg" 2>/dev/null || true)"
+    mounts_pairs="$(config_mounts "$cfg" 2>/dev/null | sed 's/\t/=/g' | tr '\n' ' ')"
+    rm -f "$cfg"
+    write_config "$newname" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
+    if [ -n "$ports" ]; then
+        set_config_ports "$newcfg" $(echo "$ports" | tr ',' ' ') >/dev/null 2>&1
+    fi
+    if [ -n "$mounts_pairs" ]; then
+        set_config_mounts "$newcfg" $mounts_pairs >/dev/null 2>&1
+    fi
+
+    # 3) Rename snapshots dir.
+    if [ -d "$SNAPSHOTS_DIR/$name" ]; then
+        mv "$SNAPSHOTS_DIR/$name" "$SNAPSHOTS_DIR/$newname" 2>/dev/null || true
+    fi
+
+    # 4) Point the jail's hostname files at the new name.
+    write_rootfs_niceties "$newname"
+
+    log "Renamed '$name' -> '$newname' (hostname, prompt, snapshots updated)."
+}
+
+cmd_doctor() {
+    ensure_runtime
+    local ok=0 warn=0 fail=0
+    local status=
+
+    report() { # $1 = label, $2 = ok|warn|fail, rest = detail
+        local label="$1" lvl="$2" detail="${3:-}"
+        case "$lvl" in
+            ok)   printf '  [PASS] %s\n' "$label"; ok=$((ok+1)) ;;
+            warn) printf '  [WARN] %s\n' "$label"; warn=$((warn+1)) ;;
+            fail) printf '  [FAIL] %s\n' "$label"; fail=$((fail+1)) ;;
+        esac
+        [ -z "$detail" ] || printf '         %s\n' "$detail"
+    }
+
+    log "jroot doctor - checking installation..."
+    [ -w "$JROOT_HOME" ] && report "jroot home writable: $JROOT_HOME" ok || report "jroot home not writable: $JROOT_HOME" fail
+    for d in "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR"; do
+        [ -d "$d" ] || report "missing dir: $d" fail
+    done
+
+    if [ -x "$PROOT_BIN" ]; then
+        status="$(env -i "$PROOT_BIN" --version 2>/dev/null | grep -m1 -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' || true)"
+        report "proot binary: $PROOT_BIN" ok "${status:-version unknown}"
+    else
+        report "proot binary missing: $PROOT_BIN" warn "Run 'jroot init <image>' or reinstall to fix."
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        report "python3 (seccomp launcher): $(command -v python3)" ok
+        [ -x "$SECCOMP_LAUNCHER" ] && report "seccomp launcher: $SECCOMP_LAUNCHER" ok || report "seccomp launcher missing: $SECCOMP_LAUNCHER" warn
+    else
+        report "python3 not found" warn "proot escape protection (openat2 block) will be disabled"
+    fi
+
+    local cfgs=() cfg name rootfs
+    shopt -s nullglob
+    cfgs=("$CONFIGS_DIR"/*.json)
+    shopt -u nullglob
+    if [ "${#cfgs[@]}" -eq 0 ]; then
+        log "  No jails yet. Create one: jroot init ubuntu:22.04"
+    else
+        for cfg in "${cfgs[@]}"; do
+            name="$(basename "$cfg" .json)"
+            rootfs="$ROOTS_DIR/$name"
+            if [ -f "$cfg" ] && [ -n "$(config_field "$cfg" image)" ]; then
+                report "jail '$name' config" ok
+            else
+                report "jail '$name' config" fail "$cfg"
+            fi
+            if [ -d "$rootfs" ] && [ -f "$rootfs/etc/os-release" ]; then
+                local size
+                size="$(du -sh "$rootfs" 2>/dev/null | awk '{print $1}')"
+                report "jail '$name' rootfs" ok "${rootfs} (${size})"
+            else
+                report "jail '$name' rootfs" fail "$rootfs missing or incomplete"
+            fi
+        done
+    fi
+
+    printf '\n  Summary: %d ok, %d warn, %d fail\n' "$ok" "$warn" "$fail"
+    [ "$fail" -eq 0 ]
+}
+
+cmd_update() {
+    ensure_runtime
+    local name="" arg
+    for arg in "$@"; do
+        if [ -f "$CONFIGS_DIR/$arg.json" ]; then
+            name="$arg"
+        elif [ -z "$name" ]; then
+            name="$arg"
+        else
+            err "Usage: jroot update [name]"
+        fi
+    done
+
+    if [ -n "$name" ]; then
+        [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
+        local codename image_tag
+        image_tag="$(config_field "$CONFIGS_DIR/$name.json" image)"
+        image_tag="${image_tag#*:}"
+        codename="$(version_to_codename "$image_tag" 2>/dev/null || true)"
+        [ -n "$codename" ] || codename="noble"
+        log "Refreshing apt config for '$name'..."
+        config_apt "$name" "$codename"
+        write_sudoers "$name"
+        write_rootfs_niceties "$name"
+        log "Updating packages inside '$name' (apt-get update && upgrade)..."
+        run_in_jail --root "$name" /bin/sh -c "
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            export DEBIAN_FRONTEND=noninteractive
+            dpkg --configure -a 2>/dev/null || true
+            apt-get update || true
+            apt-get upgrade -y --allow-unauthenticated || true
+        " || { warn "Package upgrade inside '$name' failed (network?)."; return 1; }
+        if [ "$(config_field "$CONFIGS_DIR/$name.json" user)" = "unroot" ]; then
+            setup_unroot_user "$name"
+        fi
+        log "Jail '$name' is up to date."
+        return 0
+    fi
+
+    log "Updating proot runtime..."
+    install_proot
+    log "proot is up to date: $("$PROOT_BIN" --version 2>/dev/null | grep -m1 -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' || true)"
+
+    local cfgs=() cfg
+    shopt -s nullglob
+    cfgs=("$CONFIGS_DIR"/*.json)
+    shopt -u nullglob
+    if [ "${#cfgs[@]}" -eq 0 ]; then
+        log "No jails to update."
+        return 0
+    fi
+    for cfg in "${cfgs[@]}"; do
+        cmd_update "$(basename "$cfg" .json)" || true
+    done
+}
+
+cmd_info() {
+    [ $# -le 1 ] || err "Usage: jroot info [name]"
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        name="$(first_jail 2>/dev/null || true)"
+        [ -n "$name" ] || err "No jails found. Create one first: jroot init ubuntu:22.04"
+    fi
+    local cfg="$CONFIGS_DIR/$name.json"
+    [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+
+    local rootfs="$ROOTS_DIR/$name" size snaps snapshots_dir count
+    if [ -d "$rootfs" ]; then
+        size="$(du -sh "$rootfs" 2>/dev/null | awk '{print $1}')"
+    else
+        size="(missing)"
+    fi
+    snapshots_dir="$SNAPSHOTS_DIR/$name"
+    count=0
+    shopt -s nullglob
+    snaps=("$snapshots_dir"/*.tar.gz)
+    shopt -u nullglob
+    count="${#snaps[@]}"
+
+    printf 'Jail: %s\n' "$name"
+    printf '  image:            %s\n' "$(config_field "$cfg" image)"
+    printf '  user:             %s\n' "$(config_field "$cfg" user)"
+    printf '  build_essential:  %s\n' "$(config_field "$cfg" build_essential)"
+    printf '  mount_host (/):   %s\n' "$(config_field "$cfg" mount_host)"
+    printf '  mount_home (~):   %s\n' "$(config_field "$cfg" mount_home)"
+    printf '  rootfs:           %s  (%s)\n' "$rootfs" "$size"
+    printf '  snapshots:        %s\n' "$count"
+    if [ "$count" -gt 0 ]; then
+        printf '  last snapshot:    %s\n' "$(basename "${snaps[$((count-1))]}" .tar.gz)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Snapshots / revert (tar.gz rootfs + config at snapshot time)
+# ---------------------------------------------------------------------------
+snapshot_list() {
+    local name="$1"
+    local dir="$SNAPSHOTS_DIR/$name"
+    local snaps=() s
+    shopt -s nullglob
+    snaps=("$dir"/*.tar.gz)
+    shopt -u nullglob
+    if [ "${#snaps[@]}" -eq 0 ]; then
+        log "No snapshots for '$name' yet. Run: jroot snapshot $name"
+        return 1
+    fi
+    printf '%-20s %-14s %s\n' "LABEL" "SIZE" "DATE"
+    for s in "${snaps[@]}"; do
+        printf '%-20s %-14s %s\n' "$(basename "$s" .tar.gz)" \
+            "$(du -sh "$s" 2>/dev/null | awk '{print $1}')" \
+            "$(date -r "$s" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+    done
+}
+
+cmd_snapshot() {
+    [ $# -ge 1 ] || err "Usage: jroot snapshot <name> [label]"
+    local name="$1" label="${2:-}"
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing."
+    [ -n "$label" ] || label="$(date +%Y%m%d-%H%M%S)"
+    [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid snapshot label: '$label'"
+
+    local dir="$SNAPSHOTS_DIR/$name"
+    mkdir -p "$dir"
+    local tmp
+    tmp="$(mktemp "$dir/.snap.XXXXXX")"
+    rm -f "$tmp"
+    log "Snapshotting '$name' as '$label'..."
+    if tar -czf "$tmp.tar.gz" -C "$ROOTS_DIR" "$name" 2>/dev/null; then
+        mv "$tmp.tar.gz" "$dir/$label.tar.gz"
+        cp "$CONFIGS_DIR/$name.json" "$dir/$label.json"
+        log "Snapshot saved: $dir/$label.tar.gz"
+    else
+        rm -f "$tmp.tar.gz"
+        err "Snapshot failed."
+    fi
+}
+
+cmd_snapshots() {
+    [ $# -eq 1 ] || err "Usage: jroot snapshots <name>"
+    [ -f "$CONFIGS_DIR/$1.json" ] || err "Jail '$1' not found. Run 'jroot list' to see jails."
+    snapshot_list "$1"
+}
+
+cmd_revert() {
+    [ $# -ge 1 ] || err "Usage: jroot revert <name> [label]"
+    local name="$1" label="${2:-}"
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    local dir="$SNAPSHOTS_DIR/$name"
+
+    if [ -z "$label" ]; then
+        log "Available snapshots for '$name':"
+        snapshot_list "$name" || return 1
+        printf 'Which label to restore? [none]: '
+        read -r label || label=""
+        [ -n "$label" ] || { log "Aborted."; return 0; }
+    fi
+
+    [ -f "$dir/$label.tar.gz" ] || err "Snapshot '$label' not found for '$name'. Run 'jroot snapshots $name'."
+    [ -f "$dir/$label.json" ] || err "Snapshot config '$dir/$label.json' missing."
+
+    local response
+    printf 'Restore jail "%s" to snapshot "%s"? This replaces the current rootfs. [y/N]: ' "$name" "$label"
+    read -r response || response="N"
+    case "$response" in
+        y|Y|yes|YES) ;;
+        *) log "Aborted."; return 0 ;;
+    esac
+
+    local rootfs="$ROOTS_DIR/$name" tmp
+    tmp="$(mktemp -d "$SNAPSHOTS_DIR/.restore.XXXXXX")"
+    log "Restoring '$name' from '$label'..."
+    if ! tar -xzf "$dir/$label.tar.gz" -C "$tmp" 2>/dev/null; then
+        rm -rf "$tmp"
+        err "Restore failed: corrupt snapshot archive."
+    fi
+
+    rm -rf "$rootfs"
+    mv "$tmp/$name" "$rootfs"
+    cp "$dir/$label.json" "$CONFIGS_DIR/$name.json"
+    rm -rf "$tmp"
+    log "Jail '$name' restored to snapshot '$label'."
+}
+
+cmd_rm_snapshot() {
+    [ $# -eq 2 ] || err "Usage: jroot rm-snapshot <name> <label>"
+    local name="$1" label="$2"
+    local dir="$SNAPSHOTS_DIR/$name"
+    [ -f "$dir/$label.tar.gz" ] || err "Snapshot '$label' not found for '$name'. Run 'jroot snapshots $name'."
+    local response
+    printf 'Delete snapshot "%s/%s"? [y/N]: ' "$name" "$label"
+    read -r response || response="N"
+    case "$response" in
+        y|Y|yes|YES) ;;
+        *) log "Aborted."; return 0 ;;
+    esac
+    rm -f "$dir/$label.tar.gz" "$dir/$label.json"
+    rmdir "$dir" 2>/dev/null || true
+    log "Snapshot '$label' deleted."
+}
+
+help_header() {
+    printf '%b%s%b\n\n' "$H" "$1" "$N"
+}
+
+help_row() {
+    # $1 command-word (green), $2 args (blue), $3 description (aligned)
+    local name="$1" args="$2" desc="$3" vis pad
+    vis=$(( ${#name} + ${#args} + 1 ))
+    pad=$(( 40 - vis ))
+    [ "$pad" -lt 2 ] && pad=2
+    printf '    %b%s%b %b%s%b%*s%s\n' "$G" "$name" "$N" "$B" "$args" "$N" "$pad" "" "$desc"
+}
+
+cmd_help_cmd() {
+    local cmd="$1"; shift
+    case "$cmd" in
+        init)
+            printf '%bjroot init%b - create a jail from an Ubuntu image\n\n' "$H" "$N"
+            printf '    %bjroot init <image> [--name=<n>] [flags]%b\n' "$G" "$N"
+            help_row "image" "ubuntu:22.04|20.04|24.04|24.10" "Ubuntu release to use"
+            help_row "--name=<n>" "" "Jail name (default: derived from image)"
+            help_row "--user=root|unroot" "" "root=fake root, unroot=non-root jail user"
+            help_row "--build-essential=0/1" "" "Install gcc/g++/make (default 1)"
+            help_row "--mount-host=0/1" "" "Bind host / to /mnt/host (default 0)"
+            help_row "--mount-home=0/1" "" "Bind host \$HOME to /mnt/home (default 0)"
+            printf '\n    %bExample:%b jroot init ubuntu:22.04 --name=dev --user=unroot\n' "$G" "$N"
+            ;;
+        enter)
+            printf '%bjroot enter%b - open a shell, or run a command, inside a jail\n\n' "$H" "$N"
+            printf '    %bjroot enter <name>%b\n' "$G" "$N"
+            printf '    %bjroot enter <name> <cmd...>%b\n' "$G" "$N"
+            printf '    %bjroot enter <name> --root <cmd...>%b\n' "$G" "$N"
+            printf '\n    Without a command you get an interactive shell. Use --root to act as\n'
+            printf '    the admin (root) user.\n'
+            ;;
+        shell)
+            printf '%bjroot shell%b - interactive jroot command shell\n\n' "$H" "$N"
+            printf '    %bjroot shell%b\n' "$G" "$N"
+            printf '\n    Opens a %bjroot>%b prompt where you run jroot commands without the\n' "$B" "$N"
+            printf '    prefix (e.g. %blist%b, %benter dev%b). Type %bexit%b to leave.\n' "$G" "$N" "$G" "$N" "$G" "$N"
+            ;;
+        clean)
+            printf '%bjroot clean%b - free disk space inside a jail\n\n' "$H" "$N"
+            printf '    %bjroot clean <name> [more jails...]%b\n' "$G" "$N"
+            printf '\n    Removes apt caches, package lists, debconf, and temp files.\n'
+            printf '    Also trims /usr/share/doc and /var/log for build-essential jails.\n'
+            ;;
+        size)
+            printf '%bjroot size%b - show disk usage per jail\n\n' "$H" "$N"
+            printf '    %bjroot size%b                (all jails)\n' "$G" "$N"
+            printf '    %bjroot size <name>%b         (one jail)\n' "$G" "$N"
+            printf '\n    Shows rootfs size and total snapshot size per jail.\n'
+            ;;
+        exec)
+            printf '%bjroot exec%b - run a single command inside a jail (no shell)\n\n' "$H" "$N"
+            printf '    %bjroot exec <name> [--root] <cmd...>%b\n' "$G" "$N"
+            printf '\n    %bExample:%b jroot exec dev --root apt-get update\n' "$G" "$N"
+            ;;
+        file)
+            if [ $# -ge 1 ]; then
+                case "$1" in
+                    cp) printf '%bjroot file cp%b - copy a file between host and jail\n\n' "$H" "$N"
+                        printf '    %bjroot file cp <name> <src> <dst>%b\n' "$G" "$N"
+                        printf '\n    One of <src>/<dst> must be a jail path (prefix %b:%b).\n' "$G" "$N"
+                        printf '    %bhost -> jail:%b  jroot file cp dev ~/app.tar.gz :/root/app.tar.gz\n' "$G" "$N"
+                        printf '    %bjail -> host:%b  jroot file cp dev :/root/log.txt ./log.txt\n' "$G" "$N"
+                        ;;
+                    mv) printf '%bjroot file mv%b - move a file between host and jail\n\n' "$H" "$N"
+                        printf '    %bjroot file mv <name> <src> <dst>%b\n' "$G" "$N"
+                        printf '\n    Same rules as %bjroot file cp%b. One path is a jail path (prefix %b:%b).\n' "$G" "$N" "$G" "$N"
+                        ;;
+                    *)  err "Unknown file subcommand: $1 (try 'jroot help file cp' or 'jroot help file mv')" ;;
+                esac
+            else
+                file_usage
+            fi
+            ;;
+        port)
+            port_usage
+            ;;
+        mnt)
+            mnt_usage "<name>"
+            ;;
+        install)
+            printf '%bjroot install%b - install apt packages inside a jail\n\n' "$H" "$N"
+            printf '    %bjroot install <name> <pkg...>%b\n' "$G" "$N"
+            printf '\n    Runs %bjroot exec <name> --root apt-get install -y ...%b\n' "$G" "$N"
+            printf '    %bExample:%b jroot install dev git curl\n' "$G" "$N"
+            ;;
+        config)
+            printf '%bjroot config%b - view or change a jail'"'"'s settings\n\n' "$H" "$N"
+            printf '    %bjroot config <name>%b\n' "$G" "$N"
+            printf '    %bjroot config <name> --show%b\n' "$G" "$N"
+            printf '    %bjroot config <name> --mount-host=0/1%b\n' "$G" "$N"
+            printf '    %bjroot config <name> --mount-home=0/1%b\n' "$G" "$N"
+            printf '    %bjroot config <name> --build-essential=0/1%b\n' "$G" "$N"
+            printf '    %bjroot config <name> --user=root|unroot%b\n' "$G" "$N"
+            ;;
+        list|ls)
+            printf '%bjroot list%b - list all jails\n\n' "$H" "$N"
+            printf '    %bjroot list%b\n' "$G" "$N"
+            printf '    %bjroot list --json%b   (machine-readable output)\n' "$G" "$N"
+            ;;
+        info)
+            printf '%bjroot info%b - show a jail'"'"'s details and disk usage\n\n' "$H" "$N"
+            printf '    %bjroot info [name]%b    (no name = all jails)\n' "$G" "$N"
+            ;;
+        snapshot)
+            printf '%bjroot snapshot%b - save a full backup of a jail\n\n' "$H" "$N"
+            printf '    %bjroot snapshot <name> [label]%b\n' "$G" "$N"
+            printf '\n    Saves rootfs + config as a tar.gz. Label defaults to a timestamp.\n'
+            ;;
+        snapshots)
+            printf '%bjroot snapshots%b - list saved snapshots for a jail\n\n' "$H" "$N"
+            printf '    %bjroot snapshots <name>%b\n' "$G" "$N"
+            ;;
+        revert)
+            printf '%bjroot revert%b - restore a jail from a snapshot\n\n' "$H" "$N"
+            printf '    %bjroot revert <name> [label]%b\n' "$G" "$N"
+            printf '\n    Without a label, the latest snapshot is used.\n'
+            ;;
+        rm-snapshot)
+            printf '%bjroot rm-snapshot%b - delete a saved snapshot\n\n' "$H" "$N"
+            printf '    %bjroot rm-snapshot <name> <label>%b\n' "$G" "$N"
+            ;;
+        update)
+            printf '%bjroot update%b - update proot + packages in a jail\n\n' "$H" "$N"
+            printf '    %bjroot update [name]%b   (no name = all jails)\n' "$G" "$N"
+            ;;
+        doctor)
+            printf '%bjroot doctor%b - check the setup for problems\n\n' "$H" "$N"
+            printf '    %bjroot doctor%b\n' "$G" "$N"
+            ;;
+        rm|delete)
+            printf '%bjroot rm%b - permanently delete a jail\n\n' "$H" "$N"
+            printf '    %bjroot rm <name>%b\n' "$G" "$N"
+            printf '\n    Deletes the rootfs, config, and all snapshots for the jail.\n'
+            ;;
+        rename)
+            printf '%bjroot rename%b - rename a jail\n\n' "$H" "$N"
+            printf '    %bjroot rename <name> <newname>%b\n' "$G" "$N"
+            printf '\n    Moves the rootfs, config, and snapshots to the new name, and\n'
+            printf '    updates the jail hostname, /etc/hosts, and shell prompt.\n'
+            ;;
+        help)
+            printf '%bjroot help%b - show this help\n\n' "$H" "$N"
+            printf '    %bjroot help%b            (all commands)\n' "$G" "$N"
+            printf '    %bjroot help <command>%b   (one command, e.g. %bjroot help file cp%b)\n' "$G" "$N"
+            ;;
+        *)  err "Unknown command: $cmd (try '${CMD_HINT}help')" ;;
+    esac
+}
+
+cmd_help() {
+    if [ $# -ge 1 ]; then
+        cmd_help_cmd "$@"
+        return
+    fi
+    printf '%bjroot%b %b- rootless Linux jails (no host root required)%b\n\n' "$H" "$N" "$D" "$N"
+
+    printf '%bUSAGE%b\n' "$H" "$N"
+    printf '    %b<command>%b %b[arguments...]%b\n\n' "$G" "$N" "$B" "$N"
+
+    printf '%bCREATE & USE%b\n' "$H" "$N"
+    help_row "jroot init" "<image> [flags]"        "Create a jail (see FLAGS below)"
+    help_row "jroot enter" "<name>"                "Open a shell inside a jail"
+    help_row "jroot shell" ""                      "Interactive jroot command shell (jroot> prompt)"
+    help_row "jroot enter" "<name> <cmd...>"       "Run one command inside a jail"
+    help_row "jroot enter" "<name> --root <cmd>"   "Run a command as root (admin)"
+    help_row "jroot exec" "<name> [--root] <cmd>"  "Run one command inside a jail"
+    help_row "jroot file" "cp|mv <name> <src> <dst>" "Copy/move a file in or out of a jail"
+    printf '                                      %b (prefix jail paths with %b:%b, e.g. %b:/root/file%b)\n' "$B" "$G" "$N" "$G" "$N"
+    help_row "jroot port" "list|add|rm <name>"    "Control which jailed ports may bind publicly"
+    help_row "jroot mnt" "<name> <label> <dir>"   "Bind-mount a host directory at /mnt/<label>"
+    help_row "jroot install" "<name> <pkg...>"     "Install packages inside a jail (apt)"
+    help_row "jroot config" "<name>"               "View or change a jail's settings"
+    help_row "jroot list" "[--json]"               "List all jails (JSON with --json)"
+    help_row "jroot info" "[name]"                 "Show a jail's details and disk usage"
+    help_row "jroot size" "[name]"                 "Show disk usage per jail"
+    printf '\n'
+
+    printf '%bSNAPSHOTS%b\n' "$H" "$N"
+    help_row "jroot snapshot" "<name> [label]"      "Save a full backup (rootfs + config)"
+    help_row "jroot snapshots" "<name>"             "List saved snapshots"
+    help_row "jroot revert" "<name> [label]"        "Restore a jail from a snapshot"
+    help_row "jroot rm-snapshot" "<name> <label>"   "Delete a snapshot"
+    printf '\n'
+
+    printf '%bMAINTENANCE%b\n' "$H" "$N"
+    help_row "jroot update" "[name]"    "Update proot + packages (all jails if no name)"
+    help_row "jroot clean" "<name>..."  "Free disk space inside a jail"
+    help_row "jroot doctor" ""          "Check the setup for problems"
+    help_row "jroot rm" "<name>"        "Permanently delete a jail"
+    help_row "jroot rename" "<n> <new>" "Rename a jail (updates hostname/prompt/snapshots)"
+    help_row "jroot help" "[command]"     "Show help (for one command too)"
+    printf '\n'
+
+    printf '%bFLAGS for init%b\n' "$H" "$N"
+    help_row "--name=<n>" ""              "Jail name (default: derived from the image)"
+    help_row "--user=root|unroot" ""      "root = fake root (default). unroot = daily use"
+    printf '                                      %b as the non-root user %bjail%b, root locked;\n' "$B" "$H" "$N"
+    printf '                                      %b use %bjroot enter <name> --root%b for admin%b\n' "$B" "$G" "$N" "$N"
+    help_row "--build-essential=0/1" ""   "Install gcc/g++/make (default 1)"
+    help_row "--mount-host=0/1" ""        "Bind host / to /mnt/host (default 0)"
+    help_row "--mount-home=0/1" ""        "Bind host \$HOME to /mnt/home (default 0)"
+    printf '\n'
+
+    printf '%bSTORAGE (under ~/.jroot)%b\n' "$H" "$N"
+    help_row "roots/<name>" ""              "rootfs"
+    help_row "configs/<name>.json" ""       "jail config"
+    help_row "snapshots/<name>/" ""         "snapshots (tar.gz + config)"
+    printf '\n'
+
+    printf '%bEXAMPLES%b\n' "$H" "$N"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot init ubuntu:22.04"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot enter dev apt-get --version"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot install dev git curl"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot snapshot dev before-upgrade"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot revert dev before-upgrade"
+    printf '    %b$%b %s\n' "$G" "$N" "jroot list --json"
+}
+
+jroot_cmd() {
+    [ $# -ge 1 ] || { cmd_help; return 0; }
+    case "$1" in
+        init)          shift; cmd_init "$@" ;;
+        enter)         shift; cmd_enter "$@" ;;
+        exec)          shift; cmd_exec "$@" ;;
+        file)          shift; cmd_file "$@" ;;
+        port)          shift; cmd_port "$@" ;;
+        mnt)           shift; cmd_mnt "$@" ;;
+        mount)         shift; cmd_mnt "$@" ;;
+        install)       shift; cmd_install "$@" ;;
+        config)        shift; cmd_config "$@" ;;
+        list|ls)       shift; cmd_list "$@" ;;
+        info)          shift; cmd_info "$@" ;;
+        size)          shift; cmd_size "$@" ;;
+        update)        shift; cmd_update "$@" ;;
+        clean)         shift; cmd_clean "$@" ;;
+        snapshot)      shift; cmd_snapshot "$@" ;;
+        snapshots)     shift; cmd_snapshots "$@" ;;
+        revert)        shift; cmd_revert "$@" ;;
+        rm-snapshot)   shift; cmd_rm_snapshot "$@" ;;
+        doctor)        shift; cmd_doctor "$@" ;;
+        rm|delete)     shift; cmd_rm "$@" ;;
+        rename)        shift; cmd_rename "$@" ;;
+        help|--help|-h) shift; cmd_help "$@" ;;
+        *)             err "Unknown command: $1 (run '${CMD_HINT}help')" ;;
+    esac
+}
+
+cmd_shell() {
+    local line
+    CMD_HINT=""
+    printf '%bjroot interactive shell%b - run jroot commands without the prefix.\n' "$G" "$N"
+    printf '    Type %bhelp%b for commands, %bexit%b to leave.\n\n' "$G" "$N" "$G" "$N"
+    while true; do
+        read -r -p "jroot> " -a line || { printf 'Bye!\n'; return 0; }
+        if [ "${#line[@]}" -eq 0 ]; then
+            continue
+        fi
+        case "${line[0]}" in
+            exit|quit|bye|leave|exit\(\)|quit\(\)|:q|q) printf 'Bye!\n'; return 0 ;;
+            help|--help|-h) cmd_help "${line[@]:1}" 2>&1 | sed -E 's/jroot ([a-z])/\1/g' ;;
+            *)             (jroot_cmd "${line[@]}") || true ;;
+        esac
+    done
+}
+
+main() {
+    [ $# -ge 1 ] || { cmd_help; exit 0; }
+    case "$1" in
+        shell)         shift; cmd_shell "$@" ;;
+        *)             jroot_cmd "$@" ;;
+    esac
+}
+
+main "$@"
