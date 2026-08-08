@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# jroot - Rootless Linux jails via proot (no root on the host required)
+# jroot - Rootless Linux jails via proot
 #
 # Migrated from fakeroot3.sh. Commands:
 #   jroot init <image> [flags]  Create a jail (--name/--user/--build-essential/
