@@ -13,6 +13,62 @@
 [![Ubuntu](https://img.shields.io/badge/UBUNTU-16.04%20%E2%86%92%2026.04-E95420?style=for-the-badge\&logo=ubuntu\&logoColor=white)](#)
 [![Bash](https://img.shields.io/badge/BASH-RUNTIME-121011?style=for-the-badge\&logo=gnu-bash\&logoColor=white)](#)
 
+```bash
+$ jroot init ubuntu:22.04
+
+$ jroot enter ubuntu
+
+root@ubuntu:~# whoami
+root
+
+root@ubuntu:~# apt install git python3 gcc
+```
+
+```bash
+$ id
+uid=1000(...)
+```
+
+**No host root. No VM. No privileged `chroot`.**
+
+Just userspace.
+
+---
+
+## Installation
+
+1. Download the assets:
+```bash
+curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/install-jroot.sh
+curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
+```
+
+Or if you prefer using wget:
+```bash
+wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/install-jroot.sh
+wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
+```
+
+3. Run the installer:
+```bash
+bash install-jroot.sh
+```
+
+4. Use jroot:
+```bash
+jroot help
+```
+
+---
+
+## What is JRoot?
+
+JRoot is a rootless Linux jail manager built around **PRoot**.
+
+It creates complete Linux root filesystems and runs them from an ordinary user account, providing a configurable environment with package management, networking, filesystem mapping, root/unroot execution modes, snapshots, diagnostics, and optional security hardening.
+
+Everything lives under the user's JRoot directory. No system daemon is required, and the host does not need to grant JRoot administrative privileges.
+
 ```text
 HOST
  │
@@ -43,59 +99,7 @@ HOST
        └─────────────┘
 ```
 
-```bash
-$ jroot init ubuntu:22.04
-
-$ jroot enter ubuntu
-
-root@ubuntu:~# whoami
-root
-
-root@ubuntu:~# apt install git python3 gcc
-```
-
-```bash
-$ id
-uid=1000(...)
-```
-
-**No host root. No VM. No privileged `chroot`.**
-
-Just userspace.
-
 ---
-
-## What is JRoot?
-
-JRoot is a rootless Linux jail manager built around **PRoot**.
-
-It creates complete Linux root filesystems and runs them from an ordinary user account, providing a configurable environment with package management, networking, filesystem mapping, root/unroot execution modes, snapshots, diagnostics, and optional security hardening.
-
-Everything lives under the user's JRoot directory. No system daemon is required, and the host does not need to grant JRoot administrative privileges.
-
-## Installation
-
-1. Download the assets:
-```bash
-curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/install-jroot.sh
-curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
-```
-
-Or if you prefer using wget:
-```bash
-wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/install-jroot.sh
-wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
-```
-
-3. Run the installer:
-```bash
-bash install-jroot.sh
-```
-
-4. Use jroot:
-```bash
-jroot help
-```
 
 ### The interesting part?
 
