@@ -82,7 +82,7 @@ case "$ARCH" in
     *)       err "Unsupported architecture: $ARCH" ;;
 esac
 
-UBUNTU_VERSIONS="16.04:xenial 18.04:bionic 20.04:focal 22.04:jammy 23.04:lunar 23.10:mantic 24.04:noble 24.10:oracular 25.04:plucky 25.10:questing 26.04:resolute 26.10:stonking"
+UBUNTU_VERSIONS="16.04:xenial 18.04:bionic 20.04:focal 22.04:jammy 23.04:lunar 23.10:mantic 24.04:noble 24.10:oracular 25.04:plucky 25.10:questing 26.04:resolute"
 ALPINE_VERSIONS="3.18 3.19 3.20 3.21 3.22 edge"
 SUPPORTED_IMAGES="ubuntu alpine"
 
@@ -115,7 +115,7 @@ alpine_version_exists() {
 list_images() {
     printf '%bSupported images:%b\n' "$C_CYA" "$C_NC"
     printf '  %bubuntu:<version>%b  - Ubuntu Linux versions:\n' "$C_GRN" "$C_NC"
-    printf '    16.04, 18.04, 20.04, 22.04, 23.04, 23.10, 24.04, 24.10, 25.04, 25.10, 26.04, 26.10\n'
+    printf '    16.04, 18.04, 20.04, 22.04, 23.04, 23.10, 24.04, 24.10, 25.04, 25.10, 26.04\n'
     printf '\n'
     printf '  %balpine:<version>%b  - Alpine Linux versions:\n' "$C_GRN" "$C_NC"
     printf '    3.18, 3.19, 3.20, 3.21, 3.22, edge\n'
