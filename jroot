@@ -242,7 +242,18 @@ ensure_runtime() {
     if ! command -v python3 >/dev/null 2>&1; then
         warn "python3 not found on host - jails will enter WITHOUT the openat2 seccomp filter (known proot escape vector). Install python3."
     fi
-    build_port_shim || true
+    # Check if warnings should be silenced
+    local mute_file="$JROOT_HOME/.mute-warnings"
+    local mute_until=""
+    if [ -f "$mute_file" ]; then
+        mute_until="$(cat "$mute_file" 2>/dev/null || true)"
+    fi
+    local now="$(date +%s)"
+    if [ -n "$mute_until" ] && [ "$mute_until" -gt "$now" ]; then
+        build_port_shim 2>/dev/null || true
+    else
+        build_port_shim || true
+    fi
 }
 
 build_port_shim() {
@@ -255,7 +266,18 @@ build_port_shim() {
         fi
     fi
     if ! command -v gcc >/dev/null 2>&1; then
-        warn "gcc not found on host - 'jroot port' (bind() shim) and read-only mounts are unavailable. Install gcc to use it."
+        # Check if warnings are muted
+        local mute_file="$JROOT_HOME/.mute-warnings"
+        local mute_until=""
+        if [ -f "$mute_file" ]; then
+            mute_until="$(cat "$mute_file" 2>/dev/null || true)"
+        fi
+        local now="$(date +%s)"
+        if [ -z "$mute_until" ] || [ "$mute_until" -le "$now" ]; then
+            warn "gcc not found on host - 'jroot port' (bind() shim) and read-only mounts are unavailable. Install gcc to use it."
+            warn "To mute this warning for 7 days: jroot doctor --mute=7d"
+            warn "To mute forever: jroot doctor --mute=forever"
+        fi
         return 1
     fi
     cat > "$src" <<'CEOF'
@@ -2258,6 +2280,55 @@ cmd_rename() {
 }
 
 cmd_doctor() {
+    local mute=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mute=*)
+                mute="${1#*=}"
+                shift
+                ;;
+            --mute)
+                echo "Usage: jroot doctor --mute=7d|--mute=forever"
+                echo "  7d    - mute warnings for 7 days"
+                echo "  forever - mute warnings forever"
+                echo "  off   - unmute warnings"
+                return 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Handle mute option
+    if [ -n "$mute" ]; then
+        local mute_file="$JROOT_HOME/.mute-warnings"
+        if [ "$mute" = "off" ]; then
+            rm -f "$mute_file" 2>/dev/null || true
+            log "Warnings unmuted."
+            return 0
+        elif [ "$mute" = "forever" ]; then
+            echo "9999999999" > "$mute_file"
+            log "Warnings muted forever. To unmute: jroot doctor --mute=off"
+            return 0
+        elif [[ "$mute" =~ ^([0-9]+)(d|h|m)$ ]]; then
+            local num="${BASH_REMATCH[1]}"
+            local unit="${BASH_REMATCH[2]}"
+            local seconds=0
+            case "$unit" in
+                d) seconds=$((num * 86400)) ;;
+                h) seconds=$((num * 3600)) ;;
+                m) seconds=$((num * 60)) ;;
+            esac
+            local until_time=$(( $(date +%s) + seconds ))
+            echo "$until_time" > "$mute_file"
+            log "Warnings muted for ${num}${unit}. To unmute: jroot doctor --mute=off"
+            return 0
+        else
+            err "Invalid mute format. Use: 7d, 12h, 30m, forever, or off"
+        fi
+    fi
+
     ensure_runtime
     local ok=0 warn=0 fail=0
     local status=
@@ -2290,6 +2361,26 @@ cmd_doctor() {
         [ -x "$SECCOMP_LAUNCHER" ] && report "seccomp launcher: $SECCOMP_LAUNCHER" ok || report "seccomp launcher missing: $SECCOMP_LAUNCHER" warn
     else
         report "python3 not found" warn "proot escape protection (openat2 block) will be disabled"
+    fi
+
+    # Check gcc and show mute status
+    if ! command -v gcc >/dev/null 2>&1; then
+        local mute_file="$JROOT_HOME/.mute-warnings"
+        local mute_until=""
+        if [ -f "$mute_file" ]; then
+            mute_until="$(cat "$mute_file" 2>/dev/null || true)"
+        fi
+        local now="$(date +%s)"
+        if [ -n "$mute_until" ] && [ "$mute_until" -gt "$now" ]; then
+            local remaining=$((mute_until - now))
+            local days=$((remaining / 86400))
+            local hours=$(( (remaining % 86400) / 3600 ))
+            report "gcc not found (muted)" warn "Warnings silenced for ${days}d ${hours}h (until $(date -d "@$mute_until" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown"))"
+        else
+            report "gcc not found" warn "'jroot port' and read-only mounts unavailable. Install gcc or mute: jroot doctor --mute=7d"
+        fi
+    else
+        report "gcc: $(command -v gcc)" ok
     fi
 
     local cfgs=() cfg name rootfs
@@ -2681,6 +2772,10 @@ cmd_help_cmd() {
         doctor)
             printf '%bjroot doctor%b - check the setup for problems\n\n' "$H" "$N"
             printf '    %bjroot doctor%b\n' "$G" "$N"
+            printf '    %bjroot doctor --mute=7d%b   (mute warnings for 7 days)\n' "$G" "$N"
+            printf '    %bjroot doctor --mute=forever%b  (mute warnings forever)\n' "$G" "$N"
+            printf '    %bjroot doctor --mute=off%b  (unmute warnings)\n' "$G" "$N"
+            printf '\n    Mutes gcc/python3 warnings that may not be relevant to your use case.\n'
             ;;
         rm|delete)
             printf '%bjroot rm%b - permanently delete a jail\n\n' "$H" "$N"
@@ -2741,7 +2836,7 @@ cmd_help() {
     printf '%bMAINTENANCE%b\n' "$H" "$N"
     help_row "jroot update" "[name]"    "Update proot + packages (all jails if no name)"
     help_row "jroot clean" "<name>..."  "Free disk space inside a jail"
-    help_row "jroot doctor" ""          "Check the setup for problems"
+    help_row "jroot doctor" "[--mute=7d|forever|off]" "Check setup, or mute warnings"
     help_row "jroot rm" "<name>"        "Permanently delete a jail"
     help_row "jroot rename" "<n> <new>" "Rename a jail (updates hostname/prompt/snapshots)"
     help_row "jroot help" "[command]"     "Show help (for one command too)"
