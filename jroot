@@ -274,10 +274,21 @@ prog = sock_fprog()
 prog.len = len(program)
 prog.filter = ctypes.cast(arr, ctypes.POINTER(sock_filter))
 
-if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-    raise OSError(ctypes.get_errno(), "PR_SET_NO_NEW_PRIVS")
-if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(prog)) != 0:
-    raise OSError(ctypes.get_errno(), "PR_SET_SECCOMP")
+# Try to enable seccomp. On WSL1 (no seccomp support), PR_SET_SECCOMP
+# returns EINVAL (22). Fall back gracefully with a warning.
+try:
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "PR_SET_NO_NEW_PRIVS")
+    if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(prog)) != 0:
+        raise OSError(ctypes.get_errno(), "PR_SET_SECCOMP")
+except OSError as e:
+    if e.errno == 22:  # EINVAL - WSL1 / kernel without seccomp
+        sys.stderr.write("jroot: WARNING: seccomp not supported on this kernel ")
+        sys.stderr.write("(WSL1? older kernel?). Skipping seccomp filter.\n")
+        sys.stderr.write("jroot: Security reduced - openat2 escape NOT blocked.\n")
+        # Continue without seccomp - proot still works
+    else:
+        raise
 
 # Landlock: kernel-enforced, inode-based filesystem allowlist. This is the
 # authoritative defense against syscalls proot does not trace (faccessat2,
