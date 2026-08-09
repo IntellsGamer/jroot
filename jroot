@@ -16,6 +16,9 @@
 #   jroot list [--json]         List all jails (machine-readable with --json)
 #   jroot info [name]           Show a jail's details and rootfs size
 #   jroot size [name]           Show disk usage per jail
+#   jroot history [name]        What was done to a jail, and when
+#   jroot compare <a> <b>       Diff two jails (config + package lists)
+#   jroot which [jail] <prog>   Find a program across jails
 #   jroot update [name]         Update runtime + jail packages (all if no name)
 #   jroot clean <name>...       Free disk space (apt caches, lists, logs)
 #   jroot snapshot <name> [label]  Save rootfs + config (tar.gz)
@@ -85,6 +88,7 @@ JROOT_HOME="${JROOT_HOME:-$REAL_HOME/.jroot}"
 ROOTS_DIR="$JROOT_HOME/roots"
 CONFIGS_DIR="$JROOT_HOME/configs"
 SNAPSHOTS_DIR="$JROOT_HOME/snapshots"
+HISTORY_DIR="$JROOT_HOME/history"
 BIN_DIR="$JROOT_HOME/bin"
 CACHE_DIR="$JROOT_HOME/.cache"
 PROOT_BIN="$BIN_DIR/proot"
@@ -181,6 +185,29 @@ resolve() {
 
 json_esc() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# ---------------------------------------------------------------------------
+# Jail history: an append-only provenance log per jail, one TSV line per event
+#   <epoch>\t<event>\t<detail>
+# Written by the commands that change a jail, read back by `jroot history`.
+# ---------------------------------------------------------------------------
+history_file() {
+    printf '%s/%s.log' "$HISTORY_DIR" "$1"
+}
+
+# record_event <jail> <event> [detail...]
+# Never fails a command: history is a convenience, not a transaction log.
+record_event() {
+    local name="$1" event="$2"; shift 2 || true
+    local detail="$*"
+    [ -n "$name" ] && [ -n "$event" ] || return 0
+    mkdir -p "$HISTORY_DIR" 2>/dev/null || return 0
+    # Tabs and newlines would break the record format.
+    detail="$(printf '%s' "$detail" | tr '\t\n' '  ')"
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$detail" \
+        >> "$(history_file "$name")" 2>/dev/null || true
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -438,7 +465,7 @@ PYEOF
 }
 
 ensure_runtime() {
-    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR"
+    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
     if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v6" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
@@ -1662,6 +1689,7 @@ mount_add() {
     pairs="$pairs $label=$hpath=$mode"
     set_config_mounts "$cfg" $pairs
     log "Mounted $hpath at /mnt/$label inside '$name' ($mode)."
+    record_event "$name" "mnt" "added /mnt/$label -> $hpath ($mode)"
 }
 
 mount_set() {
@@ -1676,6 +1704,7 @@ mount_set() {
     pairs="$(echo "$cur" | sed 's/\t/=/g' | sed "s/^$label=\(.*\)=.*$/$label=\1=$mode/" | tr '\n' ' ')"
     set_config_mounts "$cfg" $pairs
     log "/mnt/$label for '$name' is now $mode."
+    record_event "$name" "mnt" "/mnt/$label set to $mode"
 }
 
 mount_rm() {
@@ -1689,6 +1718,7 @@ mount_rm() {
     pairs="$(echo "$cur" | sed 's/\t/=/g' | grep -v "^$label=" | tr '\n' ' ')"
     set_config_mounts "$cfg" $pairs
     log "Removed /mnt/$label from '$name'."
+    record_event "$name" "mnt" "removed /mnt/$label"
 }
 
 mnt_usage() {
@@ -2280,22 +2310,29 @@ cmd_init() {
 
     write_rootfs_niceties "$name"
     write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
+    record_event "$name" "created" \
+        "$image user=$user_mode build_essential=$build_essential mount_host=$mount_host mount_home=$mount_home"
 
     local bootstrapped=1
     if [ "${JROOT_SKIP_APT:-}" = "1" ] || [ "${JROOT_SKIP_BOOTSTRAP:-}" = "1" ]; then
         warn "Skipping bootstrap (env JROOT_SKIP_APT/JROOT_SKIP_BOOTSTRAP)."
         bootstrapped=0
+        record_event "$name" "bootstrap" "skipped by env"
     elif bootstrap "$name" "$distro" "$version"; then
         log "Core packages installed."
+        record_event "$name" "bootstrap" "core packages installed"
     else
         warn "Bootstrap exited non-zero - finishing configures may still be needed."
         bootstrapped=0
+        record_event "$name" "bootstrap" "FAILED (exited non-zero)"
     fi
 
     if [ "$user_mode" = "unroot" ] && [ "$distro" = "ubuntu" ]; then
         setup_unroot_user "$name"
+        record_event "$name" "unroot" "created user 'jail', locked root"
     elif [ "$user_mode" = "unroot" ] && [ "$distro" = "alpine" ]; then
         setup_unroot_alpine "$name"
+        record_event "$name" "unroot" "created user 'jail', locked root"
     fi
 
     log ""
@@ -2492,6 +2529,7 @@ cmd_port() {
             all="$(set_config_ports "$cfg" $(echo "$all" | tr ',' ' ') 2>/dev/null)"
             [ -n "$all" ] || err "Failed to save port config."
             log "Port $port is now PUBLIC for '$name' (binds 0.0.0.0). All ports: $all"
+            record_event "$name" "port" "opened $port (public: $all)"
             ;;
         rm)
             [ -n "$port" ] || { port_usage; err "Usage: jroot port $name rm <port>"; }
@@ -2501,6 +2539,7 @@ cmd_port() {
             all="$(set_config_ports "$cfg" $rest 2>/dev/null)"
             [ -n "$all" ] || all="(none)"
             log "Port $port removed for '$name'. Public ports now: $all"
+            record_event "$name" "port" "closed $port (public: $all)"
             ;;
         *)
             port_usage
@@ -2553,17 +2592,18 @@ cmd_install() {
             dpkg --configure -a 2>/dev/null || true
             apt-get update || true
             apt-get install -y --allow-unauthenticated $*
-        " || { warn "Install failed inside '$name'."; return 1; }
+        " || { warn "Install failed inside '$name'."; record_event "$name" "install" "FAILED: $*"; return 1; }
     elif [ "$distro" = "alpine" ]; then
         run_in_jail --root "$name" /bin/sh -c "
             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
             apk update
             apk add --no-cache $*
-        " || { warn "Install failed inside '$name'."; return 1; }
+        " || { warn "Install failed inside '$name'."; record_event "$name" "install" "FAILED: $*"; return 1; }
     else
         err "Unknown distro: $distro"
     fi
     log "Installed in '$name': $*"
+    record_event "$name" "install" "$*"
 
     # For unroot jails, lock root again after install
     if [ "$user_mode" = "unroot" ]; then
@@ -2618,8 +2658,10 @@ cmd_clean() {
         saved=$(( before - after ))
         if [ "$saved" -gt 0 ]; then
             log "'$name' cleaned: ${before}MB -> ${after}MB (freed ${saved}MB)"
+            record_event "$name" "clean" "freed ${saved}MB (${before}MB -> ${after}MB)"
         else
             log "'$name' cleaned: still ${after}MB"
+            record_event "$name" "clean" "nothing to free (${after}MB)"
         fi
     done
 }
@@ -2735,6 +2777,7 @@ cmd_config() {
     build_essential="$(config_field "$cfg" build_essential)"; [ -n "$build_essential" ] || build_essential=1
     mounts_pairs="$(config_mounts "$cfg" 2>/dev/null | sed 's/\t/=/g' | tr '\n' ' ')"
 
+    local old_user="$user_mode" old_mh="$mount_host" old_mhome="$mount_home" old_be="$build_essential"
     if [ $# -eq 0 ]; then
         log "Current config for '$name':"
         show_config "$name"
@@ -2762,6 +2805,13 @@ cmd_config() {
     fi
     log "Config updated for '$name':"
     show_config "$name"
+    # Record only what actually changed, so history stays readable.
+    local changes=""
+    [ "$user_mode" = "$old_user" ]       || changes="$changes user=$old_user->$user_mode"
+    [ "$mount_host" = "$old_mh" ]        || changes="$changes mount_host=$old_mh->$mount_host"
+    [ "$mount_home" = "$old_mhome" ]     || changes="$changes mount_home=$old_mhome->$mount_home"
+    [ "$build_essential" = "$old_be" ]   || changes="$changes build_essential=$old_be->$build_essential"
+    [ -z "$changes" ] || record_event "$name" "config" "${changes# }"
     if [ "$user_mode" = "unroot" ]; then
         setup_unroot_user "$name"
     fi
@@ -2781,6 +2831,7 @@ cmd_rm() {
         *) log "Aborted."; return 0 ;;
     esac
     rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json"
+    rm -f "$(history_file "$name")"
     log "Jail '$name' deleted."
 }
 
@@ -2826,6 +2877,12 @@ cmd_rename() {
 
     # 4) Point the jail's hostname files at the new name.
     write_rootfs_niceties "$newname"
+
+    # 5) Carry the history over so provenance survives the rename.
+    if [ -f "$(history_file "$name")" ]; then
+        mv "$(history_file "$name")" "$(history_file "$newname")" 2>/dev/null || true
+    fi
+    record_event "$newname" "rename" "was '$name'"
 
     log "Renamed '$name' -> '$newname' (hostname, prompt, snapshots updated)."
 }
@@ -3043,7 +3100,7 @@ cmd_update() {
                 dpkg --configure -a 2>/dev/null || true
                 apt-get update || true
                 apt-get upgrade -y --allow-unauthenticated || true
-            " || { warn "Package upgrade inside '$name' failed (network?)."; return 1; }
+            " || { warn "Package upgrade inside '$name' failed (network?)."; record_event "$name" "update" "FAILED (apt)"; return 1; }
         elif [ "$distro" = "alpine" ]; then
             log "Refreshing apk config for '$name'..."
             config_apk "$name" "$version"
@@ -3052,7 +3109,7 @@ cmd_update() {
                 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
                 apk update
                 apk upgrade --no-cache
-            " || { warn "Package upgrade inside '$name' failed (network?)."; return 1; }
+            " || { warn "Package upgrade inside '$name' failed (network?)."; record_event "$name" "update" "FAILED (apk)"; return 1; }
         else
             err "Unknown distro: $distro"
         fi
@@ -3065,6 +3122,7 @@ cmd_update() {
             fi
         fi
         log "Jail '$name' is up to date."
+        record_event "$name" "update" "packages upgraded ($distro $version)"
         return 0
     fi
 
@@ -3122,6 +3180,362 @@ cmd_info() {
 }
 
 # ---------------------------------------------------------------------------
+# jroot history - what has been done to a jail, and when
+# ---------------------------------------------------------------------------
+history_render() {
+    # $1 = jail name, $2 = limit (0 = all), $3 = 1 to prefix the jail column
+    local name="$1" limit="$2" with_jail="$3"
+    local file epoch event detail when
+    file="$(history_file "$name")"
+    [ -f "$file" ] || return 0
+    local lines
+    if [ "$limit" -gt 0 ]; then
+        lines="$(tail -n "$limit" "$file")"
+    else
+        lines="$(cat "$file")"
+    fi
+    printf '%s\n' "$lines" | while IFS=$'\t' read -r epoch event detail; do
+        [ -n "$epoch" ] || continue
+        when="$(date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null \
+             || date -r "$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$epoch")"
+        if [ "$with_jail" = "1" ]; then
+            printf '%b%-16s%b %b%-12s%b %-14s %s\n' \
+                "$D" "$when" "$N" "$G" "$name" "$N" "$event" "$detail"
+        else
+            printf '%b%-16s%b %b%-14s%b %s\n' \
+                "$D" "$when" "$N" "$G" "$event" "$N" "$detail"
+        fi
+    done
+}
+
+history_json() {
+    # $1 = jail name. Emits the jail's events as a JSON array.
+    local name="$1" file epoch event detail first=1
+    file="$(history_file "$name")"
+    printf '['
+    if [ -f "$file" ]; then
+        while IFS=$'\t' read -r epoch event detail; do
+            [ -n "$epoch" ] || continue
+            [ "$first" = 1 ] || printf ','
+            first=0
+            printf '\n  {"jail": "%s", "time": %s, "event": "%s", "detail": "%s"}' \
+                "$(json_esc "$name")" "$epoch" "$(json_esc "$event")" "$(json_esc "$detail")"
+        done < "$file"
+    fi
+    [ "$first" = 1 ] && printf ']\n' || printf '\n]\n'
+}
+
+cmd_history() {
+    local name="" limit=0 as_json=0 do_clear=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json)     as_json=1 ;;
+            --clear)    do_clear=1 ;;
+            --limit=*)  limit="${arg#*=}" ;;
+            -n)         err "Use --limit=<n> instead of -n." ;;
+            --*)        err "Unknown flag: $arg (try '${CMD_HINT}help history')" ;;
+            *)
+                [ -z "$name" ] || err "Only one jail name accepted, got '$arg'."
+                name="$arg"
+                ;;
+        esac
+    done
+    case "$limit" in
+        ''|*[!0-9]*) err "--limit must be a number, got '$limit'." ;;
+    esac
+
+    if [ -n "$name" ]; then
+        [ -f "$CONFIGS_DIR/$name.json" ] || [ -f "$(history_file "$name")" ] \
+            || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    fi
+
+    if [ "$do_clear" = 1 ]; then
+        [ -n "$name" ] || err "Usage: jroot history <name> --clear"
+        rm -f "$(history_file "$name")"
+        log "History for '$name' cleared."
+        return 0
+    fi
+
+    # Which jails to show: the named one, or every jail that has a log.
+    local names=() n
+    if [ -n "$name" ]; then
+        names=("$name")
+    else
+        shopt -s nullglob
+        for n in "$HISTORY_DIR"/*.log; do
+            names+=("$(basename "$n" .log)")
+        done
+        shopt -u nullglob
+    fi
+
+    if [ "${#names[@]}" -eq 0 ]; then
+        if [ "$as_json" = 1 ]; then
+            printf '[]\n'
+        else
+            log "No history recorded yet. It starts building as you use jroot."
+        fi
+        return 0
+    fi
+
+    if [ "$as_json" = 1 ]; then
+        if [ "${#names[@]}" -eq 1 ]; then
+            history_json "${names[0]}"
+        else
+            # Merge the per-jail arrays into one array.
+            printf '[\n'
+            local first=1 body
+            for n in "${names[@]}"; do
+                body="$(history_json "$n" | sed '1d;$d')"
+                [ -n "$body" ] || continue
+                [ "$first" = 1 ] || printf ',\n'
+                first=0
+                printf '%s' "$body"
+            done
+            printf '\n]\n'
+        fi
+        return 0
+    fi
+
+    if [ "${#names[@]}" -eq 1 ]; then
+        printf '%bHistory of jail '\''%s'\''%b\n' "$H" "${names[0]}" "$N"
+        printf '%b%-16s %-14s %s%b\n' "$D" "WHEN" "EVENT" "DETAIL" "$N"
+        history_render "${names[0]}" "$limit" 0
+        [ -f "$(history_file "${names[0]}")" ] || \
+            log "Nothing recorded for '${names[0]}' yet."
+        return 0
+    fi
+
+    # All jails, oldest first across the whole install.
+    printf '%bHistory of all jails%b\n' "$H" "$N"
+    printf '%b%-16s %-12s %-14s %s%b\n' "$D" "WHEN" "JAIL" "EVENT" "DETAIL" "$N"
+    local merged
+    merged="$(for n in "${names[@]}"; do
+        sed "s|^\([0-9]*\)\t|\1\t$n\t|" "$(history_file "$n")" 2>/dev/null
+    done | sort -n)"
+    [ -n "$merged" ] || { log "No history recorded yet."; return 0; }
+    if [ "$limit" -gt 0 ]; then
+        merged="$(printf '%s\n' "$merged" | tail -n "$limit")"
+    fi
+    local epoch jail event detail when
+    printf '%s\n' "$merged" | while IFS=$'\t' read -r epoch jail event detail; do
+        [ -n "$epoch" ] || continue
+        when="$(date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null \
+             || date -r "$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$epoch")"
+        printf '%b%-16s%b %b%-12s%b %-14s %s\n' \
+            "$D" "$when" "$N" "$G" "$jail" "$N" "$event" "$detail"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# jroot compare - config + package differences between two jails
+# ---------------------------------------------------------------------------
+jail_distro_of() {
+    local rootfs="$ROOTS_DIR/$1"
+    [ -f "$rootfs/etc/os-release" ] || { printf 'unknown'; return 0; }
+    ( . "$rootfs/etc/os-release" 2>/dev/null; printf '%s' "${ID:-unknown}" )
+}
+
+# jail_packages <name> <all|manual> -> sorted package names on stdout
+jail_packages() {
+    local name="$1" scope="${2:-manual}" distro
+    distro="$(jail_distro_of "$name")"
+    case "$distro" in
+        alpine)
+            if [ "$scope" = "all" ]; then
+                run_in_jail --root "$name" /bin/sh -c \
+                    "apk info 2>/dev/null | sort" 2>/dev/null
+            else
+                # /etc/apk/world is exactly the explicitly-installed set.
+                sed 's/[<>=].*//' "$ROOTS_DIR/$name/etc/apk/world" 2>/dev/null | sort
+            fi
+            ;;
+        *)
+            if [ "$scope" = "all" ]; then
+                run_in_jail --root "$name" /bin/sh -c \
+                    "dpkg-query -W -f '\${Package}\n' 2>/dev/null | sort" 2>/dev/null
+            else
+                run_in_jail --root "$name" /bin/sh -c \
+                    "apt-mark showmanual 2>/dev/null | sort" 2>/dev/null
+            fi
+            ;;
+    esac
+}
+
+compare_row() {
+    # $1 label, $2 value A, $3 value B
+    local mark=" " color="$N"
+    if [ "$2" != "$3" ]; then
+        mark="*"; color="$C_YEL"
+    fi
+    printf '  %b%s%b %-18s %-24s %s\n' "$color" "$mark" "$N" "$1" "$2" "$3"
+}
+
+cmd_compare() {
+    ensure_runtime
+    local a="" b="" scope="manual" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --all)      scope="all" ;;
+            --manual)   scope="manual" ;;
+            --*)        err "Unknown flag: $arg (try '${CMD_HINT}help compare')" ;;
+            *)
+                if [ -z "$a" ]; then a="$arg"
+                elif [ -z "$b" ]; then b="$arg"
+                else err "Usage: jroot compare <jailA> <jailB> [--all]"
+                fi
+                ;;
+        esac
+    done
+    [ -n "$a" ] && [ -n "$b" ] || err "Usage: jroot compare <jailA> <jailB> [--all]"
+    [ "$a" != "$b" ] || err "Both names are '$a' - nothing to compare."
+    local cfa="$CONFIGS_DIR/$a.json" cfb="$CONFIGS_DIR/$b.json"
+    [ -f "$cfa" ] || err "Jail '$a' not found. Run 'jroot list' to see jails."
+    [ -f "$cfb" ] || err "Jail '$b' not found. Run 'jroot list' to see jails."
+
+    printf '%bComparing '\''%s'\'' vs '\''%s'\''%b   (%b*%b = differs)\n\n' \
+        "$H" "$a" "$b" "$N" "$C_YEL" "$N"
+
+    printf '%bCONFIG%b\n' "$H" "$N"
+    printf '    %-18s %-24s %s\n' "FIELD" "$a" "$b"
+    local f
+    for f in image user build_essential mount_host mount_home; do
+        compare_row "$f" "$(config_field "$cfa" "$f")" "$(config_field "$cfb" "$f")"
+    done
+    compare_row "ports" \
+        "$(config_ports "$cfa" | sed 's/^$/none/')" \
+        "$(config_ports "$cfb" | sed 's/^$/none/')"
+    compare_row "mounts" \
+        "$(config_mounts "$cfa" | awk '{printf "%s ", $1}' | sed 's/ $//; s/^$/none/')" \
+        "$(config_mounts "$cfb" | awk '{printf "%s ", $1}' | sed 's/ $//; s/^$/none/')"
+    compare_row "distro" "$(jail_distro_of "$a")" "$(jail_distro_of "$b")"
+    compare_row "rootfs size" \
+        "$(du -sh "$ROOTS_DIR/$a" 2>/dev/null | awk '{print $1}')" \
+        "$(du -sh "$ROOTS_DIR/$b" 2>/dev/null | awk '{print $1}')"
+
+    printf '\n%bPACKAGES%b %b(%s)%b\n' "$H" "$N" "$D" \
+        "$([ "$scope" = all ] && printf 'every installed package' || printf 'explicitly installed; --all for every package')" "$N"
+    local tmp_a tmp_b
+    tmp_a="$(mktemp)"; tmp_b="$(mktemp)"
+    jail_packages "$a" "$scope" > "$tmp_a" 2>/dev/null || true
+    jail_packages "$b" "$scope" > "$tmp_b" 2>/dev/null || true
+    # run_in_jail may emit CRs or blank lines; normalise before diffing.
+    sed -i 's/\r$//; /^$/d' "$tmp_a" "$tmp_b" 2>/dev/null || true
+
+    if [ ! -s "$tmp_a" ] && [ ! -s "$tmp_b" ]; then
+        warn "Could not read package lists from either jail (is the rootfs bootstrapped?)."
+        rm -f "$tmp_a" "$tmp_b"
+        return 0
+    fi
+
+    local only_a only_b both
+    only_a="$(comm -23 "$tmp_a" "$tmp_b")"
+    only_b="$(comm -13 "$tmp_a" "$tmp_b")"
+    both="$(comm -12 "$tmp_a" "$tmp_b" | wc -l | tr -d ' ')"
+
+    printf '    %s: %s packages, %s: %s packages, %s shared\n' \
+        "$a" "$(wc -l < "$tmp_a" | tr -d ' ')" \
+        "$b" "$(wc -l < "$tmp_b" | tr -d ' ')" "$both"
+
+    if [ -z "$only_a" ] && [ -z "$only_b" ]; then
+        printf '  %b= identical package sets%b\n' "$G" "$N"
+    else
+        if [ -n "$only_a" ]; then
+            printf '\n  %bonly in %s:%b\n' "$G" "$a" "$N"
+            printf '%s\n' "$only_a" | sed 's/^/    + /'
+        fi
+        if [ -n "$only_b" ]; then
+            printf '\n  %bonly in %s:%b\n' "$B" "$b" "$N"
+            printf '%s\n' "$only_b" | sed 's/^/    + /'
+        fi
+    fi
+    rm -f "$tmp_a" "$tmp_b"
+}
+
+# ---------------------------------------------------------------------------
+# jroot which - find a program (or file) across jails, from the host side
+# ---------------------------------------------------------------------------
+JAIL_PATH_DIRS="usr/local/sbin usr/local/bin usr/sbin usr/bin sbin bin usr/games"
+
+# which_in_jail <name> <program> <all>
+# Prints "<jail>\t<path inside jail>" per hit. Returns 1 when nothing matched.
+which_in_jail() {
+    local name="$1" prog="$2" want_all="$3"
+    local rootfs="$ROOTS_DIR/$name" dir cand found=1
+    [ -d "$rootfs" ] || return 1
+    case "$prog" in
+        /*)
+            # Absolute path: check that exact location inside the rootfs.
+            if [ -e "$rootfs$prog" ]; then
+                printf '%s\t%s\n' "$name" "$prog"
+                found=0
+            fi
+            ;;
+        */*)
+            err "Give a program name, or an absolute path starting with '/'."
+            ;;
+        *)
+            for dir in $JAIL_PATH_DIRS; do
+                cand="$rootfs/$dir/$prog"
+                if [ -f "$cand" ] || [ -L "$cand" ]; then
+                    printf '%s\t/%s/%s\n' "$name" "$dir" "$prog"
+                    found=0
+                    [ "$want_all" = "1" ] || break
+                fi
+            done
+            ;;
+    esac
+    return "$found"
+}
+
+cmd_which() {
+    local jail="" prog="" want_all=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --all|-a)  want_all=1 ;;
+            --*)       err "Unknown flag: $arg (try '${CMD_HINT}help which')" ;;
+            *)
+                # "jroot which <prog>" or "jroot which <jail> <prog>"
+                if [ -z "$prog" ] && [ -z "$jail" ]; then
+                    prog="$arg"
+                elif [ -z "$jail" ] && [ -f "$CONFIGS_DIR/$prog.json" ]; then
+                    jail="$prog"; prog="$arg"
+                else
+                    err "Usage: jroot which [jail] <program> [--all]"
+                fi
+                ;;
+        esac
+    done
+    [ -n "$prog" ] || err "Usage: jroot which [jail] <program> [--all]"
+
+    local names=() n hits=0 line
+    if [ -n "$jail" ]; then
+        [ -f "$CONFIGS_DIR/$jail.json" ] || err "Jail '$jail' not found. Run 'jroot list' to see jails."
+        names=("$jail")
+    else
+        shopt -s nullglob
+        for n in "$CONFIGS_DIR"/*.json; do
+            names+=("$(basename "$n" .json)")
+        done
+        shopt -u nullglob
+        [ "${#names[@]}" -gt 0 ] || err "No jails found. Create one first: jroot init ubuntu:22.04"
+    fi
+
+    for n in "${names[@]}"; do
+        while IFS=$'\t' read -r _ line; do
+            [ -n "$line" ] || continue
+            printf '%b%-16s%b %s\n' "$G" "$n" "$N" "$line"
+            hits=$((hits + 1))
+        done < <(which_in_jail "$n" "$prog" "$want_all" || true)
+    done
+
+    if [ "$hits" -eq 0 ]; then
+        warn "'$prog' not found in $([ -n "$jail" ] && printf "jail '%s'" "$jail" || printf '%s jail(s)' "${#names[@]}")."
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Snapshots / revert (tar.gz rootfs + config at snapshot time)
 # ---------------------------------------------------------------------------
 snapshot_list() {
@@ -3161,6 +3575,7 @@ cmd_snapshot() {
         mv "$tmp.tar.gz" "$dir/$label.tar.gz"
         cp "$CONFIGS_DIR/$name.json" "$dir/$label.json"
         log "Snapshot saved: $dir/$label.tar.gz"
+        record_event "$name" "snapshot" "$label ($(du -sh "$dir/$label.tar.gz" 2>/dev/null | awk '{print $1}'))"
     else
         rm -f "$tmp.tar.gz"
         err "Snapshot failed."
@@ -3211,6 +3626,7 @@ cmd_revert() {
     cp "$dir/$label.json" "$CONFIGS_DIR/$name.json"
     rm -rf "$tmp"
     log "Jail '$name' restored to snapshot '$label'."
+    record_event "$name" "revert" "restored snapshot '$label'"
 }
 
 cmd_rm_snapshot() {
@@ -3228,6 +3644,7 @@ cmd_rm_snapshot() {
     rm -f "$dir/$label.tar.gz" "$dir/$label.json"
     rmdir "$dir" 2>/dev/null || true
     log "Snapshot '$label' deleted."
+    record_event "$name" "rm-snapshot" "$label"
 }
 
 help_header() {
@@ -3341,6 +3758,35 @@ cmd_help_cmd() {
             printf '%bjroot info%b - show a jail'"'"'s details and disk usage\n\n' "$H" "$N"
             printf '    %bjroot info [name]%b    (no name = all jails)\n' "$G" "$N"
             ;;
+        history)
+            printf '%bjroot history%b - what has been done to a jail, and when\n\n' "$H" "$N"
+            printf '    %bjroot history%b                (all jails, oldest first)\n' "$G" "$N"
+            printf '    %bjroot history <name>%b\n' "$G" "$N"
+            printf '    %bjroot history <name> --limit=20%b\n' "$G" "$N"
+            printf '    %bjroot history <name> --json%b\n' "$G" "$N"
+            printf '    %bjroot history <name> --clear%b\n' "$G" "$N"
+            printf '\n    Records creation, installs, updates, snapshots, reverts, config\n'
+            printf '    changes, renames and cleans. Logs live in %b~/.jroot/history%b.\n' "$G" "$N"
+            ;;
+        compare|diff)
+            printf '%bjroot compare%b - config and package differences between two jails\n\n' "$H" "$N"
+            printf '    %bjroot compare <jailA> <jailB>%b\n' "$G" "$N"
+            printf '    %bjroot compare <jailA> <jailB> --all%b\n' "$G" "$N"
+            printf '\n    Compares image, user mode, mounts, ports and size, then the package\n'
+            printf '    lists. By default only explicitly-installed packages are compared\n'
+            printf '    (%bapt-mark showmanual%b / %b/etc/apk/world%b); %b--all%b uses every installed\n' "$G" "$N" "$G" "$N" "$G" "$N"
+            printf '    package. Useful for "why does it work in one jail but not the other".\n'
+            ;;
+        which)
+            printf '%bjroot which%b - find a program across jails\n\n' "$H" "$N"
+            printf '    %bjroot which <program>%b         (search every jail)\n' "$G" "$N"
+            printf '    %bjroot which <jail> <program>%b  (search one jail)\n' "$G" "$N"
+            printf '    %bjroot which <program> --all%b   (every match, not just the first)\n' "$G" "$N"
+            printf '\n    Reads the rootfs directly on the host, so no jail is started.\n'
+            printf '    An absolute path is checked as-is inside each jail.\n'
+            printf '    %bExample:%b jroot which node\n' "$G" "$N"
+            printf '    %bExample:%b jroot which /etc/nginx/nginx.conf\n' "$G" "$N"
+            ;;
         snapshot)
             printf '%bjroot snapshot%b - save a full backup of a jail\n\n' "$H" "$N"
             printf '    %bjroot snapshot <name> [label]%b\n' "$G" "$N"
@@ -3418,6 +3864,9 @@ cmd_help() {
     help_row "jroot list" "[--json]"               "List all jails (JSON with --json)"
     help_row "jroot info" "[name]"                 "Show a jail's details and disk usage"
     help_row "jroot size" "[name]"                 "Show disk usage per jail"
+    help_row "jroot history" "[name]"              "Show what was done to a jail, and when"
+    help_row "jroot compare" "<jailA> <jailB>"     "Diff two jails (config + packages)"
+    help_row "jroot which" "[jail] <program>"      "Find a program across jails"
     printf '\n'
 
     printf '%bSNAPSHOTS%b\n' "$H" "$N"
@@ -3481,6 +3930,9 @@ jroot_cmd() {
         config)        shift; cmd_config "$@" ;;
         list|ls)       shift; cmd_list "$@" ;;
         info)          shift; cmd_info "$@" ;;
+        history)       shift; cmd_history "$@" ;;
+        compare|diff)  shift; cmd_compare "$@" ;;
+        which)         shift; cmd_which "$@" ;;
         size)          shift; cmd_size "$@" ;;
         update)        shift; cmd_update "$@" ;;
         clean)         shift; cmd_clean "$@" ;;
