@@ -244,7 +244,7 @@ PIDFD_GETFD_NR = 438
 OFFSET_ARCH = 4
 OFFSET_NR = 0
 
-# jroot-seccomp-v5
+# jroot-seccomp-v6
 # proot 5.3.0 does not trace the modern *at2 family (openat2/faccessat2/fchmodat2)
 # or the fs-tree family (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
 # mount_setattr), so a jailed worker could reach real host paths (e.g. ~/.jroot
@@ -345,12 +345,22 @@ except OSError as e:
 # needs CAP_MKNOD, which a rootless jail never has. So it grants nothing while
 # still shadowing the inherited read/write/exec rights of the parent rule.
 #
-# Best effort: if the kernel lacks Landlock we warn and continue (seccomp
-# still applies).
-LANDLOCK_DENY_MASK = 0x800  # MAKE_BLOCK only == no usable access
+# File type matters: a rule attached to a NON-directory may only carry file
+# access rights (EXECUTE, WRITE_FILE, READ_FILE, TRUNCATE, IOCTL_DEV). Passing
+# directory rights for a socket or a regular file is rejected with EINVAL, so
+# masks are trimmed per inode type below.
+#
+# Best effort in both directions: if the kernel lacks Landlock, or if any rule
+# is rejected, we warn and leave the ruleset unapplied rather than enforcing a
+# half-built policy - a partial allowlist breaks proot in ways that look like
+# random "Permission denied" failures. JROOT_LANDLOCK_STRICT=1 enforces anyway.
+LANDLOCK_DENY_MASK = 0x800   # MAKE_BLOCK only == no usable access
+LANDLOCK_FILE_MASK = 0xC007  # EXECUTE|WRITE_FILE|READ_FILE|TRUNCATE|IOCTL_DEV
 if os.environ.get("JROOT_LANDLOCK"):
+    import stat as statmod
     import struct
     LANDLOCK_RULE_PATH_BENEATH = 1
+    strict = bool(os.environ.get("JROOT_LANDLOCK_STRICT"))
     entries = []
     for line in os.environ["JROOT_LANDLOCK"].splitlines():
         line = line.strip()
@@ -363,6 +373,7 @@ if os.environ.get("JROOT_LANDLOCK"):
             entries.append((path, int(mask or "0x7fff", 16)))
     # Do not leak the host path list into the jail's environment.
     os.environ.pop("JROOT_LANDLOCK", None)
+    os.environ.pop("JROOT_LANDLOCK_STRICT", None)
     if entries:
         handled = 0
         fd = -1
@@ -375,28 +386,51 @@ if os.environ.get("JROOT_LANDLOCK"):
         if handled == 0:
             sys.stderr.write("jroot: landlock: not supported by this kernel, skipping\n")
         else:
+            rejected = 0
             for path, mask in entries:
                 mask &= handled
-                if mask == 0:
+                try:
+                    real = os.path.realpath(path)
+                    is_dir = statmod.S_ISDIR(os.stat(real).st_mode)
+                except OSError:
+                    continue
+                if not is_dir:
+                    mask &= LANDLOCK_FILE_MASK
+                    if mask == 0:
+                        # Nothing left to express: on a non-directory the only
+                        # legal bits are real grants, so a deny would have to
+                        # hand out read/write/exec. Skip it - the proot
+                        # bind-over of an empty stand-in file covers this.
+                        continue
+                elif mask == 0:
                     mask = LANDLOCK_DENY_MASK & handled
                 try:
-                    o = os.open(os.path.realpath(path), os.O_PATH | os.O_CLOEXEC)
+                    o = os.open(real, os.O_PATH | os.O_CLOEXEC)
                 except OSError:
                     continue
                 try:
                     rb = ctypes.create_string_buffer(struct.pack("Q i I", mask, o, 0), 16)
                     if libc.syscall(445, fd, LANDLOCK_RULE_PATH_BENEATH, ctypes.byref(rb), 0) < 0:
+                        rejected += 1
                         sys.stderr.write("jroot: landlock: rule %s: %s\n"
                                          % (path, os.strerror(ctypes.get_errno())))
                 finally:
                     os.close(o)
-            if libc.syscall(446, fd, 0) < 0:  # restrict_self
+            if rejected and not strict:
+                sys.stderr.write(
+                    "jroot: landlock: %d rule(s) rejected by the kernel - "
+                    "continuing WITHOUT the Landlock layer so the jail still "
+                    "works (seccomp and proot still apply). Set "
+                    "JROOT_LANDLOCK_STRICT=1 to enforce it anyway.\n" % rejected)
+                os.close(fd)
+            elif libc.syscall(446, fd, 0) < 0:  # restrict_self
                 sys.stderr.write("jroot: landlock: restrict_self: %s\n"
                                  % os.strerror(ctypes.get_errno()))
             else:
                 os.close(fd)
 else:
     os.environ.pop("JROOT_LANDLOCK", None)
+    os.environ.pop("JROOT_LANDLOCK_STRICT", None)
 
 os.execv(sys.argv[1], sys.argv[1:])
 PYEOF
@@ -406,7 +440,7 @@ PYEOF
 ensure_runtime() {
     mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
-    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v5" "$SECCOMP_LAUNCHER"; then
+    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v6" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
     fi
     if ! command -v python3 >/dev/null 2>&1; then
@@ -1454,7 +1488,7 @@ show_config() {
     printf '  user:             %s\n' "$(config_field "$cfg" user)"
     printf '  build_essential:  %s\n' "$(config_field "$cfg" build_essential)"
     printf '  mount_host (/):   %s   (host / at /mnt/host)\n' "$(config_field "$cfg" mount_host)"
-    printf '  mount_home (~):   %s   (host \$HOME at /mnt/home)\n' "$(config_field "$cfg" mount_home)"
+    printf '  mount_home (~):   %s   (host $HOME at /mnt/home)\n' "$(config_field "$cfg" mount_home)"
     printf '  public ports:     %s\n' "$(config_ports "$cfg" | sed 's/^$/none/')"
     if config_mounts "$cfg" | grep -q .; then
         printf '  custom mounts:\n'
@@ -1699,6 +1733,9 @@ run_in_jail() {
     unset HOSTALIASES LD_PRELOAD LD_LIBRARY_PATH BASH_ENV ENV
     unset http_proxy https_proxy ftp_proxy all_proxy no_proxy
 
+    # Host temp dir proot uses for its glue rootfs (PROOT_TMP_DIR, else /tmp).
+    local proot_tmp="${PROOT_TMP_DIR:-/tmp}"
+
     local binds=(-b /dev -b /proc -b /sys)
     if [ "$mount_host" = "1" ]; then
         binds+=(-b /:/mnt/host)
@@ -1812,6 +1849,20 @@ run_in_jail() {
         # is dlopen'd from there, so read+execute here is mandatory - without it
         # the execv() of proot fails with EACCES and nothing runs.
         landlock_allow "$BIN_DIR" "$LANDLOCK_RX"
+        # proot builds its "glue rootfs" in a temp dir on the HOST before it can
+        # run anything. Without write access there it dies with
+        #   can't create temporary directory: Permission denied
+        #   can't create glue rootfs
+        # and every later error (execve of /bin/sh, bind sanitizing) is fallout.
+        landlock_allow "$proot_tmp" "$LANDLOCK_FULL"
+        if [ -n "${TMPDIR:-}" ] && [ "$TMPDIR" != "$proot_tmp" ]; then
+            landlock_allow "$TMPDIR" "$LANDLOCK_FULL"
+        fi
+        # The empty stand-ins that shadow ~/.jroot inside host/home mounts live
+        # under the denied JROOT_HOME, but proot has to stat them to set up the
+        # binds, so they need their own deeper allow.
+        landlock_allow "$JROOT_HOME/.denied" "$LANDLOCK_RX"
+        landlock_allow "$JROOT_HOME/.deniedbin" "$LANDLOCK_RX"
         if [ -n "$dbus_sock" ]; then
             landlock_allow "$dbus_sock" "$LANDLOCK_FULL"
         fi
