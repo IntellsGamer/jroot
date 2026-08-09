@@ -478,7 +478,8 @@ build_port_shim() {
         fi
         local now="$(date +%s)"
         if [ -z "$mute_until" ] || [ "$mute_until" -le "$now" ]; then
-            warn "gcc not found on host - 'jroot port' (bind() shim) and read-only mounts are unavailable. Install gcc to use it."
+            warn "gcc not found on host - 'jroot port' (bind() shim) is unavailable. Install gcc to use it."
+            warn "Read-only mounts still work when the kernel has Landlock (see 'jroot doctor')."
             warn "To mute this warning for 7 days: jroot doctor --mute=7d"
             warn "To mute forever: jroot doctor --mute=forever"
         fi
@@ -2927,7 +2928,7 @@ cmd_doctor() {
             local hours=$(( (remaining % 86400) / 3600 ))
             report "gcc not found (muted)" warn "Warnings silenced for ${days}d ${hours}h (until $(date -d "@$mute_until" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown"))"
         else
-            report "gcc not found" warn "'jroot port' and read-only mounts unavailable. Install gcc or mute: jroot doctor --mute=7d"
+            report "gcc not found" warn "'jroot port' unavailable (ro mounts still enforced by Landlock). Install gcc or mute: jroot doctor --mute=7d"
         fi
     else
         report "gcc: $(command -v gcc)" ok
