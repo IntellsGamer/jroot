@@ -1309,13 +1309,7 @@ EOF
     fi
     cp /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
 
-    local hostname
-    hostname="$(hostname 2>/dev/null || echo localhost)"
-    cat > "$rootfs/etc/hosts" << EOF
-127.0.0.1 localhost
-127.0.1.1 ${hostname}
-::1 localhost ip6-localhost ip6-loopback
-EOF
+    sync_jail_hosts "$name"
 }
 
 config_apk() {
@@ -1339,18 +1333,62 @@ EOF
 
     cp /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
 
-    local hostname
-    hostname="$(hostname 2>/dev/null || echo localhost)"
-    cat > "$rootfs/etc/hosts" << EOF
-127.0.0.1 localhost
-127.0.1.1 ${hostname}
-::1 localhost ip6-localhost ip6-loopback
-EOF
+    sync_jail_hosts "$name"
 }
 
 # ---------------------------------------------------------------------------
 # Rootfs niceties: custom prompt, group mirroring, sudo logging off
 # ---------------------------------------------------------------------------
+
+# The name a jailed process gets from gethostname(2). proot cannot change the
+# UTS namespace, so this is always the HOST's kernel hostname, no matter what
+# /etc/hostname or the prompt say inside the jail.
+host_kernel_name() {
+    local n=""
+    n="$(uname -n 2>/dev/null || true)"
+    [ -n "$n" ] || n="$(hostname 2>/dev/null || true)"
+    [ -n "$n" ] || n="localhost"
+    printf '%s' "$n"
+}
+
+# True when $2 is already a name field in the hosts file $1. Compares whole
+# fields, not substrings: "SoloA" must not count as present just because
+# "SoloA.lan" is there - a hosts lookup matches names exactly, so the short
+# form needs its own entry.
+hosts_has_name() {
+    awk -v n="$2" '
+        { sub(/#.*/, ""); for (i = 2; i <= NF; i++) if ($i == n) { found = 1; exit } }
+        END { exit !found }
+    ' "$1" 2>/dev/null
+}
+
+# Make sure a jail's /etc/hosts resolves BOTH its own name and the host kernel
+# name. Anything that resolves its own hostname - sudo above all - fails with
+#   sudo: unable to resolve host <hostname>: Name or service not known
+# when gethostname(2) returns a name /etc/hosts has never heard of. The jail
+# name alone is not enough precisely because the jail never really owns it.
+# Idempotent and additive: entries added inside the jail are left alone.
+sync_jail_hosts() {
+    local name="$1"
+    local rootfs="$ROOTS_DIR/$name"
+    local hosts="$rootfs/etc/hosts"
+    [ -d "$rootfs/etc" ] && [ -w "$rootfs/etc" ] || return 0
+    if [ ! -f "$hosts" ]; then
+        cat > "$hosts" << 'EOF' 2>/dev/null || return 0
+127.0.0.1 localhost
+::1 localhost ip6-localhost ip6-loopback
+EOF
+    fi
+    local kname short n
+    kname="$(host_kernel_name)"
+    short="${kname%%.*}"
+    for n in "$name" "$kname" "$short"; do
+        [ -n "$n" ] || continue
+        hosts_has_name "$hosts" "$n" && continue
+        printf '127.0.1.1\t%s\n' "$n" >> "$hosts" 2>/dev/null || true
+    done
+}
+
 write_rootfs_niceties() {
     local name="$1"
     local rootfs="$ROOTS_DIR/$name"
@@ -1389,11 +1427,10 @@ EOF
     # Present the jail by its own name, not the host's hostname.
     printf '%s\n' "$name" > "$rootfs/etc/jailname" 2>/dev/null || true
     printf '%s\n' "$name" > "$rootfs/etc/hostname" 2>/dev/null || true
-    if [ -f "$rootfs/etc/hosts" ]; then
-        grep -v "127.0.1.1" "$rootfs/etc/hosts" > "$rootfs/etc/hosts.tmp" 2>/dev/null || true
-        printf '127.0.1.1\t%s\n' "$name" >> "$rootfs/etc/hosts.tmp" 2>/dev/null || true
-        mv "$rootfs/etc/hosts.tmp" "$rootfs/etc/hosts" 2>/dev/null || true
-    fi
+    # /etc/hosts keeps BOTH names: the jail's, and the host kernel name that
+    # gethostname(2) actually returns inside the jail. Dropping the latter is
+    # what used to break sudo.
+    sync_jail_hosts "$name"
     mkdir -p "$rootfs/usr/local/bin"
     cat > "$rootfs/usr/local/bin/hostname" << 'EOF'
 #!/bin/sh
@@ -1712,6 +1749,12 @@ run_in_jail() {
     mount_host="$(config_field "$cfg" mount_host)"; [ -n "$mount_host" ] || mount_host=0
     mount_home="$(config_field "$cfg" mount_home)"; [ -n "$mount_home" ] || mount_home=0
     image="$(config_field "$cfg" image)"
+
+    # Keep /etc/hosts in step with the host on every entry: the kernel hostname
+    # a jailed process sees is the host's, and it changes when the machine is
+    # renamed or the jail is moved to another machine. Cheap, idempotent, and it
+    # repairs jails created before this was handled.
+    sync_jail_hosts "$name"
 
     local proot_args=(-k "$PROOT_KERNEL_RELEASE")
     export HOSTNAME="$name"
