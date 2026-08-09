@@ -81,7 +81,7 @@ HOST
 │  identity mapping                │
 │  package management              │
 │  snapshots & revert              │
-│  security layer (seccomp)        │
+│  security layer (seccomp+landlock)│
 │  read-only mounts (LD_PRELOAD)   │
 │  port binding control            │
 │  file transfer (host ↔ jail)     │
@@ -535,10 +535,15 @@ and produces a simple summary:
 [PASS] proot binary: /home/user/.jroot/bin/proot  (v5.3.0)
 [PASS] python3 (seccomp launcher): /usr/bin/python3
 [PASS] seccomp launcher: /home/user/.jroot/bin/seccomp-launcher
+[PASS] kernel seccomp filter mode
+       openat2 / io_uring escape vectors are blocked
+[PASS] kernel Landlock ABI v3
+       ~/.jroot is denied and ro mounts are enforced by the kernel
+[PASS] gcc: /usr/bin/gcc
 [PASS] jail 'dev' config
 [PASS] jail 'dev' rootfs    /home/user/.jroot/roots/dev (245M)
 
-Summary: 6 ok, 0 warn, 0 fail
+Summary: 8 ok, 0 warn, 0 fail
 ```
 
 The diagnostic system is implemented directly in JRoot rather than relying on a collection of external commands.
@@ -570,9 +575,12 @@ ubuntu-test           180M       0B
 
 PRoot is powerful because it can provide filesystem and process translation without requiring privileged mounts.
 
-That power also means its attack surface deserves attention.
+That power also means its attack surface deserves attention. PRoot translates paths by intercepting syscalls with `ptrace`, so anything it does not intercept sees real host paths.
 
-JRoot includes a seccomp-based launcher designed to block the `openat2` syscall (437) before PRoot starts.
+JRoot starts every jail through a launcher that installs two kernel-level protections before PRoot runs:
+
+* a **seccomp filter** that refuses the syscalls PRoot 5.3.0 does not trace — `openat2`, `faccessat2`, `fchmodat2`, the fs-tree family (`open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`), `pidfd_getfd`, and **io_uring** (a ring bypasses `ptrace` entirely, so once a ring exists every read/write/open on it is invisible to PRoot). The blocked calls return `ENOSYS`, so callers fall back to the classic syscalls PRoot does trace.
+* a **Landlock ruleset** — a kernel-enforced, inode-based path allowlist. The jail gets its own rootfs, `/dev`, `/proc`, `/sys`, and whatever you mounted; everything else on the host is refused with `EACCES` no matter which syscall is used. `~/.jroot` is explicitly denied so a jailed process cannot reach another jail's rootfs or rewrite its own config.
 
 ```text
 JRoot
@@ -581,7 +589,8 @@ JRoot
 seccomp launcher
   │
   ├── NO_NEW_PRIVS
-  └── syscall filtering (blocks openat2)
+  ├── syscall filtering (openat2, io_uring, fs-tree family, ...)
+  └── Landlock path allowlist (rootfs + mounts only, ~/.jroot denied)
   │
   ▼
  PRoot
@@ -590,23 +599,25 @@ seccomp launcher
 Ubuntu userspace
 ```
 
-The runtime checks for the launcher and reports whether the protection is available through `jroot doctor`.
+Both are best effort: a kernel without `CONFIG_SECCOMP_FILTER` or without Landlock (WSL1, older kernels) gets a warning and runs with the remaining layers. `jroot doctor` reports exactly which of the two your kernel supports. `JROOT_LANDLOCK_OFF=1` disables the allowlist for debugging.
 
 ### Additional security features
 
 1. **Loopback-only by default** – Jailed servers only listen on `127.0.0.1` unless explicitly whitelisted with `jroot port`
-2. **Read-only mount enforcement** – `jroot mnt ... ro` blocks ALL write syscalls via LD_PRELOAD
-3. **Host mount warnings** – JRoot warns when host `/` or `$HOME` are deliberately mounted
+2. **Read-only mount enforcement** – `jroot mnt ... ro` is enforced twice: by Landlock in the kernel, and by the LD_PRELOAD shim returning `EROFS`
+3. **Host mount warnings** – JRoot warns when host `/` or `$HOME` are deliberately mounted, and shadows `~/.jroot` inside those mounts
 4. **Unroot mode** – Root account can be locked, daily use is a non-root user
 5. **Clean environment** – `LD_PRELOAD`, `LD_LIBRARY_PATH`, and proxy env vars are unset on enter
 
+**Alpine caveat:** the `libjroot.so` shim is built against the host's glibc and cannot load inside a musl jail, so Alpine jails do not get loopback-only port rewriting. Landlock and seccomp are libc-independent and still apply.
+
 ### Important
 
-JRoot is **not a virtual machine**.
+JRoot is **not a virtual machine**, and it does not use namespaces or cgroups.
 
-It is **not kernel-level container isolation**.
+Landlock and seccomp are real kernel enforcement, but they only cover filesystem paths and syscall numbers. There is no PID, network, or user namespace, no resource limit, and PRoot's `ptrace` translation is not designed to withstand a process that is actively attacking it.
 
-It should not be treated as a security boundary for hostile workloads.
+Treat JRoot as strong containment for code you mostly trust, not as a boundary for hostile workloads.
 
 The goal is rootless Linux environments, not pretending a userspace process can defeat the kernel.
 
@@ -816,7 +827,7 @@ Instead:
                 │  jail configuration               │
                 │  rootfs management                │
                 │  snapshots                        │
-                │  security (seccomp)               │
+                │  security (seccomp + landlock)    │
                 │  port shim (bind() LD_PRELOAD)    │
                 │  mount shim (write syscalls)      │
                 └───────────┬───────────────────────┘

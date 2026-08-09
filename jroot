@@ -6,23 +6,37 @@
 #   jroot init <image> [flags]  Create a jail (--name/--user/--build-essential/
 #                               --mount-host/--mount-home skip those prompts)
 #   jroot enter <name> [cmd...] Enter a jail / run a command (name required)
-#   jroot install <name> <pkg...>  apt-get install as root inside a jail
+#   jroot exec <name> [--root] <cmd...>  Run one command, no interactive shell
+#   jroot shell                 Interactive "jroot>" prompt (no command prefix)
+#   jroot install <name> <pkg...>  apt-get/apk install as root inside a jail
+#   jroot file cp|mv <name> <src> <dst>  Move files in/out (jail paths use ":")
+#   jroot port list|add|rm <name> [port]  Ports allowed to bind publicly
+#   jroot mnt <name> [label dir [rw|ro]]  Bind a host dir at /mnt/<label>
 #   jroot config <name>         Show / change a jail's settings
 #   jroot list [--json]         List all jails (machine-readable with --json)
 #   jroot info [name]           Show a jail's details and rootfs size
+#   jroot size [name]           Show disk usage per jail
 #   jroot update [name]         Update runtime + jail packages (all if no name)
+#   jroot clean <name>...       Free disk space (apt caches, lists, logs)
 #   jroot snapshot <name> [label]  Save rootfs + config (tar.gz)
 #   jroot snapshots <name>      List snapshots for a jail
 #   jroot revert <name> [label] Restore a jail to a snapshot
 #   jroot rm-snapshot <name> <label>  Delete a snapshot
-#   jroot doctor                Check the installation for problems
+#   jroot doctor [--mute=...]   Check the installation for problems
 #   jroot rm <name>             Delete a jail and its config
-#   jroot help                  Show this help
+#   jroot rename <name> <new>   Rename a jail (rootfs, config, snapshots)
+#   jroot help [command]        Show this help, or help for one command
 #
 # Everything lives under ~/.jroot and works without host root:
-#   proot   -> fake rootfs/root, no chroot, no mount, no cgroups needed
-#   apt     -> HTTPS mirrors (port 80 often blocked), trusted=yes + gpgv shim
-#   seccomp -> python3 filter blocks the openat2 proot escape (syscall 437)
+#   proot    -> fake rootfs/root, no chroot, no mount, no cgroups needed
+#   apt      -> HTTPS mirrors (port 80 often blocked), trusted=yes + gpgv shim
+#   seccomp  -> python3 filter refuses the syscalls proot cannot trace:
+#               openat2/faccessat2/fchmodat2, the fs-tree family, io_uring
+#               (rings bypass ptrace entirely) and pidfd_getfd
+#   landlock -> kernel-enforced path allowlist applied by the same launcher;
+#               the only layer that also covers musl (Alpine) jails
+#   shim     -> LD_PRELOAD libjroot.so forces listeners to loopback unless the
+#               port is allowlisted, and returns EROFS for ro mounts (glibc only)
 #
 # Per-jail options (set at init, changeable via `jroot config`):
 #   user            root (fake root via proot -0) or unroot (installs as root,
@@ -30,9 +44,13 @@
 #   build_essential install gcc/g++/make during bootstrap
 #   mount_host      bind host / to /mnt/host inside the jail
 #   mount_home      bind host $HOME to /mnt/home inside the jail
+#   ports           ports allowed to bind publicly (see `jroot port`)
+#   mounts          extra host dirs at /mnt/<label>, rw or ro (see `jroot mnt`)
 #
 # Env (optional):
 #   JROOT_HOME=path        Override storage root (default $HOME/.jroot)
+#   JROOT_KERNEL=x.y.z     Kernel release reported inside jails (default 6.8.0)
+#   JROOT_LANDLOCK_OFF=1   Skip the Landlock allowlist (debugging only)
 #   JROOT_SKIP_APT=1       Skip the apt bootstrap during init
 #   JROOT_SKIP_BOOTSTRAP=1 Same as above
 #   NONINTERACTIVE=1       Use all prompt defaults
@@ -58,7 +76,12 @@ USE_COLOR=0
 H="$C_CYA"; G="$C_GRN"; B="$C_BLU"; D="$C_DIM"; N="$C_NC"
 [ "$USE_COLOR" = 1 ] || { H=""; G=""; B=""; D=""; N=""; }
 
-JROOT_HOME="${JROOT_HOME:-$HOME/.jroot}"
+# run_in_jail exports HOME=/root (or /home/jail) into this process, so $HOME is
+# no longer the host's home after the first jail launch. Capture it once, before
+# anything can clobber it: init/update/verify all call run_in_jail more than once
+# per run, and the later calls still need the real host home for /mnt/home.
+REAL_HOME="$HOME"
+JROOT_HOME="${JROOT_HOME:-$REAL_HOME/.jroot}"
 ROOTS_DIR="$JROOT_HOME/roots"
 CONFIGS_DIR="$JROOT_HOME/configs"
 SNAPSHOTS_DIR="$JROOT_HOME/snapshots"
@@ -74,6 +97,17 @@ PROOT_KERNEL_RELEASE="${JROOT_KERNEL:-6.8.0}"
 # default; ports listed in the jail's config "ports" field are left public.
 PORT_SHIM_SRC="$BIN_DIR/libjroot.c"
 PORT_SHIM="$BIN_DIR/libjroot.so"
+
+# Landlock filesystem access masks, used to compose the JROOT_LANDLOCK rule
+# list consumed by the seccomp launcher (see write_seccomp_launcher).
+#   FULL = every fs bit up to ABI v3 (read/write/exec/create/remove/truncate)
+#   RX   = EXECUTE | READ_FILE | READ_DIR - enough to run and read, not write
+LANDLOCK_FULL="0x7fff"
+LANDLOCK_RX="0xd"
+LANDLOCK_RULES=""
+
+landlock_allow() { LANDLOCK_RULES="${LANDLOCK_RULES}${1}"$'\t'"${2}"$'\n'; }
+landlock_deny()  { LANDLOCK_RULES="${LANDLOCK_RULES}!${1}"$'\n'; }
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -199,10 +233,18 @@ FSCONFIG_NR = 431
 FSMOUNT_NR = 432
 FSPICK_NR = 433
 MOUNT_SETATTR_NR = 442
+# io_uring: submission happens through shared ring buffers, so individual file
+# operations are NOT syscalls and proot's ptrace interception never sees them.
+IO_URING_SETUP_NR = 425
+IO_URING_ENTER_NR = 426
+IO_URING_REGISTER_NR = 427
+# pidfd_getfd steals a live file descriptor out of another process - including
+# proot itself, which holds descriptors outside the jail.
+PIDFD_GETFD_NR = 438
 OFFSET_ARCH = 4
 OFFSET_NR = 0
 
-# jroot-seccomp-v4
+# jroot-seccomp-v5
 # proot 5.3.0 does not trace the modern *at2 family (openat2/faccessat2/fchmodat2)
 # or the fs-tree family (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
 # mount_setattr), so a jailed worker could reach real host paths (e.g. ~/.jroot
@@ -211,6 +253,18 @@ OFFSET_NR = 0
 # traces and the shim denies); the fs-tree calls have no fallback but are never
 # legitimately needed inside a jail and otherwise only fail with EPERM until the
 # jail runs privileged, at which point they become live escapes.
+#
+# io_uring is a wider hole than openat2 ever was: once a ring is set up, reads,
+# writes and openat operations are submitted via mmap'd queues, so ptrace-based
+# path translation is bypassed entirely for every operation on that ring. There
+# is no way to filter individual ring operations from here, so the ring itself
+# is refused. ENOSYS makes liburing and glibc fall back to normal syscalls,
+# which proot does trace.
+#
+# NOTE for anyone extending this list: the filter is installed before execv() of
+# proot, so PROOT INHERITS IT TOO. Any syscall proot itself needs (ptrace, wait4,
+# process_vm_readv, ...) must stay allowed, which is why only calls proot never
+# makes can be denied by number.
 program = [
     # idx0: load arch
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
@@ -224,49 +278,33 @@ program = [
     BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, 0x3fffffff, 0, 1),
     # idx5: kill (x32 ABI)
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-    # idx6: if nr == openat2 -> idx7, else idx8
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, OPENAT2_NR, 0, 1),
-    # idx7: ENOSYS (openat2 -> fallback openat)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx8: if nr == faccessat2 -> idx9, else idx10
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FACCESSAT2_NR, 0, 1),
-    # idx9: ENOSYS (faccessat2 -> fallback faccessat)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx10: if nr == fchmodat2 -> idx11, else idx12
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FCHMODAT2_NR, 0, 1),
-    # idx11: ENOSYS (fchmodat2 -> fallback fchmodat)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx12: if nr == open_tree -> idx13, else idx14
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, OPEN_TREE_NR, 0, 1),
-    # idx13: ENOSYS (open_tree)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx14: if nr == move_mount -> idx15, else idx16
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, MOVE_MOUNT_NR, 0, 1),
-    # idx15: ENOSYS (move_mount)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx16: if nr == fsopen -> idx17, else idx18
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FSOPEN_NR, 0, 1),
-    # idx17: ENOSYS (fsopen)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx18: if nr == fsconfig -> idx19, else idx20
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FSCONFIG_NR, 0, 1),
-    # idx19: ENOSYS (fsconfig)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx20: if nr == fsmount -> idx21, else idx22
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FSMOUNT_NR, 0, 1),
-    # idx21: ENOSYS (fsmount)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx22: if nr == fspick -> idx23, else idx24
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FSPICK_NR, 0, 1),
-    # idx23: ENOSYS (fspick)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx24: if nr == mount_setattr -> idx25, else idx26
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, MOUNT_SETATTR_NR, 0, 1),
-    # idx25: ENOSYS (mount_setattr)
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx26: allow everything else
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 ]
+
+# One "if nr == X: return ENOSYS" pair per entry. jt=0 falls through to the
+# ENOSYS return, jf=1 skips it and reaches the next comparison.
+DENY_ENOSYS = [
+    (OPENAT2_NR, "openat2 -> fallback openat"),
+    (FACCESSAT2_NR, "faccessat2 -> fallback faccessat"),
+    (FCHMODAT2_NR, "fchmodat2 -> fallback fchmodat"),
+    (OPEN_TREE_NR, "open_tree"),
+    (MOVE_MOUNT_NR, "move_mount"),
+    (FSOPEN_NR, "fsopen"),
+    (FSCONFIG_NR, "fsconfig"),
+    (FSMOUNT_NR, "fsmount"),
+    (FSPICK_NR, "fspick"),
+    (MOUNT_SETATTR_NR, "mount_setattr"),
+    (IO_URING_SETUP_NR, "io_uring_setup -> fallback to traced syscalls"),
+    (IO_URING_ENTER_NR, "io_uring_enter"),
+    (IO_URING_REGISTER_NR, "io_uring_register"),
+    (PIDFD_GETFD_NR, "pidfd_getfd"),
+]
+
+for _nr, _why in DENY_ENOSYS:
+    program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, _nr, 0, 1))
+    program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS))
+
+# allow everything else
+program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW))
 
 ArrayType = sock_filter * len(program)
 arr = ArrayType(*program)
@@ -293,11 +331,23 @@ except OSError as e:
 # Landlock: kernel-enforced, inode-based filesystem allowlist. This is the
 # authoritative defense against syscalls proot does not trace (faccessat2,
 # fchmodat2, open_tree, fsopen, ...): any path with no allow rule is refused
-# by the kernel with EACCES, regardless of syscall number. JROOT_LANDLOCK
-# carries one "PATH\tMASK" line per allow and one "!PATH" line per deny (a
-# deny is an allow rule with an empty access mask on that exact inode, and the
-# kernel honours the deepest matching rule). Best effort: if the kernel lacks
-# Landlock we warn and continue (seccomp still applies).
+# by the kernel with EACCES, regardless of syscall number, and it works the
+# same for musl jails where the LD_PRELOAD shim cannot be loaded.
+#
+# JROOT_LANDLOCK carries one "PATH\tMASK" line per allow and one "!PATH" line
+# per deny. Landlock resolves an access against the rule on the file itself or
+# its closest parent with a rule, so a deny on ~/.jroot still lets a deeper
+# allow on ~/.jroot/roots/<jail> through.
+#
+# A deny cannot be expressed as a zero mask: landlock_add_rule() rejects an
+# empty allowed_access with ENOMSG. LANDLOCK_ACCESS_FS_MAKE_BLOCK (1 << 11) is
+# used instead - it is a handled bit in every ABI, and creating a block device
+# needs CAP_MKNOD, which a rootless jail never has. So it grants nothing while
+# still shadowing the inherited read/write/exec rights of the parent rule.
+#
+# Best effort: if the kernel lacks Landlock we warn and continue (seccomp
+# still applies).
+LANDLOCK_DENY_MASK = 0x800  # MAKE_BLOCK only == no usable access
 if os.environ.get("JROOT_LANDLOCK"):
     import struct
     LANDLOCK_RULE_PATH_BENEATH = 1
@@ -307,10 +357,12 @@ if os.environ.get("JROOT_LANDLOCK"):
         if not line or line.startswith("#"):
             continue
         if line.startswith("!"):
-            entries.append((line[1:].strip(), 0))
+            entries.append((line[1:].strip(), LANDLOCK_DENY_MASK))
         else:
             path, _, mask = line.partition("\t")
             entries.append((path, int(mask or "0x7fff", 16)))
+    # Do not leak the host path list into the jail's environment.
+    os.environ.pop("JROOT_LANDLOCK", None)
     if entries:
         handled = 0
         fd = -1
@@ -321,10 +373,12 @@ if os.environ.get("JROOT_LANDLOCK"):
                 handled = probe
                 break
         if handled == 0:
-            sys.stderr.write("jroot: landlock: no supported ABI, skipping\n")
+            sys.stderr.write("jroot: landlock: not supported by this kernel, skipping\n")
         else:
             for path, mask in entries:
                 mask &= handled
+                if mask == 0:
+                    mask = LANDLOCK_DENY_MASK & handled
                 try:
                     o = os.open(os.path.realpath(path), os.O_PATH | os.O_CLOEXEC)
                 except OSError:
@@ -341,6 +395,8 @@ if os.environ.get("JROOT_LANDLOCK"):
                                  % os.strerror(ctypes.get_errno()))
             else:
                 os.close(fd)
+else:
+    os.environ.pop("JROOT_LANDLOCK", None)
 
 os.execv(sys.argv[1], sys.argv[1:])
 PYEOF
@@ -350,11 +406,11 @@ PYEOF
 ensure_runtime() {
     mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
-    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v4" "$SECCOMP_LAUNCHER"; then
+    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v5" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        warn "python3 not found on host - jails will enter WITHOUT the openat2 seccomp filter (known proot escape vector). Install python3."
+        warn "python3 not found on host - jails will enter WITHOUT the seccomp filter (openat2/io_uring escape vectors) and WITHOUT Landlock. Install python3."
     fi
     # Check if warnings should be silenced
     local mute_file="$JROOT_HOME/.mute-warnings"
@@ -1615,7 +1671,7 @@ run_in_jail() {
     local name="$1"; shift
     local cfg="$CONFIGS_DIR/$name.json"
     local rootfs="$ROOTS_DIR/$name"
-    local real_home="$HOME"
+    local real_home="$REAL_HOME"
     local user_mode mount_host mount_home image
     user_mode="$(config_field "$cfg" user)";      [ -n "$user_mode" ]  || user_mode="root"
     mount_host="$(config_field "$cfg" mount_host)"; [ -n "$mount_host" ] || mount_host=0
@@ -1725,12 +1781,12 @@ run_in_jail() {
     # Alpine (musl) jails cannot load the host glibc-built shim (musl lacks
     # __snprintf_chk and similar, so relocation fails at exec time), so the
     # LD_PRELOAD shim is skipped there. Consequence: loopback-only port
-    # enforcement, ro-mount EROFS and the shim's libc-level .jroot deny do not
-    # apply inside Alpine jails. The .denied proot bind-over and the seccomp
-    # ENOSYS blocks still protect ~/.jroot from raw syscalls.
+    # enforcement does not apply inside Alpine jails. ro mounts and the ~/.jroot
+    # deny are still enforced, by Landlock and by the .denied proot bind-over
+    # plus the seccomp ENOSYS blocks - none of which depend on libc.
     if [ "$jail_distro" = "alpine" ]; then
         shim_ok=0
-        warn "Alpine jail '$name': LD_PRELOAD shim is glibc-only, DISABLED (no port loopback / ro-mount enforcement)"
+        warn "Alpine jail '$name': LD_PRELOAD shim is glibc-only, DISABLED (ports are not forced to loopback)"
     fi
     if [ -x "$PORT_SHIM" ] && [ "$shim_ok" = "1" ]; then
         local jail_ports
@@ -1741,13 +1797,57 @@ run_in_jail() {
             JROOT_RO_MOUNTS="${ro_mounts#:}" "$@"
     fi
 
-    # Block the openat2 escape (syscall 437) with a seccomp filter applied to
-    # proot; every guest process inherits it on exec. Requires host python3.
+    # Landlock allowlist, composed from the same data as the proot binds above so
+    # the two layers cannot drift. This is the only layer that is both
+    # kernel-enforced and libc-independent: it covers the syscalls proot does not
+    # trace AND it works inside musl (Alpine) jails where the LD_PRELOAD shim
+    # cannot be loaded. Set JROOT_LANDLOCK_OFF=1 to skip it.
+    LANDLOCK_RULES=""
+    if [ -z "${JROOT_LANDLOCK_OFF:-}" ]; then
+        landlock_allow "$rootfs" "$LANDLOCK_FULL"
+        landlock_allow /dev "$LANDLOCK_FULL"
+        landlock_allow /proc "$LANDLOCK_FULL"
+        landlock_allow /sys "$LANDLOCK_FULL"
+        # proot itself is exec'd from BIN_DIR *after* restrict_self, and the shim
+        # is dlopen'd from there, so read+execute here is mandatory - without it
+        # the execv() of proot fails with EACCES and nothing runs.
+        landlock_allow "$BIN_DIR" "$LANDLOCK_RX"
+        if [ -n "$dbus_sock" ]; then
+            landlock_allow "$dbus_sock" "$LANDLOCK_FULL"
+        fi
+        if [ "$mount_host" = "1" ]; then
+            landlock_allow / "$LANDLOCK_FULL"
+        fi
+        if [ "$mount_home" = "1" ]; then
+            landlock_allow "$real_home" "$LANDLOCK_FULL"
+        fi
+        # Custom mounts: ro gets read+execute only, which makes read-only mounts
+        # kernel-enforced instead of relying on the shim's EROFS returns.
+        while IFS=$'\t' read -r m_label m_hostpath m_mode; do
+            [ -n "$m_hostpath" ] || continue
+            if [ "$m_mode" = "ro" ]; then
+                landlock_allow "$m_hostpath" "$LANDLOCK_RX"
+            else
+                landlock_allow "$m_hostpath" "$LANDLOCK_FULL"
+            fi
+        done < <(config_mounts "$cfg")
+        # Deny jroot's own state. It sits above roots/<jail> and bin/, and
+        # Landlock resolves against the closest rule, so those allows still win.
+        landlock_deny "$JROOT_HOME"
+        if [ -f "$real_home/.local/bin/jroot" ]; then
+            landlock_deny "$real_home/.local/bin/jroot"
+        fi
+    fi
+
+    # Block the syscalls proot cannot trace (openat2, the fs-tree family,
+    # io_uring, ...) with a seccomp filter applied to proot; every guest process
+    # inherits it on exec. Requires host python3, which also applies Landlock.
     # NOTE: proot must run as a CHILD (no `exec`) so jroot can keep going
     # after it exits - init/update/verify all call run_in_jail mid-script.
     local rc=0
     if command -v python3 >/dev/null 2>&1 && [ -x "$SECCOMP_LAUNCHER" ]; then
-        python3 "$SECCOMP_LAUNCHER" "$PROOT_BIN" "${proot_args[@]}" \
+        JROOT_LANDLOCK="$LANDLOCK_RULES" \
+            python3 "$SECCOMP_LAUNCHER" "$PROOT_BIN" "${proot_args[@]}" \
             -r "$rootfs" "${binds[@]}" "$@"
         rc=$?
     else
@@ -2133,8 +2233,10 @@ cmd_init() {
         warn "Or just: jroot update $name"
     fi
     warn ""
-    warn "SECURITY: the openat2 syscall is blocked via seccomp to prevent the"
-    warn "known proot container escape vulnerability."
+    warn "SECURITY: syscalls proot cannot trace (openat2, io_uring, the fs-tree"
+    warn "family) are refused by a seccomp filter, and a Landlock allowlist keeps"
+    warn "the jail off host paths it was not given. Run 'jroot doctor' to see"
+    warn "which of the two your kernel actually supports."
     if [ "$mount_host" = "1" ]; then
         warn ""
         warn "SECURITY: host / is mounted at /mnt/host inside the jail - it is READ/WRITE."
@@ -2633,6 +2735,30 @@ cmd_rename() {
     log "Renamed '$name' -> '$newname' (hostname, prompt, snapshots updated)."
 }
 
+# Read-only probe of the two kernel features jroot depends on. Prints
+# "seccomp=<yes|no|unknown> landlock=<abi|no|unknown>".
+kernel_features() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf 'seccomp=unknown landlock=unknown\n'
+        return 0
+    fi
+    python3 -c '
+import ctypes, platform
+libc = ctypes.CDLL(None, use_errno=True)
+m = platform.machine()
+NR_SECCOMP = {"x86_64": 317, "AMD64": 317, "aarch64": 277, "arm64": 277}.get(m)
+seccomp = "no"
+if NR_SECCOMP:
+    action = ctypes.c_uint(0x00050000)          # SECCOMP_RET_ERRNO
+    # SECCOMP_GET_ACTION_AVAIL (op 2) only queries, it installs nothing.
+    if libc.syscall(NR_SECCOMP, 2, 0, ctypes.byref(action)) == 0:
+        seccomp = "yes"
+abi = libc.syscall(444, None, 0, 1)             # CREATE_RULESET_VERSION
+landlock = str(abi) if abi > 0 else "no"
+print("seccomp=%s landlock=%s" % (seccomp, landlock))
+' 2>/dev/null || printf 'seccomp=unknown landlock=unknown\n'
+}
+
 cmd_doctor() {
     local mute=""
     while [ $# -gt 0 ]; do
@@ -2714,7 +2840,26 @@ cmd_doctor() {
         report "python3 (seccomp launcher): $(command -v python3)" ok
         [ -x "$SECCOMP_LAUNCHER" ] && report "seccomp launcher: $SECCOMP_LAUNCHER" ok || report "seccomp launcher missing: $SECCOMP_LAUNCHER" warn
     else
-        report "python3 not found" warn "proot escape protection (openat2 block) will be disabled"
+        report "python3 not found" warn "seccomp filter and Landlock allowlist will both be disabled"
+    fi
+
+    # Kernel side of the sandbox: seccomp filter mode and Landlock ABI.
+    local feats seccomp_avail landlock_abi
+    feats="$(kernel_features)"
+    seccomp_avail="${feats#seccomp=}"; seccomp_avail="${seccomp_avail%% *}"
+    landlock_abi="${feats##*landlock=}"
+    case "$seccomp_avail" in
+        yes) report "kernel seccomp filter mode" ok "openat2 / io_uring escape vectors are blocked" ;;
+        no)  report "kernel lacks seccomp filter mode" warn "WSL1 or CONFIG_SECCOMP_FILTER=n - jails run without syscall filtering" ;;
+        *)   report "kernel seccomp support unknown" warn "could not probe (no python3?)" ;;
+    esac
+    case "$landlock_abi" in
+        ''|unknown) report "kernel Landlock support unknown" warn "could not probe (no python3?)" ;;
+        no) report "kernel lacks Landlock" warn "no kernel-enforced path allowlist; falling back to proot + seccomp + shim" ;;
+        *)  report "kernel Landlock ABI v$landlock_abi" ok "~/.jroot is denied and ro mounts are enforced by the kernel" ;;
+    esac
+    if [ -n "${JROOT_LANDLOCK_OFF:-}" ]; then
+        report "Landlock disabled by JROOT_LANDLOCK_OFF" warn "unset it to re-enable the kernel path allowlist"
     fi
 
     # Check gcc and show mute status
@@ -3078,9 +3223,9 @@ cmd_help_cmd() {
             mnt_usage "<name>"
             ;;
         install)
-            printf '%bjroot install%b - install apt packages inside a jail\n\n' "$H" "$N"
+            printf '%bjroot install%b - install packages inside a jail (apt or apk)\n\n' "$H" "$N"
             printf '    %bjroot install <name> <pkg...>%b\n' "$G" "$N"
-            printf '\n    Runs %bjroot exec <name> --root apt-get install -y ...%b\n' "$G" "$N"
+            printf '\n    Ubuntu jails use apt-get, Alpine jails use apk, both as root.\n'
             printf '    %bExample:%b jroot install dev git curl\n' "$G" "$N"
             ;;
         config)
