@@ -190,13 +190,27 @@ else:
 
 ENOSYS = 38
 OPENAT2_NR = 437
-RENAMEAT2_NR = 435
-FCHMODAT2_NR = 437
 FACCESSAT2_NR = 439
-NAME_TO_HANDLE_AT_NR = 442
+FCHMODAT2_NR = 452
+OPEN_TREE_NR = 428
+MOVE_MOUNT_NR = 429
+FSOPEN_NR = 430
+FSCONFIG_NR = 431
+FSMOUNT_NR = 432
+FSPICK_NR = 433
+MOUNT_SETATTR_NR = 442
 OFFSET_ARCH = 4
 OFFSET_NR = 0
 
+# jroot-seccomp-v4
+# proot 5.3.0 does not trace the modern *at2 family (openat2/faccessat2/fchmodat2)
+# or the fs-tree family (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
+# mount_setattr), so a jailed worker could reach real host paths (e.g. ~/.jroot
+# configs) with raw syscalls that skip both proot and the LD_PRELOAD shim. Return
+# ENOSYS: for *at2 the caller falls back to the classic variant (which proot
+# traces and the shim denies); the fs-tree calls have no fallback but are never
+# legitimately needed inside a jail and otherwise only fail with EPERM until the
+# jail runs privileged, at which point they become live escapes.
 program = [
     # idx0: load arch
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
@@ -210,11 +224,47 @@ program = [
     BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, 0x3fffffff, 0, 1),
     # idx5: kill (x32 ABI)
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-    # idx6: if nr == 437 (openat2) -> idx7, else idx8
+    # idx6: if nr == openat2 -> idx7, else idx8
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, OPENAT2_NR, 0, 1),
-    # idx7: return ENOSYS so callers fall back to openat/open
+    # idx7: ENOSYS (openat2 -> fallback openat)
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
-    # idx8: allow
+    # idx8: if nr == faccessat2 -> idx9, else idx10
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FACCESSAT2_NR, 0, 1),
+    # idx9: ENOSYS (faccessat2 -> fallback faccessat)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx10: if nr == fchmodat2 -> idx11, else idx12
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FCHMODAT2_NR, 0, 1),
+    # idx11: ENOSYS (fchmodat2 -> fallback fchmodat)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx12: if nr == open_tree -> idx13, else idx14
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, OPEN_TREE_NR, 0, 1),
+    # idx13: ENOSYS (open_tree)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx14: if nr == move_mount -> idx15, else idx16
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, MOVE_MOUNT_NR, 0, 1),
+    # idx15: ENOSYS (move_mount)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx16: if nr == fsopen -> idx17, else idx18
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FSOPEN_NR, 0, 1),
+    # idx17: ENOSYS (fsopen)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx18: if nr == fsconfig -> idx19, else idx20
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FSCONFIG_NR, 0, 1),
+    # idx19: ENOSYS (fsconfig)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx20: if nr == fsmount -> idx21, else idx22
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FSMOUNT_NR, 0, 1),
+    # idx21: ENOSYS (fsmount)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx22: if nr == fspick -> idx23, else idx24
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FSPICK_NR, 0, 1),
+    # idx23: ENOSYS (fspick)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx24: if nr == mount_setattr -> idx25, else idx26
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, MOUNT_SETATTR_NR, 0, 1),
+    # idx25: ENOSYS (mount_setattr)
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+    # idx26: allow everything else
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 ]
 
@@ -229,6 +279,58 @@ if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
 if libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(prog)) != 0:
     raise OSError(ctypes.get_errno(), "PR_SET_SECCOMP")
 
+# Landlock: kernel-enforced, inode-based filesystem allowlist. This is the
+# authoritative defense against syscalls proot does not trace (faccessat2,
+# fchmodat2, open_tree, fsopen, ...): any path with no allow rule is refused
+# by the kernel with EACCES, regardless of syscall number. JROOT_LANDLOCK
+# carries one "PATH\tMASK" line per allow and one "!PATH" line per deny (a
+# deny is an allow rule with an empty access mask on that exact inode, and the
+# kernel honours the deepest matching rule). Best effort: if the kernel lacks
+# Landlock we warn and continue (seccomp still applies).
+if os.environ.get("JROOT_LANDLOCK"):
+    import struct
+    LANDLOCK_RULE_PATH_BENEATH = 1
+    entries = []
+    for line in os.environ["JROOT_LANDLOCK"].splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("!"):
+            entries.append((line[1:].strip(), 0))
+        else:
+            path, _, mask = line.partition("\t")
+            entries.append((path, int(mask or "0x7fff", 16)))
+    if entries:
+        handled = 0
+        fd = -1
+        for probe in (0x7fff, 0x3fff, 0x1fff):  # ABI v3/v2/v1 fs bits
+            attr = ctypes.create_string_buffer(struct.pack("QQ", probe, 0), 16)
+            fd = libc.syscall(444, ctypes.byref(attr), 16, 0)  # create_ruleset
+            if fd >= 0:
+                handled = probe
+                break
+        if handled == 0:
+            sys.stderr.write("jroot: landlock: no supported ABI, skipping\n")
+        else:
+            for path, mask in entries:
+                mask &= handled
+                try:
+                    o = os.open(os.path.realpath(path), os.O_PATH | os.O_CLOEXEC)
+                except OSError:
+                    continue
+                try:
+                    rb = ctypes.create_string_buffer(struct.pack("Q i I", mask, o, 0), 16)
+                    if libc.syscall(445, fd, LANDLOCK_RULE_PATH_BENEATH, ctypes.byref(rb), 0) < 0:
+                        sys.stderr.write("jroot: landlock: rule %s: %s\n"
+                                         % (path, os.strerror(ctypes.get_errno())))
+                finally:
+                    os.close(o)
+            if libc.syscall(446, fd, 0) < 0:  # restrict_self
+                sys.stderr.write("jroot: landlock: restrict_self: %s\n"
+                                 % os.strerror(ctypes.get_errno()))
+            else:
+                os.close(fd)
+
 os.execv(sys.argv[1], sys.argv[1:])
 PYEOF
     chmod +x "$SECCOMP_LAUNCHER"
@@ -236,7 +338,8 @@ PYEOF
 
 ensure_runtime() {
     mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR"
-    if [ ! -x "$SECCOMP_LAUNCHER" ]; then
+    mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
+    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v4" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
     fi
     if ! command -v python3 >/dev/null 2>&1; then
@@ -295,6 +398,7 @@ build_port_shim() {
 #include <errno.h>
 #include <dlfcn.h>
 #include <stdarg.h>
+#include <dirent.h>
 
 typedef int (*bind_fn)(int, const struct sockaddr *, socklen_t);
 
@@ -456,6 +560,66 @@ static int at_is_ro(int dirfd, const char *path) {
     return path_is_ro(abs);
 }
 
+/* ---- deny layer: jroot internals look non-existent ---------------------- */
+
+static int denied_errno(void) {
+    errno = ENOENT;
+    return -1;
+}
+
+/* A path inside the ~/.jroot config/rootfs tree, or the installed jroot
+ * binary itself, must look NON-EXISTENT from inside every jail - regardless
+ * of how host directories are bind-mounted in (custom mounts, / at /mnt/host,
+ * or $HOME at /mnt/home). Otherwise a jailed user could edit a jail's config
+ * (switch themselves to root, open public ports) or replace the jroot binary
+ * for the next run. Applied to BOTH read and write syscalls. */
+static int path_is_denied(const char *path) {
+    if (!path || !*path) return 0;
+    char abs[8192];
+    if (path[0] != '/') {
+        char cwd[8192];
+        if (!getcwd(cwd, sizeof(cwd))) return 0;
+        snprintf(abs, sizeof(abs), "%s/%s", cwd, path);
+    } else {
+        snprintf(abs, sizeof(abs), "%s", path);
+    }
+    char norm[8192];
+    norm_path(abs, norm, sizeof(norm));
+    {
+        char *dup = strdup(norm);
+        char *tok, *save = NULL;
+        int denied = 0;
+        for (tok = strtok_r(dup, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
+            if (strcmp(tok, ".jroot") == 0) { denied = 1; break; }
+        }
+        free(dup);
+        if (denied) return 1;
+    }
+    {
+        static const char bin[] = "/.local/bin/jroot";
+        size_t nl = strlen(norm);
+        size_t bl = sizeof(bin) - 1;
+        if (nl >= bl && strcmp(norm + nl - bl, bin) == 0) return 1;
+    }
+    return 0;
+}
+
+static int at_is_denied(int dirfd, const char *path) {
+    if (!path || !*path) return 0;
+    char abs[8192];
+    if (!resolve_at(dirfd, path, abs, sizeof(abs))) return 0;
+    return path_is_denied(abs);
+}
+
+#define DENY_OR_RO(p) \
+    do { if (path_is_denied(p)) return denied_errno(); \
+         if (path_is_ro(p)) return blocked_errno(); } while (0)
+
+#define DENY_OR_RO_AT(fd, p) \
+    do { if (at_is_denied((fd), (p))) return denied_errno(); \
+         if (at_is_ro((fd), (p))) return blocked_errno(); } while (0)
+
+
 typedef int (*open_fn)(const char *, int, ...);
 typedef int (*openat_fn)(int, const char *, int, ...);
 typedef int (*creat_fn)(const char *, mode_t);
@@ -480,6 +644,7 @@ typedef int (*utime_fn)(const char *, const void *);
 int name(const char *path, int flags, ...) {                            \
     static open_fn real = NULL;                                         \
     if (!real) real = (open_fn)dlsym(RTLD_NEXT, sym);                   \
+    if (path_is_denied(path)) return denied_errno();                    \
     if (want_write(flags) && path_is_ro(path)) return blocked_errno();  \
     va_list ap; va_start(ap, flags); mode_t mode = 0;                   \
     if (flags & O_CREAT) mode = va_arg(ap, mode_t);                     \
@@ -495,6 +660,7 @@ SHIM_OPEN(open64, "open64")
 int name(int dirfd, const char *path, int flags, ...) {                 \
     static openat_fn real = NULL;                                       \
     if (!real) real = (openat_fn)dlsym(RTLD_NEXT, sym);                 \
+    if (at_is_denied(dirfd, path)) return denied_errno();               \
     if (want_write(flags) && at_is_ro(dirfd, path)) return blocked_errno(); \
     va_list ap; va_start(ap, flags); mode_t mode = 0;                   \
     if (flags & O_CREAT) mode = va_arg(ap, mode_t);                     \
@@ -510,7 +676,7 @@ SHIM_OPENAT(openat64, "openat64")
 int name(const char *path, mode_t mode) {                               \
     static creat_fn real = NULL;                                        \
     if (!real) real = (creat_fn)dlsym(RTLD_NEXT, sym);                  \
-    if (path_is_ro(path)) return blocked_errno();                       \
+    DENY_OR_RO(path);                                                   \
     return real(path, mode);                                            \
 }
 
@@ -521,7 +687,7 @@ SHIM_CREAT(creat64, "creat64")
 int name(const char *path) {                                            \
     static path_fn real = NULL;                                         \
     if (!real) real = (path_fn)dlsym(RTLD_NEXT, sym);                   \
-    if (path_is_ro(path)) return blocked_errno();                       \
+    DENY_OR_RO(path);                                                   \
     return real(path);                                                  \
 }
 
@@ -533,6 +699,7 @@ typedef int (*symlink_fn)(const char *, const char *);
 int symlink(const char *target, const char *linkpath) {
     static symlink_fn real = NULL;
     if (!real) real = (symlink_fn)dlsym(RTLD_NEXT, "symlink");
+    if (path_is_denied(linkpath)) return denied_errno();
     if (path_is_ro(linkpath)) return blocked_errno();
     return real(target, linkpath);
 }
@@ -541,7 +708,7 @@ int symlink(const char *target, const char *linkpath) {
 int name(const char *path, mode_t mode) {                               \
     static path_mode_fn real = NULL;                                    \
     if (!real) real = (path_mode_fn)dlsym(RTLD_NEXT, sym);              \
-    if (path_is_ro(path)) return blocked_errno();                       \
+    DENY_OR_RO(path);                                                   \
     return real(path, mode);                                            \
 }
 
@@ -552,6 +719,7 @@ typedef int (*mknod_fn)(const char *, mode_t, dev_t);
 int mknod(const char *path, mode_t mode, dev_t dev) {
     static mknod_fn real = NULL;
     if (!real) real = (mknod_fn)dlsym(RTLD_NEXT, "mknod");
+    if (path_is_denied(path)) return denied_errno();
     if (path_is_ro(path)) return blocked_errno();
     return real(path, mode, dev);
 }
@@ -559,6 +727,7 @@ int mknod(const char *path, mode_t mode, dev_t dev) {
 int rename(const char *oldpath, const char *newpath) {
     static rename_fn real = NULL;
     if (!real) real = (rename_fn)dlsym(RTLD_NEXT, "rename");
+    if (path_is_denied(oldpath) || path_is_denied(newpath)) return denied_errno();
     if (path_is_ro(oldpath) || path_is_ro(newpath)) return blocked_errno();
     return real(oldpath, newpath);
 }
@@ -566,6 +735,7 @@ int rename(const char *oldpath, const char *newpath) {
 int renameat(int od, const char *op, int nd, const char *np) {
     static renameat_fn real = NULL;
     if (!real) real = (renameat_fn)dlsym(RTLD_NEXT, "renameat");
+    if (at_is_denied(od, op) || at_is_denied(nd, np)) return denied_errno();
     if (at_is_ro(od, op) || at_is_ro(nd, np)) return blocked_errno();
     return real(od, op, nd, np);
 }
@@ -573,6 +743,7 @@ int renameat(int od, const char *op, int nd, const char *np) {
 int renameat2(int od, const char *op, int nd, const char *np, unsigned int flags) {
     static renameat2_fn real = NULL;
     if (!real) real = (renameat2_fn)dlsym(RTLD_NEXT, "renameat2");
+    if (at_is_denied(od, op) || at_is_denied(nd, np)) return denied_errno();
     if (at_is_ro(od, op) || at_is_ro(nd, np)) return blocked_errno();
     return real(od, op, nd, np, flags);
 }
@@ -580,34 +751,35 @@ int renameat2(int od, const char *op, int nd, const char *np, unsigned int flags
 int mkdirat(int dirfd, const char *path, mode_t mode) {
     static mkdirat_fn real = NULL;
     if (!real) real = (mkdirat_fn)dlsym(RTLD_NEXT, "mkdirat");
-    if (at_is_ro(dirfd, path)) return blocked_errno();
+    DENY_OR_RO_AT(dirfd, path);
     return real(dirfd, path, mode);
 }
 
 int unlinkat(int dirfd, const char *path, int flags) {
     static unlinkat_fn real = NULL;
     if (!real) real = (unlinkat_fn)dlsym(RTLD_NEXT, "unlinkat");
-    if (at_is_ro(dirfd, path)) return blocked_errno();
+    DENY_OR_RO_AT(dirfd, path);
     return real(dirfd, path, flags);
 }
 
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     static fchmodat_fn real = NULL;
     if (!real) real = (fchmodat_fn)dlsym(RTLD_NEXT, "fchmodat");
-    if (at_is_ro(dirfd, path)) return blocked_errno();
+    DENY_OR_RO_AT(dirfd, path);
     return real(dirfd, path, mode, flags);
 }
 
 int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
     static fchownat_fn real = NULL;
     if (!real) real = (fchownat_fn)dlsym(RTLD_NEXT, "fchownat");
-    if (at_is_ro(dirfd, path)) return blocked_errno();
+    DENY_OR_RO_AT(dirfd, path);
     return real(dirfd, path, uid, gid, flags);
 }
 
 int chmod(const char *path, mode_t mode) {
     static path_mode_fn real = NULL;
     if (!real) real = (path_mode_fn)dlsym(RTLD_NEXT, "chmod");
+    if (path_is_denied(path)) return denied_errno();
     if (path_is_ro(path)) return blocked_errno();
     return real(path, mode);
 }
@@ -615,6 +787,7 @@ int chmod(const char *path, mode_t mode) {
 int link(const char *oldpath, const char *newpath) {
     static link_fn real = NULL;
     if (!real) real = (link_fn)dlsym(RTLD_NEXT, "link");
+    if (path_is_denied(oldpath) || path_is_denied(newpath)) return denied_errno();
     if (path_is_ro(oldpath) || path_is_ro(newpath)) return blocked_errno();
     return real(oldpath, newpath);
 }
@@ -622,6 +795,7 @@ int link(const char *oldpath, const char *newpath) {
 int linkat(int od, const char *op, int nd, const char *np, int flags) {
     static linkat_fn real = NULL;
     if (!real) real = (linkat_fn)dlsym(RTLD_NEXT, "linkat");
+    if (at_is_denied(od, op) || at_is_denied(nd, np)) return denied_errno();
     if (at_is_ro(od, op) || at_is_ro(nd, np)) return blocked_errno();
     return real(od, op, nd, np, flags);
 }
@@ -629,20 +803,21 @@ int linkat(int od, const char *op, int nd, const char *np, int flags) {
 int symlinkat(const char *target, int dirfd, const char *path) {
     static symlinkat_fn real = NULL;
     if (!real) real = (symlinkat_fn)dlsym(RTLD_NEXT, "symlinkat");
-    if (at_is_ro(dirfd, path)) return blocked_errno();
+    DENY_OR_RO_AT(dirfd, path);
     return real(target, dirfd, path);
 }
 
 int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     static mknodat_fn real = NULL;
     if (!real) real = (mknodat_fn)dlsym(RTLD_NEXT, "mknodat");
-    if (at_is_ro(dirfd, path)) return blocked_errno();
+    DENY_OR_RO_AT(dirfd, path);
     return real(dirfd, path, mode, dev);
 }
 
 int truncate(const char *path, off_t length) {
     static truncate_fn real = NULL;
     if (!real) real = (truncate_fn)dlsym(RTLD_NEXT, "truncate");
+    if (path_is_denied(path)) return denied_errno();
     if (path_is_ro(path)) return blocked_errno();
     return real(path, length);
 }
@@ -650,13 +825,14 @@ int truncate(const char *path, off_t length) {
 int utimensat(int dirfd, const char *path, const struct timespec *times, int flags) {
     static utimensat_fn real = NULL;
     if (!real) real = (utimensat_fn)dlsym(RTLD_NEXT, "utimensat");
-    if (at_is_ro(dirfd, path)) return blocked_errno();
+    DENY_OR_RO_AT(dirfd, path);
     return real(dirfd, path, times, flags);
 }
 
 int utime(const char *path, const void *times) {
     static utime_fn real = NULL;
     if (!real) real = (utime_fn)dlsym(RTLD_NEXT, "utime");
+    if (path_is_denied(path)) return denied_errno();
     if (path_is_ro(path)) return blocked_errno();
     return real(path, times);
 }
@@ -666,6 +842,7 @@ typedef int (*chown_fn)(const char *, uid_t, gid_t);
 int chown(const char *path, uid_t uid, gid_t gid) {
     static chown_fn real = NULL;
     if (!real) real = (chown_fn)dlsym(RTLD_NEXT, "chown");
+    if (path_is_denied(path)) return denied_errno();
     if (path_is_ro(path)) return blocked_errno();
     return real(path, uid, gid);
 }
@@ -673,12 +850,141 @@ int chown(const char *path, uid_t uid, gid_t gid) {
 int lchown(const char *path, uid_t uid, gid_t gid) {
     static chown_fn real = NULL;
     if (!real) real = (chown_fn)dlsym(RTLD_NEXT, "lchown");
+    if (path_is_denied(path)) return denied_errno();
     if (path_is_ro(path)) return blocked_errno();
     return real(path, uid, gid);
 }
 
-/* Block fopen-family writes too (they route through our open, but fdopen
- * and fwrite are common enough that catching the open is sufficient). */
+/* ---- deny layer (read side): make jroot internals look non-existent ---- */
+
+typedef int (*stat_fn)(const char *, struct stat *);
+typedef int (*stat64_fn)(const char *, struct stat64 *);
+typedef int (*fstatat_fn)(int, const char *, struct stat *, int);
+typedef int (*fstatat64_fn)(int, const char *, struct stat64 *, int);
+typedef int (*statx_fn)(int, const char *, int, unsigned int, struct statx *);
+typedef int (*access_fn)(const char *, int);
+typedef int (*faccessat_fn)(int, const char *, int, int);
+typedef ssize_t (*readlink_fn)(const char *, char *, size_t);
+typedef ssize_t (*readlinkat_fn)(int, const char *, char *, size_t);
+typedef int (*chdir_fn)(const char *);
+
+#define SHIM_STAT(name, sym, stat_t)                                    \
+int name(const char *path, stat_t *st) {                                \
+    static stat_fn real = NULL;                                         \
+    if (!real) real = (stat_fn)dlsym(RTLD_NEXT, sym);                   \
+    if (path_is_denied(path)) return denied_errno();                    \
+    return real(path, st);                                              \
+}
+
+SHIM_STAT(stat, "stat", struct stat)
+SHIM_STAT(stat64, "stat64", struct stat64)
+SHIM_STAT(lstat, "lstat", struct stat)
+SHIM_STAT(lstat64, "lstat64", struct stat64)
+
+int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+    static fstatat_fn real = NULL;
+    if (!real) real = (fstatat_fn)dlsym(RTLD_NEXT, "fstatat");
+    if (at_is_denied(dirfd, path)) return denied_errno();
+    return real(dirfd, path, st, flags);
+}
+
+int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
+    static fstatat64_fn real = NULL;
+    if (!real) real = (fstatat64_fn)dlsym(RTLD_NEXT, "fstatat64");
+    if (at_is_denied(dirfd, path)) return denied_errno();
+    return real(dirfd, path, st, flags);
+}
+
+int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *stx) {
+    static statx_fn real = NULL;
+    if (!real) real = (statx_fn)dlsym(RTLD_NEXT, "statx");
+    if (at_is_denied(dirfd, path)) return denied_errno();
+    return real(dirfd, path, flags, mask, stx);
+}
+
+int access(const char *path, int mode) {
+    static access_fn real = NULL;
+    if (!real) real = (access_fn)dlsym(RTLD_NEXT, "access");
+    if (path_is_denied(path)) return denied_errno();
+    return real(path, mode);
+}
+
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+    static faccessat_fn real = NULL;
+    if (!real) real = (faccessat_fn)dlsym(RTLD_NEXT, "faccessat");
+    if (at_is_denied(dirfd, path)) return denied_errno();
+    return real(dirfd, path, mode, flags);
+}
+
+ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
+    static readlink_fn real = NULL;
+    if (!real) real = (readlink_fn)dlsym(RTLD_NEXT, "readlink");
+    if (path_is_denied(path)) return denied_errno();
+    return real(path, buf, bufsiz);
+}
+
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
+    static readlinkat_fn real = NULL;
+    if (!real) real = (readlinkat_fn)dlsym(RTLD_NEXT, "readlinkat");
+    if (at_is_denied(dirfd, path)) return denied_errno();
+    return real(dirfd, path, buf, bufsiz);
+}
+
+int chdir(const char *path) {
+    static chdir_fn real = NULL;
+    if (!real) real = (chdir_fn)dlsym(RTLD_NEXT, "chdir");
+    if (path_is_denied(path)) return denied_errno();
+    return real(path);
+}
+
+/* Hide denied entries from directory listings. glibc's readdir() calls the
+ * getdents64 SYSCALL directly (bypassing the exported symbol), so interpose
+ * at the readdir level: skip any entry named ".jroot". */
+typedef struct dirent *(*readdir_fn)(DIR *);
+typedef struct dirent64 *(*readdir64_fn)(DIR *);
+typedef int (*readdir_r_fn)(DIR *, struct dirent *, struct dirent **);
+typedef int (*readdir64_r_fn)(DIR *, struct dirent64 *, struct dirent64 **);
+
+struct dirent *readdir(DIR *dirp) {
+    static readdir_fn real = NULL;
+    if (!real) real = (readdir_fn)dlsym(RTLD_NEXT, "readdir");
+    struct dirent *e;
+    while ((e = real(dirp)) != NULL) {
+        if (strcmp(e->d_name, ".jroot") != 0) return e;
+    }
+    return e;
+}
+
+struct dirent64 *readdir64(DIR *dirp) {
+    static readdir64_fn real = NULL;
+    if (!real) real = (readdir64_fn)dlsym(RTLD_NEXT, "readdir64");
+    struct dirent64 *e;
+    while ((e = real(dirp)) != NULL) {
+        if (strcmp(e->d_name, ".jroot") != 0) return e;
+    }
+    return e;
+}
+
+int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result) {
+    static readdir_r_fn real = NULL;
+    if (!real) real = (readdir_r_fn)dlsym(RTLD_NEXT, "readdir_r");
+    int rc;
+    do {
+        rc = real(dirp, entry, result);
+    } while (rc == 0 && *result != NULL && strcmp((*result)->d_name, ".jroot") == 0);
+    return rc;
+}
+
+int readdir64_r(DIR *dirp, struct dirent64 *entry, struct dirent64 **result) {
+    static readdir64_r_fn real = NULL;
+    if (!real) real = (readdir64_r_fn)dlsym(RTLD_NEXT, "readdir64_r");
+    int rc;
+    do {
+        rc = real(dirp, entry, result);
+    } while (rc == 0 && *result != NULL && strcmp((*result)->d_name, ".jroot") == 0);
+    return rc;
+}
+
 CEOF
     if gcc -shared -fPIC -O2 -o "$PORT_SHIM" "$src" -ldl 2>/dev/null; then
         log "Built port shim: $PORT_SHIM"
@@ -743,7 +1049,7 @@ get_ubuntu() {
     local name="$1" version="$2"
     local rootfs="$ROOTS_DIR/$name"
 
-    if [ -f "$rootfs/etc/os-release" ] && [ -f "$rootfs/bin/sh" ]; then
+    if [ -f "$rootfs/etc/os-release" ] && { [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ]; }; then
         log "Rootfs already present for '$name'"
         return
     fi
@@ -763,7 +1069,7 @@ get_ubuntu() {
     fi
     log "Extracting rootfs..."
     tar -xzf "$tarball" -C "$rootfs"
-    [ -f "$rootfs/bin/sh" ] || err "Rootfs extraction failed - /bin/sh not found"
+    [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ] || err "Rootfs extraction failed - /bin/sh not found"
     log "Rootfs extracted to $rootfs"
 }
 
@@ -771,7 +1077,7 @@ get_alpine() {
     local name="$1" version="$2"
     local rootfs="$ROOTS_DIR/$name"
 
-    if [ -f "$rootfs/etc/os-release" ] && [ -f "$rootfs/bin/sh" ]; then
+    if [ -f "$rootfs/etc/os-release" ] && { [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ]; }; then
         log "Rootfs already present for '$name'"
         return
     fi
@@ -829,7 +1135,7 @@ get_alpine() {
         log "Extracting rootfs..."
         tar -xzf "$tarball" -C "$rootfs"
     fi
-    [ -f "$rootfs/bin/sh" ] || err "Rootfs extraction failed - /bin/sh not found"
+    [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ] || err "Rootfs extraction failed - /bin/sh not found"
     log "Rootfs extracted to $rootfs"
 }
 
@@ -1334,6 +1640,23 @@ run_in_jail() {
         binds+=(-b "$real_home:/mnt/home")
     fi
 
+    # Deny layer: shadow jroot's own tree and binary inside / and $HOME mounts
+    # with empty stand-ins, so even raw syscalls that skip the LD_PRELOAD shim
+    # resolve them to a dead path. The shim additionally returns ENOENT for any
+    # path with a ".jroot" component (covers arbitrary custom mounts too).
+    if [ "$mount_home" = "1" ] || [ "$mount_host" = "1" ]; then
+        local denied_dir="$JROOT_HOME/.denied" denied_bin="$JROOT_HOME/.deniedbin"
+        [ -d "$denied_dir" ] || { mkdir -p "$denied_dir"; : > "$denied_bin"; }
+        if [ "$mount_home" = "1" ]; then
+            binds+=(-b "$denied_dir:/mnt/home/.jroot")
+            binds+=(-b "$denied_bin:/mnt/home/.local/bin/jroot")
+        fi
+        if [ "$mount_host" = "1" ]; then
+            binds+=(-b "$denied_dir:/mnt/host${real_home}/.jroot")
+            binds+=(-b "$denied_bin:/mnt/host${real_home}/.local/bin/jroot")
+        fi
+    fi
+
     # Custom per-jail mounts (persisted in the config "mounts" array).
     # ro mounts are enforced by the LD_PRELOAD shim (write syscalls -> EROFS).
     local m_label m_hostpath m_mode ro_mounts=""
@@ -1369,8 +1692,18 @@ run_in_jail() {
         export DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_sock"
     fi
 
+    # Distro detection (musl Alpine needs different shell + no glibc shim).
+    local jail_distro="" shim_ok=1
+    if [ -f "$rootfs/etc/os-release" ]; then
+        jail_distro="$(. "$rootfs/etc/os-release" 2>/dev/null; printf '%s' "${ID:-}")"
+    fi
+
     if [ "$#" -eq 0 ]; then
-        set -- /bin/bash --login
+        if [ "$jail_distro" = "alpine" ]; then
+            set -- /bin/sh
+        else
+            set -- /bin/bash --login
+        fi
     fi
 
     # Loopback-only by default: wrap the guest command in /usr/bin/env so the
@@ -1378,7 +1711,17 @@ run_in_jail() {
     # python3 launcher and proot itself never see it). JROOT_PORTS lists the
     # ports that may stay public (0.0.0.0); everything else is forced to
     # 127.0.0.1 / ::1 by the shim.
-    if [ -x "$PORT_SHIM" ]; then
+    # Alpine (musl) jails cannot load the host glibc-built shim (musl lacks
+    # __snprintf_chk and similar, so relocation fails at exec time), so the
+    # LD_PRELOAD shim is skipped there. Consequence: loopback-only port
+    # enforcement, ro-mount EROFS and the shim's libc-level .jroot deny do not
+    # apply inside Alpine jails. The .denied proot bind-over and the seccomp
+    # ENOSYS blocks still protect ~/.jroot from raw syscalls.
+    if [ "$jail_distro" = "alpine" ]; then
+        shim_ok=0
+        warn "Alpine jail '$name': LD_PRELOAD shim is glibc-only, DISABLED (no port loopback / ro-mount enforcement)"
+    fi
+    if [ -x "$PORT_SHIM" ] && [ "$shim_ok" = "1" ]; then
         local jail_ports
         jail_ports="$(config_ports "$cfg")"
         binds+=(-b "$PORT_SHIM:/usr/local/lib/libjroot.so")
