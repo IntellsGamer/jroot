@@ -1446,10 +1446,11 @@ CEOF
     # .so is built against the HOST libc but loaded inside the JAIL, so a single
     # modern symbol (glibc >= 2.38 redirects strtol to __isoc23_strtol) makes
     # every jail with an older libc fail to exec anything at all.
-    # --no-as-needed keeps DT_NEEDED libdl.so.2, which is where dlsym lives on
-    # pre-2.34 jails (it is a harmless stub on newer ones).
-    if gcc -shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-            -o "$PORT_SHIM" "$src" -Wl,--no-as-needed -ldl 2>/dev/null; then
+    # Keeping DT_NEEDED libdl.so.2 matters for the same reason: on jails older
+    # than glibc 2.34 that is where dlsym lives (on newer ones it is a stub).
+    local cflags="-shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+    if gcc $cflags -o "$PORT_SHIM" "$src" -Wl,--no-as-needed -l:libdl.so.2 2>/dev/null \
+       || gcc $cflags -o "$PORT_SHIM" "$src" -ldl 2>/dev/null; then
         log "Built port shim: $PORT_SHIM"
         shim_glibc_floor_warn
         return 0
@@ -1527,8 +1528,9 @@ build_shim_in_jail() {
     cp "$PORT_SHIM_SRC" "$rootfs/tmp/libjroot.c" 2>/dev/null || return 1
     log "Building the jroot shim inside '$name' (its libc differs from the host's)..."
     SHIM_RESOLVING=1 run_in_jail --root "$name" /bin/sh -c \
-        'gcc -shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-             -o /usr/local/lib/libjroot.so /tmp/libjroot.c -Wl,--no-as-needed -ldl' >/dev/null 2>&1 || {
+        'CF="-shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+         gcc $CF -o /usr/local/lib/libjroot.so /tmp/libjroot.c -Wl,--no-as-needed -l:libdl.so.2 \
+             || gcc $CF -o /usr/local/lib/libjroot.so /tmp/libjroot.c -ldl' >/dev/null 2>&1 || {
         rm -f "$rootfs/tmp/libjroot.c"
         return 1
     }
