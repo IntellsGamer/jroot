@@ -78,7 +78,10 @@ CMD_HINT="jroot "
 C_RED='\033[1;31m'; C_GRN='\033[1;32m'; C_YEL='\033[1;33m'; C_NC='\033[0m'
 C_CYA='\033[1;36m'; C_BLU='\033[1;34m'; C_BLD='\033[1m'; C_DIM='\033[2m'
 log()  { echo -e "${C_GRN}[+]${C_NC} $1"; }
-warn() { echo -e "${C_YEL}[!]${C_NC} $1"; }
+# Warnings go to stderr: several call sites capture a function's stdout
+# (set_config_ports, resolve_jail_shim, config helpers), and a warning landing in
+# a captured value has silently corrupted config values and the shim mode before.
+warn() { echo -e "${C_YEL}[!]${C_NC} $1" >&2; }
 err()  { echo -e "${C_RED}[!]${C_NC} $1" >&2; exit 1; }
 
 # Color the help text only when stdout is a terminal (pipes stay plain).
@@ -1113,28 +1116,36 @@ int lchown(const char *path, uid_t uid, gid_t gid) {
 /* ---- deny layer (read side): make jroot internals look non-existent ---- */
 
 typedef int (*stat_fn)(const char *, struct stat *);
-typedef int (*stat64_fn)(const char *, struct stat64 *);
 typedef int (*fstatat_fn)(int, const char *, struct stat *, int);
-typedef int (*fstatat64_fn)(int, const char *, struct stat64 *, int);
-typedef int (*statx_fn)(int, const char *, int, unsigned int, struct statx *);
 typedef int (*access_fn)(const char *, int);
 typedef int (*faccessat_fn)(int, const char *, int, int);
 typedef ssize_t (*readlink_fn)(const char *, char *, size_t);
 typedef ssize_t (*readlinkat_fn)(int, const char *, char *, size_t);
 typedef int (*chdir_fn)(const char *);
+/* The *64 and statx interfaces are glibc-specific. musl defines the 64-bit
+ * names as macros for the base ones, so defining functions with those names
+ * there would collide, and struct stat64/statx may not exist at all. Hooking
+ * the base names is enough on musl, where they are already 64-bit. */
+#ifdef __GLIBC__
+typedef int (*stat64_fn)(const char *, struct stat64 *);
+typedef int (*fstatat64_fn)(int, const char *, struct stat64 *, int);
+typedef int (*statx_fn)(int, const char *, int, unsigned int, struct statx *);
+#endif
 
 #define SHIM_STAT(name, sym, stat_t)                                    \
 int name(const char *path, stat_t *st) {                                \
     static stat_fn real = NULL;                                         \
     if (!real) real = (stat_fn)dlsym(RTLD_NEXT, sym);                   \
     if (path_is_denied(path)) return denied_errno();                    \
-    return real(path, st);                                              \
+    return real(path, (struct stat *)st);                               \
 }
 
 SHIM_STAT(stat, "stat", struct stat)
-SHIM_STAT(stat64, "stat64", struct stat64)
 SHIM_STAT(lstat, "lstat", struct stat)
+#ifdef __GLIBC__
+SHIM_STAT(stat64, "stat64", struct stat64)
 SHIM_STAT(lstat64, "lstat64", struct stat64)
+#endif
 
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     static fstatat_fn real = NULL;
@@ -1143,6 +1154,7 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     return real(dirfd, path, st, flags);
 }
 
+#ifdef __GLIBC__
 int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
     static fstatat64_fn real = NULL;
     if (!real) real = (fstatat64_fn)dlsym(RTLD_NEXT, "fstatat64");
@@ -1156,6 +1168,7 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
     if (at_is_denied(dirfd, path)) return denied_errno();
     return real(dirfd, path, flags, mask, stx);
 }
+#endif
 
 int access(const char *path, int mode) {
     static access_fn real = NULL;
@@ -1351,12 +1364,14 @@ static int jp_path_is_proc(const char *path) {
  * at the readdir level: skip any entry named ".jroot", and - when the stream
  * is the host /proc - any pid that is not part of this jail. */
 typedef struct dirent *(*readdir_fn)(DIR *);
-typedef struct dirent64 *(*readdir64_fn)(DIR *);
 typedef int (*readdir_r_fn)(DIR *, struct dirent *, struct dirent **);
-typedef int (*readdir64_r_fn)(DIR *, struct dirent64 *, struct dirent64 **);
 typedef DIR *(*opendir_fn)(const char *);
 typedef DIR *(*fdopendir_fn)(int);
 typedef int (*closedir_fn)(DIR *);
+#ifdef __GLIBC__
+typedef struct dirent64 *(*readdir64_fn)(DIR *);
+typedef int (*readdir64_r_fn)(DIR *, struct dirent64 *, struct dirent64 **);
+#endif
 
 static int jp_hide_entry(DIR *dirp, const char *name) {
     if (strcmp(name, ".jroot") == 0) return 1;
@@ -1411,16 +1426,6 @@ struct dirent *readdir(DIR *dirp) {
     return e;
 }
 
-struct dirent64 *readdir64(DIR *dirp) {
-    static readdir64_fn real = NULL;
-    if (!real) real = (readdir64_fn)dlsym(RTLD_NEXT, "readdir64");
-    struct dirent64 *e;
-    while ((e = real(dirp)) != NULL) {
-        if (!jp_hide_entry(dirp, e->d_name)) return e;
-    }
-    return e;
-}
-
 int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result) {
     static readdir_r_fn real = NULL;
     if (!real) real = (readdir_r_fn)dlsym(RTLD_NEXT, "readdir_r");
@@ -1429,6 +1434,17 @@ int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result) {
         rc = real(dirp, entry, result);
     } while (rc == 0 && *result != NULL && jp_hide_entry(dirp, (*result)->d_name));
     return rc;
+}
+
+#ifdef __GLIBC__
+struct dirent64 *readdir64(DIR *dirp) {
+    static readdir64_fn real = NULL;
+    if (!real) real = (readdir64_fn)dlsym(RTLD_NEXT, "readdir64");
+    struct dirent64 *e;
+    while ((e = real(dirp)) != NULL) {
+        if (!jp_hide_entry(dirp, e->d_name)) return e;
+    }
+    return e;
 }
 
 int readdir64_r(DIR *dirp, struct dirent64 *entry, struct dirent64 **result) {
@@ -1440,6 +1456,7 @@ int readdir64_r(DIR *dirp, struct dirent64 *entry, struct dirent64 **result) {
     } while (rc == 0 && *result != NULL && jp_hide_entry(dirp, (*result)->d_name));
     return rc;
 }
+#endif
 
 CEOF
     # -std=gnu11 and no _FORTIFY_SOURCE keep the symbol requirements old: this
@@ -1516,7 +1533,7 @@ shim_probe() {
     rm -rf "$dir" 2>/dev/null
     mkdir -p "$dir/.jroot" 2>/dev/null || return 1
     : > "$dir/canary" 2>/dev/null
-    out="$("$PROOT_BIN" -k "$PROOT_KERNEL_RELEASE" -0 -r "$rootfs" \
+    out="$("$PROOT_BIN" -k "$PROOT_KERNEL_RELEASE" -0 -w / -r "$rootfs" \
         -b /dev -b /proc -b /sys -b "$PORT_SHIM:/usr/local/lib/libjroot.so" \
         /usr/bin/env LD_PRELOAD=/usr/local/lib/libjroot.so \
         /bin/ls -a1 /tmp/.jroot-shimprobe 2>&1)" || rc=1
@@ -1574,14 +1591,18 @@ shim_status() {
     printf 'unknown'
 }
 
-# Prints "local", "host", or nothing.
+# Decide which shim a jail gets and publish it in the global SHIM_MODE
+# ("local", "host", or empty). A global rather than stdout on purpose: this
+# function logs and warns, and capturing its output would fold those messages
+# into the value.
 resolve_jail_shim() {
     local name="$1" so marker verdict
+    SHIM_MODE=""
     so="$(jail_local_shim "$name")"
     marker="$JROOT_HOME/.shim.$name"
 
     if [ -s "$so" ] && grep -qa "$SHIM_VERSION" "$so" 2>/dev/null; then
-        printf 'local'
+        SHIM_MODE="local"
         return 0
     fi
     [ -x "$PORT_SHIM" ] || return 0
@@ -1589,20 +1610,20 @@ resolve_jail_shim() {
     if [ -f "$marker" ] && [ "$marker" -nt "$PORT_SHIM" ]; then
         verdict="$(cat "$marker" 2>/dev/null || true)"
         case "$verdict" in
-            host) printf 'host'; return 0 ;;
+            host) SHIM_MODE="host"; return 0 ;;
             none) return 0 ;;
         esac
     fi
 
     if shim_probe "$name"; then
         printf 'host' > "$marker" 2>/dev/null || true
-        printf 'host'
+        SHIM_MODE="host"
         return 0
     fi
 
     if build_shim_in_jail "$name"; then
         printf 'local' > "$marker" 2>/dev/null || true
-        printf 'local'
+        SHIM_MODE="local"
         return 0
     fi
 
@@ -2479,7 +2500,8 @@ run_in_jail() {
     # jail's libc - see resolve_jail_shim. JROOT_SHIM_OFF=1 skips it entirely.
     local shim_mode=""
     if [ -z "${JROOT_SHIM_OFF:-}" ] && [ "${SHIM_RESOLVING:-0}" != "1" ]; then
-        shim_mode="$(resolve_jail_shim "$name")"
+        resolve_jail_shim "$name"
+        shim_mode="$SHIM_MODE"
     fi
     if [ -n "$shim_mode" ]; then
         local jail_ports
