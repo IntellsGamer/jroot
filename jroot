@@ -1485,10 +1485,12 @@ shim_glibc_floor_warn() {
 #
 # libjroot.so is compiled on the HOST but dlopen'd by the JAIL's dynamic loader
 # through LD_PRELOAD, so the two libcs have to agree. A host newer than the jail
-# (glibc 2.39 host, 22.04 jail) or a different libc entirely (musl on Alpine)
-# means the host-built shim cannot load, and preloading it anyway breaks every
-# command in the jail:
+# (glibc 2.39 host, 22.04 jail) means the host-built shim cannot load, and
+# preloading it anyway breaks every command in the jail:
 #   /bin/bash: libc.so.6: version `GLIBC_2.38' not found (required by libjroot.so)
+# The shim is deliberately built against an old symbol set (see build_port_shim)
+# so one copy covers Ubuntu 16.04 through 26.04, and in practice musl jails too -
+# but that is verified per jail at runtime rather than assumed.
 #
 # Resolution order, cached per jail in ~/.jroot/.shim.<name>:
 #   1. a shim built inside the jail (always ABI-correct)
@@ -1500,20 +1502,35 @@ jail_local_shim() {
     printf '%s' "$ROOTS_DIR/$1/usr/local/lib/libjroot.so"
 }
 
-# Can the jail's loader preload the host-built shim? Runs proot directly (not
-# run_in_jail) to stay out of the resolution path.
+# Can the jail's loader preload the host-built shim, and does it actually take
+# effect there? Exit status alone is not enough: a loader that fails to bind the
+# preload can still run the command, leaving the shim silently inert. So the
+# probe checks an observable side effect - the shim hides directory entries named
+# ".jroot" - using nothing but `ls`, which every image has.
+# Runs proot directly (not run_in_jail) to stay out of the resolution path.
 shim_probe() {
-    local name="$1" rootfs="$ROOTS_DIR/$name" out rc=0
+    local name="$1" rootfs="$ROOTS_DIR/$name" out rc=0 dir
     [ -x "$PROOT_BIN" ] || return 1
     [ -x "$PORT_SHIM" ] || return 1
+    dir="$rootfs/tmp/.jroot-shimprobe"
+    rm -rf "$dir" 2>/dev/null
+    mkdir -p "$dir/.jroot" 2>/dev/null || return 1
+    : > "$dir/canary" 2>/dev/null
     out="$("$PROOT_BIN" -k "$PROOT_KERNEL_RELEASE" -0 -r "$rootfs" \
         -b /dev -b /proc -b /sys -b "$PORT_SHIM:/usr/local/lib/libjroot.so" \
-        /usr/bin/env LD_PRELOAD=/usr/local/lib/libjroot.so /bin/true 2>&1)" || rc=1
+        /usr/bin/env LD_PRELOAD=/usr/local/lib/libjroot.so \
+        /bin/ls -a1 /tmp/.jroot-shimprobe 2>&1)" || rc=1
+    rm -rf "$dir" 2>/dev/null
+    [ "$rc" = 0 ] || return 1
     case "$out" in
         *"not found"*|*"cannot open shared object"*|*"undefined symbol"*|\
-        *"unsupported relocation"*|*"Error relocating"*) rc=1 ;;
+        *"Error relocating"*|*"Error loading"*|*"unsupported relocation"*) return 1 ;;
     esac
-    return "$rc"
+    # The listing must have worked at all...
+    printf '%s\n' "$out" | grep -qFx 'canary' || return 1
+    # ...and the shim must have hidden the .jroot entry.
+    printf '%s\n' "$out" | grep -qFx '.jroot' && return 1
+    return 0
 }
 
 # Compile the shim with the jail's own toolchain. Fixes both the old-glibc case
@@ -1538,6 +1555,23 @@ build_shim_in_jail() {
     [ -s "$so" ] || return 1
     log "Shim built inside '$name'."
     return 0
+}
+
+# Read-only view of the shim decision for a jail: local | host | none | unknown.
+# Never probes and never builds, so it is safe for `jroot doctor` and `list`.
+shim_status() {
+    local name="$1" so marker
+    so="$(jail_local_shim "$name")"
+    if [ -s "$so" ] && grep -qa "$SHIM_VERSION" "$so" 2>/dev/null; then
+        printf 'local'
+        return 0
+    fi
+    marker="$JROOT_HOME/.shim.$name"
+    if [ -f "$marker" ] && [ "$marker" -nt "$PORT_SHIM" ]; then
+        cat "$marker" 2>/dev/null
+        return 0
+    fi
+    printf 'unknown'
 }
 
 # Prints "local", "host", or nothing.
@@ -1573,7 +1607,7 @@ resolve_jail_shim() {
     fi
 
     printf 'none' > "$marker" 2>/dev/null || true
-    warn "Jail '$name': the host-built shim cannot load here (its libc is older than the host's, or it is musl) and the jail has no gcc to build its own."
+    warn "Jail '$name': the shim cannot load here (its libc is too old for the host build, or incompatible) and the jail has no gcc to build its own."
     warn "  Consequences: no per-jail loopback address, 'jroot port' has no effect, host processes stay visible in /proc, ro mounts rely on Landlock only."
     warn "  Fix: jroot install $name gcc   (Alpine: jroot install $name build-base), then re-enter."
     return 0
@@ -3162,7 +3196,8 @@ net_list() {
     printf '  A server on a non-public port is reachable from the host at that\n'
     printf '  jail'"'"'s ADDRESS, e.g. %bcurl http://127.2.0.1:8080%b. Public ports\n' "$G" "$N"
     printf '  (%bjroot port <name> add%b) bind 0.0.0.0 and ignore the address.\n' "$G" "$N"
-    printf '  Alpine jails cannot load the shim, so they keep plain 127.0.0.1.\n'
+    printf '  A jail whose libc cannot load the shim keeps plain 127.0.0.1;\n'
+    printf '  %bjroot doctor%b shows which jails those are.\n' "$G" "$N"
 }
 
 cmd_port() {
@@ -3724,6 +3759,12 @@ cmd_doctor() {
             else
                 report "jail '$name' rootfs" fail "$rootfs missing or incomplete"
             fi
+            case "$(shim_status "$name")" in
+                host)    report "jail '$name' shim: host build" ok "per-jail address, ports and /proc hiding are active" ;;
+                local)   report "jail '$name' shim: built inside the jail" ok "its libc differs from the host's" ;;
+                none)    report "jail '$name' shim: unavailable" warn "no per-jail address, 'jroot port' inert, host processes visible in /proc. Fix: jroot install $name gcc" ;;
+                *)       report "jail '$name' shim: not decided yet" ok "resolved on the next 'jroot enter'" ;;
+            esac
         done
     fi
 
