@@ -486,7 +486,7 @@ PYEOF
 }
 
 ensure_runtime() {
-    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR"
+    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR" "$JROOT_HOME/pids"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
     if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v7" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
@@ -2513,6 +2513,9 @@ run_in_jail() {
         else
             set -- /bin/bash --login
         fi
+        # Save the PID for jroot kill (only for interactive shells)
+        local pidfile="$JROOT_HOME/pids/$name.pid"
+        echo $$ > "$pidfile" 2>/dev/null || true
     fi
 
     # The shim is applied by wrapping the guest command in /usr/bin/env, so
@@ -3583,7 +3586,86 @@ cmd_rm() {
     esac
     rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json"
     rm -f "$(history_file "$name")"
+    rm -f "$JROOT_HOME/pids/$name.pid" 2>/dev/null || true
     log "Jail '$name' deleted."
+}
+
+cmd_kill() {
+    local force=0
+    local name=""
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --force|-f) force=1 ;;
+            --*) err "Unknown option: $arg" ;;
+            *)
+                if [ -z "$name" ]; then
+                    name="$arg"
+                else
+                    err "Usage: jroot kill <name> [--force|-f]"
+                fi
+                ;;
+        esac
+    done
+    [ -n "$name" ] || err "Usage: jroot kill <name> [--force|-f]"
+    
+    local pidfile="$JROOT_HOME/pids/$name.pid"
+    [ -f "$pidfile" ] || err "Jail '$name' is not running (no PID file)."
+    
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        warn "PID $pid is not running. Removing stale PID file."
+        rm -f "$pidfile"
+        return 0
+    fi
+    
+    log "Killing jail '$name' (PID: $pid)..."
+    
+    # Kill the entire process group (bash + all children)
+    local pgid
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    if [ -n "$pgid" ]; then
+        if [ "$force" = 1 ]; then
+            kill -KILL -"$pgid" 2>/dev/null || true
+        else
+            kill -TERM -"$pgid" 2>/dev/null || true
+            sleep 0.3
+            # Force kill if still running
+            kill -KILL -"$pgid" 2>/dev/null || true
+        fi
+    else
+        # Fallback: kill just the PID
+        if [ "$force" = 1 ]; then
+            kill -KILL "$pid" 2>/dev/null || true
+        else
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 0.3
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    
+    rm -f "$pidfile"
+    log "Jail '$name' killed."
+}
+
+cmd_ps() {
+    local found=0
+    printf '%-16s %-8s %s\n' "JAIL" "PID" "COMMAND"
+    for pidfile in "$JROOT_HOME/pids"/*.pid; do
+        [ -f "$pidfile" ] || continue
+        local name="$(basename "$pidfile" .pid)"
+        local pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+        if kill -0 "$pid" 2>/dev/null; then
+            local cmd="$(ps -o cmd= -p "$pid" 2>/dev/null | head -c 50)"
+            printf '%-16s %-8s %s\n' "$name" "$pid" "${cmd:-unknown}"
+            found=1
+        else
+            # Stale PID file
+            rm -f "$pidfile"
+        fi
+    done
+    [ "$found" -eq 0 ] && log "No running jails."
 }
 
 cmd_rename() {
@@ -4591,6 +4673,19 @@ cmd_help_cmd() {
             printf '\n    Moves the rootfs, config, and snapshots to the new name, and\n'
             printf '    updates the jail hostname, /etc/hosts, and shell prompt.\n'
             ;;
+        kill|stop)
+            printf '%bjroot kill%b - terminate a running jail\n\n' "$H" "$N"
+            printf '    %bjroot kill <name>%b\n' "$G" "$N"
+            printf '    %bjroot kill <name> --force%b\n' "$G" "$N"
+            printf '\n    Kills the jail'"'"'s shell process and all its children.\n'
+            printf '    Use %b--force%b for an immediate SIGKILL instead of SIGTERM.\n' "$G" "$N"
+            ;;
+        ps)
+            printf '%bjroot ps%b - list running jails\n\n' "$H" "$N"
+            printf '    %bjroot ps%b\n' "$G" "$N"
+            printf '\n    Shows the PID and command for each running jail.\n'
+            printf '    Stale PID files are automatically cleaned up.\n'
+            ;;
         help)
             printf '%bjroot help%b - show this help\n\n' "$H" "$N"
             printf '    %bjroot help%b            (all commands)\n' "$G" "$N"
@@ -4646,6 +4741,8 @@ cmd_help() {
     help_row "jroot doctor" "[--mute=7d|forever|off]" "Check setup, or mute warnings"
     help_row "jroot rm" "<name>"        "Permanently delete a jail"
     help_row "jroot rename" "<n> <new>" "Rename a jail (updates hostname/prompt/snapshots)"
+    help_row "jroot kill" "<name>"      "Terminate a running jail"
+    help_row "jroot ps" ""              "List running jails"
     help_row "jroot help" "[command]"     "Show help (for one command too)"
     printf '\n'
 
@@ -4709,6 +4806,8 @@ jroot_cmd() {
         doctor)        shift; cmd_doctor "$@" ;;
         rm|delete)     shift; cmd_rm "$@" ;;
         rename)        shift; cmd_rename "$@" ;;
+        kill|stop)     shift; cmd_kill "$@" ;;
+        ps)            shift; cmd_ps "$@" ;;
         help|--help|-h) shift; cmd_help "$@" ;;
         *)             err "Unknown command: $1 (run '${CMD_HINT}help')" ;;
     esac

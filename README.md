@@ -565,6 +565,41 @@ The jail's hostname, `/etc/hosts`, and shell prompt are also updated to reflect 
 
 ---
 
+# 🛑 Managing running jails
+
+### `jroot ps` – list running jails
+
+Shows every jail that currently has an active interactive shell:
+
+```bash
+jroot ps
+JAIL             PID      COMMAND
+dev              12345    /bin/bash --login
+staging          12346    /bin/bash --login
+```
+
+Stale PID files are automatically cleaned up when a jail exits or is killed.
+
+### `jroot kill` – terminate a running jail
+
+Kills the jail's shell process and all its children. This is equivalent to sending SIGTERM to the entire process group.
+
+```bash
+jroot kill dev
+[+] Killing jail 'dev' (PID: 12345)...
+[+] Jail 'dev' killed.
+```
+
+For immediate termination (SIGKILL):
+
+```bash
+jroot kill dev --force
+```
+
+The jail's rootfs and configuration are left intact — you can restart it with `jroot enter dev` later.
+
+---
+
 # 🖥️ Interactive command shell
 
 For repetitive tasks, JRoot offers an interactive shell where you don't need to type `jroot` every time.
@@ -918,6 +953,8 @@ MAINTENANCE
   jroot update [name]              Update runtime/packages
   jroot clean <name>...            Free disk space inside a jail
   jroot rename <name> <newname>    Rename a jail
+  jroot kill <name>                Terminate a running jail
+  jroot ps                         List running jails
   jroot rm <name>                  Delete a jail
   jroot help [command]             Show help
 ```
