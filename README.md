@@ -74,20 +74,20 @@ HOST
  │
  │  ordinary user
  ▼
-┌──────────────────────────────────┐
-│              JRoot               │
-│                                  │
-│  filesystem mapping              │
-│  identity mapping                │
-│  package management              │
-│  snapshots & revert              │
-│  security layer (seccomp+landlock)│
-│  per-jail loopback address       │
-│  /proc process filtering         │
-│  read-only mounts (LD_PRELOAD)   │
-│  port binding control            │
-│  file transfer (host ↔ jail)     │
-└────────────┬─────────────────────┘
+┌────────────────────────────────────┐
+│              JRoot                 │
+│                                    │
+│  filesystem mapping                │
+│  identity mapping                  │
+│  package management                │
+│  snapshots & revert                │
+│  security layer (seccomp+landlock) │
+│  per-jail loopback address         │
+│  /proc process filtering           │
+│  read-only mounts (LD_PRELOAD)     │
+│  port binding control              │
+│  file transfer (host ↔ jail)       │
+└────────────┬───────────────────────┘
              │
              ▼
         ┌─────────┐
@@ -429,6 +429,8 @@ jroot net set web off         # share 127.0.0.1 with the host, like before
 ```
 
 Public ports are unaffected: `jroot port web add 8080` binds `0.0.0.0` and ignores the jail address.
+
+> **The deliberate trade-off: a jail can no longer reach host services on 127.0.0.1. `jroot net set <name> off` restores the old shared behaviour.**
 
 ---
 
