@@ -31,6 +31,10 @@
 #   jroot help [command]        Show this help, or help for one command
 #
 # Everything lives under ~/.jroot and works without host root:
+#   roots/<name>          rootfs        configs/<name>.json   jail config
+#   snapshots/<name>/     snapshots     history/<name>.log    jail provenance
+#
+# Layers:
 #   proot    -> fake rootfs/root, no chroot, no mount, no cgroups needed
 #   apt      -> HTTPS mirrors (port 80 often blocked), trusted=yes + gpgv shim
 #   seccomp  -> python3 filter refuses the syscalls proot cannot trace:
@@ -3401,16 +3405,16 @@ cmd_compare() {
     for f in image user build_essential mount_host mount_home; do
         compare_row "$f" "$(config_field "$cfa" "$f")" "$(config_field "$cfb" "$f")"
     done
-    compare_row "ports" \
-        "$(config_ports "$cfa" | sed 's/^$/none/')" \
-        "$(config_ports "$cfb" | sed 's/^$/none/')"
-    compare_row "mounts" \
-        "$(config_mounts "$cfa" | awk '{printf "%s ", $1}' | sed 's/ $//; s/^$/none/')" \
-        "$(config_mounts "$cfb" | awk '{printf "%s ", $1}' | sed 's/ $//; s/^$/none/')"
+    local pa pb ma mb sa sb
+    pa="$(config_ports "$cfa")"; pb="$(config_ports "$cfb")"
+    compare_row "ports" "${pa:-none}" "${pb:-none}"
+    ma="$(config_mounts "$cfa" | awk '{printf "%s ", $1}' | sed 's/ $//')"
+    mb="$(config_mounts "$cfb" | awk '{printf "%s ", $1}' | sed 's/ $//')"
+    compare_row "mounts" "${ma:-none}" "${mb:-none}"
     compare_row "distro" "$(jail_distro_of "$a")" "$(jail_distro_of "$b")"
-    compare_row "rootfs size" \
-        "$(du -sh "$ROOTS_DIR/$a" 2>/dev/null | awk '{print $1}')" \
-        "$(du -sh "$ROOTS_DIR/$b" 2>/dev/null | awk '{print $1}')"
+    sa="$(du -sh "$ROOTS_DIR/$a" 2>/dev/null | awk '{print $1}')"
+    sb="$(du -sh "$ROOTS_DIR/$b" 2>/dev/null | awk '{print $1}')"
+    compare_row "rootfs size" "${sa:-missing}" "${sb:-missing}"
 
     printf '\n%bPACKAGES%b %b(%s)%b\n' "$H" "$N" "$D" \
         "$([ "$scope" = all ] && printf 'every installed package' || printf 'explicitly installed; --all for every package')" "$N"
@@ -3906,6 +3910,7 @@ cmd_help() {
     help_row "roots/<name>" ""              "rootfs"
     help_row "configs/<name>.json" ""       "jail config"
     help_row "snapshots/<name>/" ""         "snapshots (tar.gz + config)"
+    help_row "history/<name>.log" ""        "what was done to the jail, and when"
     printf '\n'
 
     printf '%bEXAMPLES%b\n' "$H" "$N"

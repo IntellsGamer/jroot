@@ -571,6 +571,78 @@ ubuntu-test           180M       0B
 
 ---
 
+# 🔎 Inspecting jails
+
+### `jroot history` – what was done to a jail, and when
+
+Every command that changes a jail appends a line to `~/.jroot/history/<name>.log`: creation, bootstrap, installs, updates, snapshots, reverts, config changes, mounts, ports, cleans and renames.
+
+```bash
+jroot history dev
+WHEN             EVENT          DETAIL
+2026-08-09 21:04 created        ubuntu:22.04 user=root build_essential=1
+2026-08-09 21:09 bootstrap      core packages installed
+2026-08-10 09:12 install        git curl
+2026-08-10 09:40 snapshot       before-upgrade (86M)
+2026-08-10 10:03 mnt            added /mnt/work -> /home/user/projects (ro)
+```
+
+```bash
+jroot history                  # every jail, oldest first, with a JAIL column
+jroot history dev --limit=20   # only the last 20 events
+jroot history dev --json       # machine-readable
+jroot history dev --clear      # forget this jail's history
+```
+
+A rename carries the log over, and deleting a jail deletes its log with it.
+
+### `jroot compare` – diff two jails
+
+Answers "why does it work in `dev` but not in `web`". It compares the config first, then the package lists.
+
+```bash
+jroot compare dev web
+Comparing 'dev' vs 'web'   (* = differs)
+
+CONFIG
+    FIELD              dev                      web
+    image              ubuntu:22.04             ubuntu:22.04
+  * user               root                     unroot
+    mount_host         0                        0
+    ports              none                     8080
+  * mounts             work                     none
+    distro             ubuntu                   ubuntu
+    rootfs size        245M                     180M
+
+PACKAGES (explicitly installed; --all for every package)
+    dev: 42 packages, web: 39 packages, 37 shared
+
+  only in dev:
+    + git
+    + htop
+
+  only in web:
+    + nginx
+```
+
+By default only explicitly-installed packages are compared — `apt-mark showmanual` on Ubuntu, `/etc/apk/world` on Alpine — which keeps the output about decisions you made rather than dependency noise. Use `--all` to compare every installed package.
+
+### `jroot which` – find a program across jails
+
+```bash
+jroot which node
+dev              /usr/local/bin/node
+build            /usr/bin/node
+
+jroot which dev node          # one jail only
+jroot which node --all        # every match, not just the first on PATH
+jroot which /etc/nginx/nginx.conf   # absolute paths are checked as-is
+```
+
+This reads the rootfs directly from the host, so no jail is started and nothing is executed. Exit status is 1 when nothing matches, so it composes in scripts.
+
+---
+
 # 🛡️ Security
 
 PRoot is powerful because it can provide filesystem and process translation without requiring privileged mounts.
@@ -738,6 +810,9 @@ INSPECTION
   jroot list [--json]              List all jails
   jroot info [name]                Show jail details
   jroot size [name]                Show disk usage per jail
+  jroot history [name]             What was done to a jail, and when
+  jroot compare <jailA> <jailB>    Diff two jails (config + packages)
+  jroot which [jail] <program>     Find a program across jails
   jroot doctor                     Diagnose JRoot
 
 
