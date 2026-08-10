@@ -3242,8 +3242,8 @@ net_list() {
     printf '  A jail whose libc cannot load the shim keeps plain 127.0.0.1;\n'
     printf '  %bjroot doctor%b shows which jails those are.\n' "$G" "$N"
     printf '\n'
-    printf '  The deliberate trade-off: a jail can no longer reach host services on 127.0.0.1.\n' "$G" "$N"
-    printf '  %bjroot net set <name> off%b restores the old shared behaviour\n'  "$G" "$N"
+    printf '  The deliberate trade-off: a jail can no longer reach host services on 127.0.0.1.\n'
+    printf '  %bjroot net set <name> off%b restores the old shared behaviour.\n' "$G" "$N"
     printf '\n'
     printf '  This is a list of addresses assigned to jails. Run %bjroot net help%b for more information.\n' "$G" "$N"
 }
