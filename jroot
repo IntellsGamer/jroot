@@ -62,6 +62,7 @@
 #   JROOT_KERNEL=x.y.z     Kernel release reported inside jails (default 6.8.0)
 #   JROOT_LANDLOCK_OFF=1   Skip the Landlock allowlist (debugging only)
 #   JROOT_SHOW_ALL_PROCS=1 Let jails see every host process in /proc
+#   JROOT_SHIM_OFF=1       Do not load the LD_PRELOAD shim at all
 #   JROOT_SKIP_APT=1       Skip the apt bootstrap during init
 #   JROOT_SKIP_BOOTSTRAP=1 Same as above
 #   NONINTERACTIVE=1       Use all prompt defaults
@@ -3220,17 +3221,17 @@ net_list() {
     [ "${#cfgs[@]}" -gt 0 ] || err "No jails found. Create one first: jroot init ubuntu:22.04"
     [ -x "$PORT_SHIM" ] || shim_note="shim not built (needs gcc) - addresses are NOT applied yet"
 
-    printf '%b%-16s %-16s %-14s %s%b\n' "$D" "JAIL" "ADDRESS" "PUBLIC PORTS" "DISTRO" "$N"
+    printf '%b%-16s %-18s %-14s %s%b\n' "$D" "JAIL" "ADDRESS" "PUBLIC PORTS" "DISTRO" "$N"
     for cfg in "${cfgs[@]}"; do
         name="$(basename "$cfg" .json)"
         [ -z "$only" ] || [ "$only" = "$name" ] || continue
         lb="$(config_field "$cfg" loopback)"
         ports="$(config_ports "$cfg")"
         case "$lb" in
-            off|shared|disabled) lb="127.0.0.1 (shared)" ;;
-            "")                  lb="auto (on next enter)" ;;
+            off|shared|disabled) lb="127.0.0.1 shared" ;;
+            "")                  lb="auto" ;;
         esac
-        printf '%b%-16s%b %-16s %-14s %s\n' "$G" "$name" "$N" "$lb" "${ports:-none}" \
+        printf '%b%-16s%b %-18s %-14s %s\n' "$G" "$name" "$N" "$lb" "${ports:-none}" \
             "$(jail_distro_of "$name")"
     done
     [ -z "$shim_note" ] || warn "$shim_note"
@@ -3597,7 +3598,9 @@ cmd_rename() {
     fi
     mv "$ROOTS_DIR/$name" "$ROOTS_DIR/$newname" || err "Failed to rename rootfs."
 
-    # 2) Rename config, keeping every field but updating "name".
+    # 2) Rename config, keeping every field but updating "name". Moving the file
+    # (rather than deleting and rewriting it) is what preserves fields this
+    # function does not know about - loopback, and anything added later.
     local image user_mode mount_host mount_home build_essential ports mounts_pairs
     image="$(config_field "$cfg" image)"
     user_mode="$(config_field "$cfg" user)";          [ -n "$user_mode" ]          || user_mode="root"
@@ -3606,8 +3609,9 @@ cmd_rename() {
     build_essential="$(config_field "$cfg" build_essential)"; [ -n "$build_essential" ] || build_essential=1
     ports="$(config_ports "$cfg" 2>/dev/null || true)"
     mounts_pairs="$(config_mounts "$cfg" 2>/dev/null | sed 's/\t/=/g' | tr '\n' ' ')"
-    rm -f "$cfg"
+    mv "$cfg" "$newcfg" 2>/dev/null || true
     write_config "$newname" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
+    # Belt and braces for hosts without python3, where write_config cannot merge.
     if [ -n "$ports" ]; then
         set_config_ports "$newcfg" $(echo "$ports" | tr ',' ' ') >/dev/null 2>&1
     fi

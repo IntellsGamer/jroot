@@ -82,6 +82,8 @@ HOST
 │  package management              │
 │  snapshots & revert              │
 │  security layer (seccomp+landlock)│
+│  per-jail loopback address       │
+│  /proc process filtering         │
 │  read-only mounts (LD_PRELOAD)   │
 │  port binding control            │
 │  file transfer (host ↔ jail)     │
@@ -387,10 +389,92 @@ Jailed server tries to bind 0.0.0.0:3000
 port in whitelist    port not whitelisted
     │                   │
     ▼                   ▼
-allow 0.0.0.0      force 127.0.0.1
+allow 0.0.0.0      force the jail's own address
 ```
 
 This prevents accidental exposure of services running inside jails.
+
+---
+
+# 🏷️ Per-jail loopback addresses
+
+Every jail owns one address inside `127/8` — `127.2.0.1`, `127.2.0.2`, and so on — assigned on first use and stored in its config. Non-public listeners are pinned to that address instead of `127.0.0.1`.
+
+The practical result: **three jails can each run a dev server on port 8080 at the same time**, and the host reaches each one separately. Port collisions stop being something you have to think about.
+
+```bash
+jroot net
+JAIL             ADDRESS          PUBLIC PORTS   DISTRO
+api              127.2.0.1        none           ubuntu
+web              127.2.0.2        8080           ubuntu
+tiny             127.2.0.3        none           alpine
+```
+
+```bash
+# inside jail 'api'
+python3 -m http.server 8080        # asks for 0.0.0.0:8080
+# actually bound to 127.2.0.1:8080
+
+# from the host
+curl http://127.2.0.1:8080/        # 200
+curl http://127.0.0.1:8080/        # connection refused
+```
+
+`localhost` still works *inside* the jail: `connect()` is redirected the same way, so a client in the jail that dials `127.0.0.1:8080` reaches its own server. The trade-off is that a jail can no longer reach services on the **host's** `127.0.0.1`. DNS is exempt — port 53 is never redirected, so a resolver on host loopback keeps working.
+
+```bash
+jroot net set web 127.2.9.9   # pick an address by hand
+jroot net set web auto        # back to the next free one
+jroot net set web off         # share 127.0.0.1 with the host, like before
+```
+
+Public ports are unaffected: `jroot port web add 8080` binds `0.0.0.0` and ignores the jail address.
+
+---
+
+# 👀 Process isolation in `/proc`
+
+PRoot binds the host `/proc`, so without help a jailed `ps aux` lists every process on the machine, command lines included, and `pkill` inside a jail can match host processes by accident.
+
+The shim filters directory reads of `/proc` down to the jail's own process tree:
+
+```bash
+$ ps -e | wc -l      # on the host
+29
+
+$ jroot exec dev ps -e
+    PID TTY          TIME CMD
+  28938 ?        00:00:00 bash
+  28980 ?        00:00:00 proot
+  28981 ?        00:00:00 sh
+  28982 ?        00:00:00 ps
+```
+
+Membership is decided two ways: a process is part of the jail if the same PRoot instance traces it — which covers daemons that double-forked and were reparented to host PID 1 — or if its parent chain leads back to the jail's root process.
+
+This is a usability and privacy feature, not a security boundary. It covers the glibc `readdir()` path (`ls`, `ps`, `htop`, Python's `os.listdir`), but a program issuing `getdents64()` itself still sees everything, and `/proc/<pid>` remains readable when opened by exact path. Set `JROOT_SHOW_ALL_PROCS=1` to turn it off.
+
+---
+
+# 🧩 One shim, many libcs
+
+`libjroot.so` is compiled on the **host** but loaded by the **jail's** dynamic loader, so their libcs have to agree. A newer host is the common trap:
+
+```text
+/bin/bash: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+           (required by /usr/local/lib/libjroot.so)
+```
+
+That breaks every command in the jail, not just the shim. JRoot avoids it by building the shim against a deliberately old symbol set — `-std=gnu11` (so glibc 2.38+ doesn't rewrite `strtol` into `__isoc23_strtol`), no `_FORTIFY_SOURCE` (no `__*_chk` symbols), and `dlsym` pinned to the platform's base version — which keeps one build usable from Ubuntu 16.04 to 26.04, and in practice inside musl jails too.
+
+Compatibility is then **verified, not assumed**. On first use in each jail, JRoot preloads the shim and checks an observable side effect; the verdict is cached in `~/.jroot/.shim.<jail>`:
+
+1. a shim built inside the jail wins, since it is ABI-correct by construction
+2. otherwise the host build is used, if the probe shows it loads and works
+3. otherwise JRoot compiles one inside the jail with its own `gcc`
+4. otherwise the jail runs without the shim, with a warning explaining what is lost
+
+`jroot doctor` reports which of those applies to each jail. `JROOT_SHIM_OFF=1` skips the shim entirely.
 
 ---
 
@@ -675,13 +759,14 @@ Both are best effort: a kernel without `CONFIG_SECCOMP_FILTER` or without Landlo
 
 ### Additional security features
 
-1. **Loopback-only by default** – Jailed servers only listen on `127.0.0.1` unless explicitly whitelisted with `jroot port`
+1. **Loopback-only by default** – Jailed servers only listen on the jail's own `127.x.y.z` address unless explicitly whitelisted with `jroot port`
 2. **Read-only mount enforcement** – `jroot mnt ... ro` is enforced twice: by Landlock in the kernel, and by the LD_PRELOAD shim returning `EROFS`
 3. **Host mount warnings** – JRoot warns when host `/` or `$HOME` are deliberately mounted, and shadows `~/.jroot` inside those mounts
 4. **Unroot mode** – Root account can be locked, daily use is a non-root user
 5. **Clean environment** – `LD_PRELOAD`, `LD_LIBRARY_PATH`, and proxy env vars are unset on enter
+6. **Host processes hidden** – a jailed `ps` sees only the jail's own process tree
 
-**Alpine caveat:** the `libjroot.so` shim is built against the host's glibc and cannot load inside a musl jail, so Alpine jails do not get loopback-only port rewriting. Landlock and seccomp are libc-independent and still apply.
+**Shim caveat:** the LD_PRELOAD layer needs a libc the jail can load. JRoot verifies this per jail and falls back to compiling the shim inside the jail, but a jail with neither a compatible host build nor `gcc` loses the shim-based features (per-jail address, `jroot port`, `/proc` filtering). Landlock and seccomp are libc-independent and always apply.
 
 ### Important
 
@@ -797,7 +882,9 @@ FILE & PORT MANAGEMENT
   jroot file mv <name> <src> <dst> Move files (host ↔ jail)
   jroot port <name> list           Show public ports
   jroot port <name> add <port>     Make a port public (0.0.0.0)
-  jroot port <name> rm <port>      Make a port loopback-only (127.0.0.1)
+  jroot port <name> rm <port>      Keep a port on the jail's own address
+  jroot net                        Show every jail's loopback address
+  jroot net set <name> auto|off    Reassign or disable the jail address
   jroot mnt <name> list            Show custom mounts
   jroot mnt <name> <label> <dir>   Mount host directory at /mnt/<label> (rw)
   jroot mnt <name> <label> <dir> ro Mount read-only
@@ -849,6 +936,7 @@ Each jail has its own configuration.
   "mount_host": 0,
   "mount_home": 0,
   "build_essential": 1,
+  "loopback": "127.2.0.1",
   "ports": [3000, 8080],
   "mounts": [
     ["project", "/home/user/project", "rw"],
@@ -864,8 +952,19 @@ user            root or unroot
 build_essential 0 or 1
 mount_host      0 or 1 (host / at /mnt/host)
 mount_home      0 or 1 (host $HOME at /mnt/home)
+loopback        this jail's address in 127/8, or "off" to share 127.0.0.1
 ports           list of public ports (bind to 0.0.0.0)
 mounts          list of [label, hostpath, mode] (mode: rw or ro)
+```
+
+Environment overrides, mostly for debugging:
+
+```text
+JROOT_HOME=path        storage root (default ~/.jroot)
+JROOT_KERNEL=x.y.z     kernel version reported inside jails (default 6.8.0)
+JROOT_SHIM_OFF=1       do not load the LD_PRELOAD shim
+JROOT_SHOW_ALL_PROCS=1 let jails see every host process in /proc
+JROOT_LANDLOCK_OFF=1   skip the Landlock allowlist
 ```
 
 That means you don't have to rebuild an environment just because you want to change how it behaves.
