@@ -109,6 +109,9 @@ PROOT_KERNEL_RELEASE="${JROOT_KERNEL:-6.8.0}"
 # default; ports listed in the jail's config "ports" field are left public.
 PORT_SHIM_SRC="$BIN_DIR/libjroot.c"
 PORT_SHIM="$BIN_DIR/libjroot.so"
+# Build marker for the shim. Bump it whenever libjroot.c changes so existing
+# .so files - including ones compiled inside a jail - are replaced.
+SHIM_VERSION="jroot-shim-v3"
 
 # Landlock filesystem access masks, used to compose the JROOT_LANDLOCK rule
 # list consumed by the seccomp launcher (see write_seccomp_launcher).
@@ -507,7 +510,7 @@ build_port_shim() {
     # shim than the C file on disk. Without the version check an existing .so
     # newer than its source would keep an old shim alive forever after an
     # upgrade (that is how the pre-v2 shim survived jroot updates).
-    if [ -f "$src" ] && grep -q "jroot-shim-v2" "$src" 2>/dev/null; then
+    if [ -f "$src" ] && grep -q "$SHIM_VERSION" "$src" 2>/dev/null; then
         local so_missing=0
         [ -f "$PORT_SHIM" ] || so_missing=1
         if [ "$so_missing" = "0" ] && [ "$PORT_SHIM" -nt "$src" ]; then
@@ -547,7 +550,33 @@ build_port_shim() {
 #include <stdarg.h>
 #include <dirent.h>
 
-/* jroot-shim-v2 */
+/* jroot-shim-v3 */
+
+/* Greppable build marker: jroot compares this against the version it expects,
+ * so an upgraded jroot always replaces an older .so (including one built inside
+ * a jail). */
+const char jroot_shim_version[] = "jroot-shim-v3";
+
+/* Parse a non-negative decimal. Deliberately hand-rolled: with _GNU_SOURCE on
+ * glibc >= 2.38, <stdlib.h> redirects strtol() to __isoc23_strtol(), which
+ * stamps a GLIBC_2.38 requirement into this .so. The shim is built on the HOST
+ * but loaded inside the JAIL, so one new symbol makes every jail with an older
+ * libc fail to exec anything at all:
+ *   /bin/bash: libc.so.6: version `GLIBC_2.38' not found (required by libjroot.so)
+ * Keeping the symbol set old is what makes one host-built shim work in jails
+ * from 16.04 to 26.04. */
+static long jnum(const char *s) {
+    long n = 0;
+    if (!s) return -1;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s < '0' || *s > '9') return -1;
+    while (*s >= '0' && *s <= '9') {
+        n = n * 10 + (*s - '0');
+        if (n > 0x7fffffff) return -1;
+        s++;
+    }
+    return n;
+}
 
 typedef int (*bind_fn)(int, const struct sockaddr *, socklen_t);
 typedef int (*connect_fn)(int, const struct sockaddr *, socklen_t);
@@ -1187,7 +1216,8 @@ static pid_t jp_root(void) {
     static pid_t r = -1;
     if (r < 0) {
         const char *e = getenv("JROOT_PROC_ROOT");
-        r = (e && *e) ? (pid_t)strtol(e, NULL, 10) : 0;
+        long v = (e && *e) ? jnum(e) : -1;
+        r = (v > 0) ? (pid_t)v : 0;
     }
     return r;
 }
@@ -1218,7 +1248,7 @@ static pid_t jp_ppid(pid_t pid) {
     while (*p && *p != ' ') p++;      /* state */
     while (*p == ' ') p++;
     if (!*p) return -1;
-    return (pid_t)strtol(p, NULL, 10);
+    return (pid_t)jnum(p);
 }
 
 static pid_t jp_tracer(pid_t pid) {
@@ -1234,7 +1264,7 @@ static pid_t jp_tracer(pid_t pid) {
     buf[n] = 0;
     p = strstr(buf, "TracerPid:");
     if (!p) return -1;
-    return (pid_t)strtol(p + 10, NULL, 10);
+    return (pid_t)jnum(p + 10);
 }
 
 /* Our own tracer is proot (it ptraces every guest process), so "same tracer as
@@ -1321,7 +1351,7 @@ static int jp_hide_entry(DIR *dirp, const char *name) {
     if (!jp_enabled()) return 0;
     if (!jp_all_digits(name)) return 0;
     if (!jp_dir_is_proc((void *)dirp)) return 0;
-    return !jp_member((pid_t)strtol(name, NULL, 10));
+    return !jp_member((pid_t)jnum(name));
 }
 
 DIR *opendir(const char *path) {
@@ -1400,12 +1430,137 @@ int readdir64_r(DIR *dirp, struct dirent64 *entry, struct dirent64 **result) {
 }
 
 CEOF
-    if gcc -shared -fPIC -O2 -o "$PORT_SHIM" "$src" -ldl 2>/dev/null; then
+    # -std=gnu11 and no _FORTIFY_SOURCE keep the symbol requirements old: this
+    # .so is built against the HOST libc but loaded inside the JAIL, so a single
+    # modern symbol (glibc >= 2.38 redirects strtol to __isoc23_strtol) makes
+    # every jail with an older libc fail to exec anything at all.
+    if gcc -shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+            -o "$PORT_SHIM" "$src" -ldl 2>/dev/null; then
         log "Built port shim: $PORT_SHIM"
+        shim_glibc_floor_warn
         return 0
     fi
     warn "Failed to build port shim. 'jroot port', 'jroot net' and /proc hiding will not work."
     return 1
+}
+
+# Highest GLIBC_x.y the built shim needs. Jails older than this cannot preload
+# it, and jroot falls back to building the shim inside the jail instead.
+shim_glibc_max() {
+    command -v objdump >/dev/null 2>&1 || return 1
+    objdump -p "$PORT_SHIM" 2>/dev/null \
+        | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' \
+        | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1
+}
+
+shim_glibc_floor_warn() {
+    local v
+    v="$(shim_glibc_max 2>/dev/null || true)"
+    [ -n "$v" ] || return 0
+    # 2.17 is the floor that still covers Ubuntu 16.04 jails; anything higher
+    # means the host toolchain leaked a newer symbol into the shim.
+    case "$v" in
+        2.[0-9]|2.1[0-7]) return 0 ;;
+    esac
+    warn "Shim needs glibc >= $v; jails older than that will build their own copy instead."
+}
+
+# ---------------------------------------------------------------------------
+# Which shim does a jail get?
+#
+# libjroot.so is compiled on the HOST but dlopen'd by the JAIL's dynamic loader
+# through LD_PRELOAD, so the two libcs have to agree. A host newer than the jail
+# (glibc 2.39 host, 22.04 jail) or a different libc entirely (musl on Alpine)
+# means the host-built shim cannot load, and preloading it anyway breaks every
+# command in the jail:
+#   /bin/bash: libc.so.6: version `GLIBC_2.38' not found (required by libjroot.so)
+#
+# Resolution order, cached per jail in ~/.jroot/.shim.<name>:
+#   1. a shim built inside the jail (always ABI-correct)
+#   2. the host shim, if it actually loads there (probed once)
+#   3. build one inside the jail with its own gcc
+#   4. no shim: the jail still works, minus per-jail address / ports / /proc hiding
+# ---------------------------------------------------------------------------
+jail_local_shim() {
+    printf '%s' "$ROOTS_DIR/$1/usr/local/lib/libjroot.so"
+}
+
+# Can the jail's loader preload the host-built shim? Runs proot directly (not
+# run_in_jail) to stay out of the resolution path.
+shim_probe() {
+    local name="$1" rootfs="$ROOTS_DIR/$name" out rc=0
+    [ -x "$PROOT_BIN" ] || return 1
+    [ -x "$PORT_SHIM" ] || return 1
+    out="$("$PROOT_BIN" -k "$PROOT_KERNEL_RELEASE" -0 -r "$rootfs" \
+        -b /dev -b /proc -b /sys -b "$PORT_SHIM:/usr/local/lib/libjroot.so" \
+        /usr/bin/env LD_PRELOAD=/usr/local/lib/libjroot.so /bin/true 2>&1)" || rc=1
+    case "$out" in
+        *"not found"*|*"cannot open shared object"*|*"undefined symbol"*|\
+        *"unsupported relocation"*|*"Error relocating"*) rc=1 ;;
+    esac
+    return "$rc"
+}
+
+# Compile the shim with the jail's own toolchain. Fixes both the old-glibc case
+# and musl, when the jail has gcc (build_essential, or build-base on Alpine).
+build_shim_in_jail() {
+    local name="$1" rootfs="$ROOTS_DIR/$name" so
+    so="$(jail_local_shim "$name")"
+    [ -f "$PORT_SHIM_SRC" ] || return 1
+    SHIM_RESOLVING=1 run_in_jail --root "$name" /bin/sh -c \
+        'command -v gcc >/dev/null 2>&1' >/dev/null 2>&1 || return 1
+    mkdir -p "$rootfs/tmp" "$rootfs/usr/local/lib" 2>/dev/null || true
+    cp "$PORT_SHIM_SRC" "$rootfs/tmp/libjroot.c" 2>/dev/null || return 1
+    log "Building the jroot shim inside '$name' (its libc differs from the host's)..."
+    SHIM_RESOLVING=1 run_in_jail --root "$name" /bin/sh -c \
+        'gcc -shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+             -o /usr/local/lib/libjroot.so /tmp/libjroot.c -ldl' >/dev/null 2>&1 || {
+        rm -f "$rootfs/tmp/libjroot.c"
+        return 1
+    }
+    rm -f "$rootfs/tmp/libjroot.c"
+    [ -s "$so" ] || return 1
+    log "Shim built inside '$name'."
+    return 0
+}
+
+# Prints "local", "host", or nothing.
+resolve_jail_shim() {
+    local name="$1" so marker verdict
+    so="$(jail_local_shim "$name")"
+    marker="$JROOT_HOME/.shim.$name"
+
+    if [ -s "$so" ] && grep -qa "$SHIM_VERSION" "$so" 2>/dev/null; then
+        printf 'local'
+        return 0
+    fi
+    [ -x "$PORT_SHIM" ] || return 0
+
+    if [ -f "$marker" ] && [ "$marker" -nt "$PORT_SHIM" ]; then
+        verdict="$(cat "$marker" 2>/dev/null || true)"
+        case "$verdict" in
+            host) printf 'host'; return 0 ;;
+            none) return 0 ;;
+        esac
+    fi
+
+    if shim_probe "$name"; then
+        printf 'host' > "$marker" 2>/dev/null || true
+        printf 'host'
+        return 0
+    fi
+
+    if build_shim_in_jail "$name"; then
+        printf 'local' > "$marker" 2>/dev/null || true
+        printf 'local'
+        return 0
+    fi
+
+    printf 'none' > "$marker" 2>/dev/null || true
+    warn "Jail '$name': the host-built shim cannot load here (its libc is older than the host's, or it is musl) and the jail has no gcc to build its own."
+    warn "  Consequences: no per-jail loopback address, 'jroot port' has no effect, host processes stay visible in /proc, ro mounts rely on Landlock only."
+    warn "  Fix: jroot install $name gcc   (Alpine: jroot install $name build-base), then re-enter."
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -2254,8 +2409,8 @@ run_in_jail() {
         export DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_sock"
     fi
 
-    # Distro detection (musl Alpine needs different shell + no glibc shim).
-    local jail_distro="" shim_ok=1
+    # Distro detection (musl Alpine needs a different default shell).
+    local jail_distro=""
     if [ -f "$rootfs/etc/os-release" ]; then
         jail_distro="$(. "$rootfs/etc/os-release" 2>/dev/null; printf '%s' "${ID:-}")"
     fi
@@ -2268,25 +2423,22 @@ run_in_jail() {
         fi
     fi
 
-    # Loopback-only by default: wrap the guest command in /usr/bin/env so the
-    # bind() shim's LD_PRELOAD is applied INSIDE the jail only (the host
-    # python3 launcher and proot itself never see it). JROOT_PORTS lists the
-    # ports that may stay public (0.0.0.0); everything else is forced to
-    # 127.0.0.1 / ::1 by the shim.
-    # Alpine (musl) jails cannot load the host glibc-built shim (musl lacks
-    # __snprintf_chk and similar, so relocation fails at exec time), so the
-    # LD_PRELOAD shim is skipped there. Consequence: loopback-only port
-    # enforcement does not apply inside Alpine jails. ro mounts and the ~/.jroot
-    # deny are still enforced, by Landlock and by the .denied proot bind-over
-    # plus the seccomp ENOSYS blocks - none of which depend on libc.
-    if [ "$jail_distro" = "alpine" ]; then
-        shim_ok=0
-        warn "Alpine jail '$name': LD_PRELOAD shim is glibc-only, DISABLED (no per-jail loopback address, no /proc process hiding)"
+    # The shim is applied by wrapping the guest command in /usr/bin/env, so
+    # LD_PRELOAD only ever exists INSIDE the jail (the host python3 launcher and
+    # proot itself never see it). Which copy of the shim to use depends on the
+    # jail's libc - see resolve_jail_shim. JROOT_SHIM_OFF=1 skips it entirely.
+    local shim_mode=""
+    if [ -z "${JROOT_SHIM_OFF:-}" ] && [ "${SHIM_RESOLVING:-0}" != "1" ]; then
+        shim_mode="$(resolve_jail_shim "$name")"
     fi
-    if [ -x "$PORT_SHIM" ] && [ "$shim_ok" = "1" ]; then
+    if [ -n "$shim_mode" ]; then
         local jail_ports
         jail_ports="$(config_ports "$cfg")"
-        binds+=(-b "$PORT_SHIM:/usr/local/lib/libjroot.so")
+        # "local" means the jail already has its own build at that path, so no
+        # bind is needed (and must NOT shadow it with the host's copy).
+        if [ "$shim_mode" = "host" ]; then
+            binds+=(-b "$PORT_SHIM:/usr/local/lib/libjroot.so")
+        fi
         # JROOT_LOOPBACK  pins this jail's listeners to its own 127.x.y.z and
         #                 redirects the jail's own 127.0.0.1 traffic there.
         # JROOT_PROC_ROOT lets the shim filter /proc down to this jail's
