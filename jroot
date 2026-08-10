@@ -557,6 +557,18 @@ build_port_shim() {
  * a jail). */
 const char jroot_shim_version[] = "jroot-shim-v3";
 
+/* Pin dlsym() to the oldest symbol version the platform has. Since glibc 2.34
+ * the dl* functions live in libc.so.6 and a plain reference records
+ * dlsym@GLIBC_2.34, which a jail on an older glibc cannot satisfy. The base
+ * version node (2.2.5 on x86-64, 2.17 on aarch64) exists in every glibc of that
+ * architecture, and 2.34+ keeps it as a compat alias, so pinning here is what
+ * lets ONE host-built shim load in jails from 16.04 to 26.04. */
+#if defined(__aarch64__)
+__asm__(".symver dlsym,dlsym@GLIBC_2.17");
+#elif defined(__x86_64__)
+__asm__(".symver dlsym,dlsym@GLIBC_2.2.5");
+#endif
+
 /* Parse a non-negative decimal. Deliberately hand-rolled: with _GNU_SOURCE on
  * glibc >= 2.38, <stdlib.h> redirects strtol() to __isoc23_strtol(), which
  * stamps a GLIBC_2.38 requirement into this .so. The shim is built on the HOST
@@ -1434,8 +1446,10 @@ CEOF
     # .so is built against the HOST libc but loaded inside the JAIL, so a single
     # modern symbol (glibc >= 2.38 redirects strtol to __isoc23_strtol) makes
     # every jail with an older libc fail to exec anything at all.
+    # --no-as-needed keeps DT_NEEDED libdl.so.2, which is where dlsym lives on
+    # pre-2.34 jails (it is a harmless stub on newer ones).
     if gcc -shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-            -o "$PORT_SHIM" "$src" -ldl 2>/dev/null; then
+            -o "$PORT_SHIM" "$src" -Wl,--no-as-needed -ldl 2>/dev/null; then
         log "Built port shim: $PORT_SHIM"
         shim_glibc_floor_warn
         return 0
@@ -1514,7 +1528,7 @@ build_shim_in_jail() {
     log "Building the jroot shim inside '$name' (its libc differs from the host's)..."
     SHIM_RESOLVING=1 run_in_jail --root "$name" /bin/sh -c \
         'gcc -shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-             -o /usr/local/lib/libjroot.so /tmp/libjroot.c -ldl' >/dev/null 2>&1 || {
+             -o /usr/local/lib/libjroot.so /tmp/libjroot.c -Wl,--no-as-needed -ldl' >/dev/null 2>&1 || {
         rm -f "$rootfs/tmp/libjroot.c"
         return 1
     }
