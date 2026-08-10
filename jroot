@@ -11,6 +11,7 @@
 #   jroot install <name> <pkg...>  apt-get/apk install as root inside a jail
 #   jroot file cp|mv <name> <src> <dst>  Move files in/out (jail paths use ":")
 #   jroot port list|add|rm <name> [port]  Ports allowed to bind publicly
+#   jroot net [set <name> auto|off|addr]  Per-jail loopback address
 #   jroot mnt <name> [label dir [rw|ro]]  Bind a host dir at /mnt/<label>
 #   jroot config <name>         Show / change a jail's settings
 #   jroot list [--json]         List all jails (machine-readable with --json)
@@ -42,8 +43,9 @@
 #               (rings bypass ptrace entirely) and pidfd_getfd
 #   landlock -> kernel-enforced path allowlist applied by the same launcher;
 #               the only layer that also covers musl (Alpine) jails
-#   shim     -> LD_PRELOAD libjroot.so forces listeners to loopback unless the
-#               port is allowlisted, and returns EROFS for ro mounts (glibc only)
+#   shim     -> LD_PRELOAD libjroot.so gives the jail its own address inside
+#               127/8 (so two jails can hold the same port), hides host
+#               processes from /proc, and returns EROFS for ro mounts. glibc only.
 #
 # Per-jail options (set at init, changeable via `jroot config`):
 #   user            root (fake root via proot -0) or unroot (installs as root,
@@ -52,12 +54,14 @@
 #   mount_host      bind host / to /mnt/host inside the jail
 #   mount_home      bind host $HOME to /mnt/home inside the jail
 #   ports           ports allowed to bind publicly (see `jroot port`)
+#   loopback        this jail's address inside 127/8, or "off" (see `jroot net`)
 #   mounts          extra host dirs at /mnt/<label>, rw or ro (see `jroot mnt`)
 #
 # Env (optional):
 #   JROOT_HOME=path        Override storage root (default $HOME/.jroot)
 #   JROOT_KERNEL=x.y.z     Kernel release reported inside jails (default 6.8.0)
 #   JROOT_LANDLOCK_OFF=1   Skip the Landlock allowlist (debugging only)
+#   JROOT_SHOW_ALL_PROCS=1 Let jails see every host process in /proc
 #   JROOT_SKIP_APT=1       Skip the apt bootstrap during init
 #   JROOT_SKIP_BOOTSTRAP=1 Same as above
 #   NONINTERACTIVE=1       Use all prompt defaults
@@ -275,7 +279,7 @@ PIDFD_GETFD_NR = 438
 OFFSET_ARCH = 4
 OFFSET_NR = 0
 
-# jroot-seccomp-v6
+# jroot-seccomp-v7
 # proot 5.3.0 does not trace the modern *at2 family (openat2/faccessat2/fchmodat2)
 # or the fs-tree family (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
 # mount_setattr), so a jailed worker could reach real host paths (e.g. ~/.jroot
@@ -463,6 +467,12 @@ else:
     os.environ.pop("JROOT_LANDLOCK", None)
     os.environ.pop("JROOT_LANDLOCK_STRICT", None)
 
+# This process is about to BECOME proot: execv keeps the pid, so our pid is the
+# one that will trace every guest process. The shim uses it to tell the jail's
+# processes apart from the host's when filtering /proc (see JROOT_PROC_ROOT in
+# libjroot.c). Set after Landlock, so a failure above never leaves it stale.
+os.environ["JROOT_PROC_ROOT"] = str(os.getpid())
+
 os.execv(sys.argv[1], sys.argv[1:])
 PYEOF
     chmod +x "$SECCOMP_LAUNCHER"
@@ -471,7 +481,7 @@ PYEOF
 ensure_runtime() {
     mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
-    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v6" "$SECCOMP_LAUNCHER"; then
+    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v7" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
     fi
     if ! command -v python3 >/dev/null 2>&1; then
@@ -493,7 +503,11 @@ ensure_runtime() {
 
 build_port_shim() {
     local src="$PORT_SHIM_SRC"
-    if [ -f "$src" ]; then
+    # Rebuild when the .so is missing/stale, or when this jroot carries a newer
+    # shim than the C file on disk. Without the version check an existing .so
+    # newer than its source would keep an old shim alive forever after an
+    # upgrade (that is how the pre-v2 shim survived jroot updates).
+    if [ -f "$src" ] && grep -q "jroot-shim-v2" "$src" 2>/dev/null; then
         local so_missing=0
         [ -f "$PORT_SHIM" ] || so_missing=1
         if [ "$so_missing" = "0" ] && [ "$PORT_SHIM" -nt "$src" ]; then
@@ -509,7 +523,7 @@ build_port_shim() {
         fi
         local now="$(date +%s)"
         if [ -z "$mute_until" ] || [ "$mute_until" -le "$now" ]; then
-            warn "gcc not found on host - 'jroot port' (bind() shim) is unavailable. Install gcc to use it."
+            warn "gcc not found on host - 'jroot port', per-jail loopback addresses ('jroot net') and /proc process hiding are unavailable. Install gcc to use them."
             warn "Read-only mounts still work when the kernel has Landlock (see 'jroot doctor')."
             warn "To mute this warning for 7 days: jroot doctor --mute=7d"
             warn "To mute forever: jroot doctor --mute=forever"
@@ -533,7 +547,12 @@ build_port_shim() {
 #include <stdarg.h>
 #include <dirent.h>
 
+/* jroot-shim-v2 */
+
 typedef int (*bind_fn)(int, const struct sockaddr *, socklen_t);
+typedef int (*connect_fn)(int, const struct sockaddr *, socklen_t);
+typedef ssize_t (*sendto_fn)(int, const void *, size_t, int,
+                             const struct sockaddr *, socklen_t);
 
 static bind_fn real_bind = NULL;
 
@@ -561,6 +580,35 @@ static int port_is_public(int port) {
     return is_public;
 }
 
+/* ---- per-jail loopback address ---------------------------------------- *
+ * JROOT_LOOPBACK carries this jail's own address inside 127/8 (see
+ * `jroot net`). Listeners on non-public ports are pinned to it rather than to
+ * 127.0.0.1, so three jails can each run a dev server on port 8080 without
+ * colliding, and the host reaches each one at its own address.
+ *
+ * connect() is rewritten symmetrically: a jailed client asking for 127.0.0.1
+ * is redirected to this jail's address, so "localhost" keeps working between
+ * processes inside the jail. The side effect is that a jail no longer reaches
+ * services on the HOST's 127.0.0.1 - run `jroot net set <name> off` when that
+ * is what you want.
+ *
+ * Port 53 is never rewritten: /etc/resolv.conf may legitimately point at a
+ * resolver on host loopback (systemd-resolved, dnsmasq), and silently breaking
+ * DNS in every jail would be a bad trade for address tidiness.
+ */
+static in_addr_t jail_loopback(void) {
+    static in_addr_t cached;
+    static int done = 0;
+    if (!done) {
+        const char *e = getenv("JROOT_LOOPBACK");
+        struct in_addr a;
+        cached = htonl(INADDR_LOOPBACK);
+        if (e && *e && inet_pton(AF_INET, e, &a) == 1) cached = a.s_addr;
+        done = 1;
+    }
+    return cached;
+}
+
 int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     if (!real_bind) real_bind = (bind_fn)dlsym(RTLD_NEXT, "bind");
     if (!addr) return real_bind(fd, addr, len);
@@ -569,7 +617,7 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
         struct sockaddr_in a = *((struct sockaddr_in *)addr);
         int port = ntohs(a.sin_port);
         if (!port_is_public(port)) {
-            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* force 127.0.0.1 */
+            a.sin_addr.s_addr = jail_loopback();  /* this jail's own 127.x.y.z */
         }
         return real_bind(fd, (struct sockaddr *)&a, sizeof(a));
     }
@@ -577,12 +625,45 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
         struct sockaddr_in6 a = *((struct sockaddr_in6 *)addr);
         int port = ntohs(a.sin6_port);
         if (!port_is_public(port)) {
+            /* IPv6 has exactly one loopback address, so v6-only listeners
+             * cannot be separated per jail the way v4 ones can. */
             memset(&a.sin6_addr, 0, sizeof(a.sin6_addr));
             a.sin6_addr.s6_addr[15] = 1; /* force ::1 */
         }
         return real_bind(fd, (struct sockaddr *)&a, sizeof(a));
     }
     return real_bind(fd, addr, len);
+}
+
+int connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    static connect_fn real = NULL;
+    if (!real) real = (connect_fn)dlsym(RTLD_NEXT, "connect");
+    if (addr && addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in a = *((struct sockaddr_in *)addr);
+        if (a.sin_addr.s_addr == htonl(INADDR_LOOPBACK)
+            && ntohs(a.sin_port) != 53
+            && jail_loopback() != htonl(INADDR_LOOPBACK)) {
+            a.sin_addr.s_addr = jail_loopback();
+            return real(fd, (struct sockaddr *)&a, sizeof(a));
+        }
+    }
+    return real(fd, addr, len);
+}
+
+ssize_t sendto(int fd, const void *buf, size_t n, int flags,
+               const struct sockaddr *addr, socklen_t len) {
+    static sendto_fn real = NULL;
+    if (!real) real = (sendto_fn)dlsym(RTLD_NEXT, "sendto");
+    if (addr && addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in a = *((struct sockaddr_in *)addr);
+        if (a.sin_addr.s_addr == htonl(INADDR_LOOPBACK)
+            && ntohs(a.sin_port) != 53
+            && jail_loopback() != htonl(INADDR_LOOPBACK)) {
+            a.sin_addr.s_addr = jail_loopback();
+            return real(fd, buf, n, flags, (struct sockaddr *)&a, sizeof(a));
+        }
+    }
+    return real(fd, buf, n, flags, addr, len);
 }
 
 /* ---- read-only mounts ------------------------------------------------ */
@@ -1070,20 +1151,220 @@ int chdir(const char *path) {
     return real(path);
 }
 
+/* ---- /proc: hide processes that do not belong to this jail -------------- *
+ * proot binds the host /proc, so without this a jailed `ps aux` lists every
+ * process on the machine, complete with command lines, and `pkill` inside a
+ * jail can match host processes by accident.
+ *
+ * JROOT_PROC_ROOT carries the pid that owns this jail: the seccomp launcher,
+ * which *becomes* proot after execv (execv keeps the pid). A pid belongs to
+ * the jail when it is traced by the same proot that traces us - true for every
+ * guest process, including daemons that double-forked and got reparented to
+ * host pid 1 - or when its parent chain leads back to JROOT_PROC_ROOT, which
+ * covers the no-python fallback path where the root is jroot's own shell.
+ *
+ * Cosmetic by design: glibc's readdir() path is covered (ls, ps, htop, python's
+ * os.listdir), but a program issuing getdents64() itself - statically linked
+ * tools, Go binaries - still sees every pid, /proc/<pid> stays readable when
+ * opened by exact path, and Alpine (musl) jails never load this shim. Set
+ * JROOT_SHOW_ALL_PROCS=1 to disable.
+ */
+#define JP_DIRS 64
+static void *jp_dirs[JP_DIRS];
+static int jp_cache_pid[256];
+static char jp_cache_val[256];
+
+static int jp_enabled(void) {
+    static int e = -1;
+    if (e < 0) {
+        const char *r = getenv("JROOT_PROC_ROOT");
+        e = (r && *r && !getenv("JROOT_SHOW_ALL_PROCS")) ? 1 : 0;
+    }
+    return e;
+}
+
+static pid_t jp_root(void) {
+    static pid_t r = -1;
+    if (r < 0) {
+        const char *e = getenv("JROOT_PROC_ROOT");
+        r = (e && *e) ? (pid_t)strtol(e, NULL, 10) : 0;
+    }
+    return r;
+}
+
+static int jp_all_digits(const char *s) {
+    if (!s || !*s) return 0;
+    for (; *s; s++) if (*s < '0' || *s > '9') return 0;
+    return 1;
+}
+
+/* Field 4 of /proc/<pid>/stat is the ppid. comm (field 2) is parenthesised and
+ * may itself contain spaces and parens, so scan from the LAST ')'. */
+static pid_t jp_ppid(pid_t pid) {
+    char path[64], buf[1024], *p;
+    int fd;
+    ssize_t n;
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    p = strrchr(buf, ')');
+    if (!p) return -1;
+    p++;
+    while (*p == ' ') p++;
+    while (*p && *p != ' ') p++;      /* state */
+    while (*p == ' ') p++;
+    if (!*p) return -1;
+    return (pid_t)strtol(p, NULL, 10);
+}
+
+static pid_t jp_tracer(pid_t pid) {
+    char path[64], buf[4096], *p;
+    int fd;
+    ssize_t n;
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    p = strstr(buf, "TracerPid:");
+    if (!p) return -1;
+    return (pid_t)strtol(p + 10, NULL, 10);
+}
+
+/* Our own tracer is proot (it ptraces every guest process), so "same tracer as
+ * me" identifies siblings in this jail without needing to know proot's pid.
+ * 0 when we are not traced, e.g. the shim loaded outside a jail. */
+static pid_t jp_my_tracer(void) {
+    static pid_t t = -1;
+    if (t < 0) {
+        t = jp_tracer(getpid());
+        if (t < 0) t = 0;
+    }
+    return t;
+}
+
+static int jp_member(pid_t pid) {
+    pid_t root = jp_root(), mine = jp_my_tracer(), cur;
+    int slot, depth, verdict = 0;
+    if (root <= 0) return 1;
+    if (pid == root || pid == mine) return 1;
+    slot = (int)(pid & 255);
+    if (jp_cache_pid[slot] == (int)pid) return jp_cache_val[slot];
+    if (mine > 0 && jp_tracer(pid) == mine) {
+        /* Traced by the same proot: a jail process, even if it double-forked
+         * and got reparented to host pid 1. */
+        verdict = 1;
+    } else {
+        cur = pid;
+        for (depth = 0; depth < 128; depth++) {
+            if (cur == root) { verdict = 1; break; }
+            if (cur <= 1) break;
+            cur = jp_ppid(cur);
+            if (cur < 0) break;
+        }
+    }
+    jp_cache_pid[slot] = (int)pid;
+    jp_cache_val[slot] = (char)verdict;
+    return verdict;
+}
+
+static void jp_dir_add(void *d) {
+    int i;
+    for (i = 0; i < JP_DIRS; i++) if (!jp_dirs[i]) { jp_dirs[i] = d; return; }
+}
+
+static int jp_dir_is_proc(void *d) {
+    int i;
+    for (i = 0; i < JP_DIRS; i++) if (jp_dirs[i] == d) return 1;
+    return 0;
+}
+
+static void jp_dir_del(void *d) {
+    int i;
+    for (i = 0; i < JP_DIRS; i++) if (jp_dirs[i] == d) { jp_dirs[i] = NULL; return; }
+}
+
+static int jp_path_is_proc(const char *path) {
+    char abs[8192], norm[8192];
+    if (!path || !*path) return 0;
+    if (path[0] != '/') {
+        char cwd[8192];
+        if (!getcwd(cwd, sizeof(cwd))) return 0;
+        snprintf(abs, sizeof(abs), "%s/%s", cwd, path);
+    } else {
+        snprintf(abs, sizeof(abs), "%s", path);
+    }
+    norm_path(abs, norm, sizeof(norm));
+    return strcmp(norm, "/proc") == 0;
+}
+
 /* Hide denied entries from directory listings. glibc's readdir() calls the
  * getdents64 SYSCALL directly (bypassing the exported symbol), so interpose
- * at the readdir level: skip any entry named ".jroot". */
+ * at the readdir level: skip any entry named ".jroot", and - when the stream
+ * is the host /proc - any pid that is not part of this jail. */
 typedef struct dirent *(*readdir_fn)(DIR *);
 typedef struct dirent64 *(*readdir64_fn)(DIR *);
 typedef int (*readdir_r_fn)(DIR *, struct dirent *, struct dirent **);
 typedef int (*readdir64_r_fn)(DIR *, struct dirent64 *, struct dirent64 **);
+typedef DIR *(*opendir_fn)(const char *);
+typedef DIR *(*fdopendir_fn)(int);
+typedef int (*closedir_fn)(DIR *);
+
+static int jp_hide_entry(DIR *dirp, const char *name) {
+    if (strcmp(name, ".jroot") == 0) return 1;
+    if (!jp_enabled()) return 0;
+    if (!jp_all_digits(name)) return 0;
+    if (!jp_dir_is_proc((void *)dirp)) return 0;
+    return !jp_member((pid_t)strtol(name, NULL, 10));
+}
+
+DIR *opendir(const char *path) {
+    static opendir_fn real = NULL;
+    DIR *d;
+    if (!real) real = (opendir_fn)dlsym(RTLD_NEXT, "opendir");
+    if (path_is_denied(path)) { denied_errno(); return NULL; }
+    d = real(path);
+    if (d && jp_enabled() && jp_path_is_proc(path)) jp_dir_add((void *)d);
+    return d;
+}
+
+DIR *fdopendir(int fd) {
+    static fdopendir_fn real = NULL;
+    DIR *d;
+    if (!real) real = (fdopendir_fn)dlsym(RTLD_NEXT, "fdopendir");
+    d = real(fd);
+    if (d && jp_enabled()) {
+        char fdpath[64], target[8192];
+        ssize_t l;
+        snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+        l = readlink(fdpath, target, sizeof(target) - 1);
+        if (l > 0) {
+            target[l] = 0;
+            if (strcmp(target, "/proc") == 0) jp_dir_add((void *)d);
+        }
+    }
+    return d;
+}
+
+int closedir(DIR *dirp) {
+    static closedir_fn real = NULL;
+    if (!real) real = (closedir_fn)dlsym(RTLD_NEXT, "closedir");
+    jp_dir_del((void *)dirp);
+    return real(dirp);
+}
 
 struct dirent *readdir(DIR *dirp) {
     static readdir_fn real = NULL;
     if (!real) real = (readdir_fn)dlsym(RTLD_NEXT, "readdir");
     struct dirent *e;
     while ((e = real(dirp)) != NULL) {
-        if (strcmp(e->d_name, ".jroot") != 0) return e;
+        if (!jp_hide_entry(dirp, e->d_name)) return e;
     }
     return e;
 }
@@ -1093,7 +1374,7 @@ struct dirent64 *readdir64(DIR *dirp) {
     if (!real) real = (readdir64_fn)dlsym(RTLD_NEXT, "readdir64");
     struct dirent64 *e;
     while ((e = real(dirp)) != NULL) {
-        if (strcmp(e->d_name, ".jroot") != 0) return e;
+        if (!jp_hide_entry(dirp, e->d_name)) return e;
     }
     return e;
 }
@@ -1104,7 +1385,7 @@ int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result) {
     int rc;
     do {
         rc = real(dirp, entry, result);
-    } while (rc == 0 && *result != NULL && strcmp((*result)->d_name, ".jroot") == 0);
+    } while (rc == 0 && *result != NULL && jp_hide_entry(dirp, (*result)->d_name));
     return rc;
 }
 
@@ -1114,7 +1395,7 @@ int readdir64_r(DIR *dirp, struct dirent64 *entry, struct dirent64 **result) {
     int rc;
     do {
         rc = real(dirp, entry, result);
-    } while (rc == 0 && *result != NULL && strcmp((*result)->d_name, ".jroot") == 0);
+    } while (rc == 0 && *result != NULL && jp_hide_entry(dirp, (*result)->d_name));
     return rc;
 }
 
@@ -1123,7 +1404,7 @@ CEOF
         log "Built port shim: $PORT_SHIM"
         return 0
     fi
-    warn "Failed to build port shim. 'jroot port' will not work."
+    warn "Failed to build port shim. 'jroot port', 'jroot net' and /proc hiding will not work."
     return 1
 }
 
@@ -1533,6 +1814,26 @@ EOF
 # ---------------------------------------------------------------------------
 write_config() {
     local name="$1" image="$2" user_mode="$3" mount_host="$4" mount_home="$5" build_essential="$6"
+    local cfg="$CONFIGS_DIR/$name.json"
+    # Merge into an existing config so fields this function does not know about
+    # (ports, mounts, loopback, anything added later) survive. Before this,
+    # `jroot config` silently dropped a jail's public ports.
+    if [ -f "$cfg" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$cfg" "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential" <<'PYEOF' && return 0
+import json, sys
+cfg, name, image, user, mh, mhome, be = sys.argv[1:8]
+try:
+    c = json.load(open(cfg))
+    if not isinstance(c, dict):
+        c = {}
+except Exception:
+    c = {}
+c.update({"name": name, "image": image, "user": user,
+          "mount_host": int(mh), "mount_home": int(mhome),
+          "build_essential": int(be)})
+json.dump(c, open(cfg, "w"), indent=2)
+PYEOF
+    fi
     cat > "$CONFIGS_DIR/$name.json" << EOF
 {
   "name": "$name",
@@ -1549,15 +1850,90 @@ config_field() {
     sed -n "s/.*\"${2}\"[[:space:]]*:[[:space:]]*\"*\([^\",}]*\)\"*.*/\1/p" "$1" | head -n1
 }
 
+# set_config_field <cfg> <key> <value> - value is stored as a JSON string.
+set_config_field() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, sys
+cfg, key, val = sys.argv[1:4]
+try:
+    c = json.load(open(cfg))
+    if not isinstance(c, dict):
+        c = {}
+except Exception:
+    c = {}
+if val == "":
+    c.pop(key, None)
+else:
+    c[key] = val
+json.dump(c, open(cfg, "w"), indent=2)
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
+# Per-jail loopback addresses
+#
+# Each jail owns one address inside 127/8 (127.2.0.1, 127.2.0.2, ...). The
+# bind() shim pins the jail's non-public listeners to it, so several jails can
+# each run a server on the same port without fighting over 127.0.0.1, and the
+# host can reach each of them separately. Stored in the jail config as
+# "loopback"; the literal value "off" opts out and restores plain 127.0.0.1.
+# ---------------------------------------------------------------------------
+LOOPBACK_PREFIX="127.2"
+
+# All addresses currently claimed by any jail, one per line.
+loopback_used() {
+    local cfg
+    shopt -s nullglob
+    for cfg in "$CONFIGS_DIR"/*.json; do
+        config_field "$cfg" loopback
+    done
+    shopt -u nullglob
+}
+
+# Lowest free 127.2.x.y, skipping .0 and .255 in the last octet.
+loopback_next_free() {
+    local used idx third fourth cand
+    used="$(loopback_used)"
+    for idx in $(seq 1 4000); do
+        third=$(( (idx - 1) / 254 ))
+        fourth=$(( (idx - 1) % 254 + 1 ))
+        cand="$LOOPBACK_PREFIX.$third.$fourth"
+        printf '%s\n' "$used" | grep -qxF "$cand" || { printf '%s' "$cand"; return 0; }
+    done
+    return 1
+}
+
+# Address for a jail, allocating and persisting one on first use. Prints
+# nothing when the jail opted out or when python3 is missing (the config
+# cannot be updated safely without it).
+jail_loopback_addr() {
+    local name="$1" cfg="$CONFIGS_DIR/$name.json" cur
+    [ -f "$cfg" ] || return 0
+    cur="$(config_field "$cfg" loopback)"
+    case "$cur" in
+        off|shared|disabled) return 0 ;;
+        "") ;;
+        *) printf '%s' "$cur"; return 0 ;;
+    esac
+    command -v python3 >/dev/null 2>&1 || return 0
+    cur="$(loopback_next_free)" || return 0
+    set_config_field "$cfg" loopback "$cur" >/dev/null 2>&1 || return 0
+    printf '%s' "$cur"
+}
+
 show_config() {
     local name="$1"
     local cfg="$CONFIGS_DIR/$name.json"
+    local lb
+    lb="$(config_field "$cfg" loopback)"
     printf '  name:             %s\n' "$name"
     printf '  image:            %s\n' "$(config_field "$cfg" image)"
     printf '  user:             %s\n' "$(config_field "$cfg" user)"
     printf '  build_essential:  %s\n' "$(config_field "$cfg" build_essential)"
     printf '  mount_host (/):   %s   (host / at /mnt/host)\n' "$(config_field "$cfg" mount_host)"
     printf '  mount_home (~):   %s   (host $HOME at /mnt/home)\n' "$(config_field "$cfg" mount_home)"
+    printf '  loopback addr:    %s\n' "${lb:-auto (assigned on first enter)}"
     printf '  public ports:     %s\n' "$(config_ports "$cfg" | sed 's/^$/none/')"
     if config_mounts "$cfg" | grep -q .; then
         printf '  custom mounts:\n'
@@ -1790,6 +2166,10 @@ run_in_jail() {
     # repairs jails created before this was handled.
     sync_jail_hosts "$name"
 
+    # This jail's own loopback address (allocated on first use, "off" opts out).
+    local jail_lb
+    jail_lb="$(jail_loopback_addr "$name")"
+
     local proot_args=(-k "$PROOT_KERNEL_RELEASE")
     export HOSTNAME="$name"
     if [ "$force_root" = 1 ] || [ "$user_mode" = "root" ]; then
@@ -1901,14 +2281,22 @@ run_in_jail() {
     # plus the seccomp ENOSYS blocks - none of which depend on libc.
     if [ "$jail_distro" = "alpine" ]; then
         shim_ok=0
-        warn "Alpine jail '$name': LD_PRELOAD shim is glibc-only, DISABLED (ports are not forced to loopback)"
+        warn "Alpine jail '$name': LD_PRELOAD shim is glibc-only, DISABLED (no per-jail loopback address, no /proc process hiding)"
     fi
     if [ -x "$PORT_SHIM" ] && [ "$shim_ok" = "1" ]; then
         local jail_ports
         jail_ports="$(config_ports "$cfg")"
         binds+=(-b "$PORT_SHIM:/usr/local/lib/libjroot.so")
+        # JROOT_LOOPBACK  pins this jail's listeners to its own 127.x.y.z and
+        #                 redirects the jail's own 127.0.0.1 traffic there.
+        # JROOT_PROC_ROOT lets the shim filter /proc down to this jail's
+        #                 processes. The seccomp launcher overwrites it with
+        #                 proot's pid, which is tighter; this value (jroot's own
+        #                 pid) is the fallback for hosts without python3.
         set -- /usr/bin/env LD_PRELOAD=/usr/local/lib/libjroot.so \
             JROOT_PORTS="${jail_ports:-}" \
+            JROOT_LOOPBACK="${jail_lb:-}" \
+            JROOT_PROC_ROOT="${JROOT_PROC_ROOT:-$$}" \
             JROOT_RO_MOUNTS="${ro_mounts#:}" "$@"
     fi
 
@@ -2497,10 +2885,116 @@ port_usage() {
     printf '%bjroot port%b - control which jailed ports may bind publicly\n\n' "$H" "$N"
     printf '    %bjroot port <name> list%b              show public ports\n' "$G" "$N"
     printf '    %bjroot port <name> add <port>%b        make a port public (0.0.0.0)\n' "$G" "$N"
-    printf '    %bjroot port <name> rm <port>%b         force loopback again (127.0.0.1)\n' "$G" "$N"
+    printf '    %bjroot port <name> rm <port>%b         keep it on the jail address\n' "$G" "$N"
     printf '\n'
-    printf '    Jailed servers are loopback-only by default. A bind() LD_PRELOAD\n'
-    printf '    shim forces 127.0.0.1 unless the port is in the public list.\n'
+    printf '    Jailed servers are loopback-only by default: a bind() LD_PRELOAD\n'
+    printf '    shim pins them to the jail'"'"'s own address (see %bjroot net%b) unless the\n' "$G" "$N"
+    printf '    port is in the public list.\n'
+}
+
+net_usage() {
+    printf '%bjroot net%b - per-jail loopback addresses\n\n' "$H" "$N"
+    printf '    %bjroot net%b                          list every jail'"'"'s address\n' "$G" "$N"
+    printf '    %bjroot net <name>%b                   show one jail\n' "$G" "$N"
+    printf '    %bjroot net set <name> auto%b          assign the next free address\n' "$G" "$N"
+    printf '    %bjroot net set <name> 127.2.0.9%b     pick an address by hand\n' "$G" "$N"
+    printf '    %bjroot net set <name> off%b           share 127.0.0.1 with the host\n' "$G" "$N"
+    printf '\n'
+    printf '    Each jail owns one address inside %b127/8%b. Servers on non-public\n' "$G" "$N"
+    printf '    ports bind to it instead of 127.0.0.1, so several jails can run on\n'
+    printf '    the same port at once, and the host reaches each at its own address.\n'
+    printf '    Inside the jail, 127.0.0.1 is redirected to that address too, so\n'
+    printf '    %blocalhost%b keeps working between the jail'"'"'s own processes - but the\n' "$G" "$N"
+    printf '    jail can no longer reach host services on 127.0.0.1. Use %boff%b for\n' "$G" "$N"
+    printf '    the old shared behaviour. DNS (port 53) is never redirected.\n'
+}
+
+cmd_net() {
+    ensure_runtime
+    local op="${1:-list}"
+    case "$op" in
+        set)
+            [ $# -eq 3 ] || { net_usage; err "Usage: jroot net set <name> auto|off|<address>"; }
+            local name="$2" want="$3" cfg
+            cfg="$CONFIGS_DIR/$name.json"
+            [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+            command -v python3 >/dev/null 2>&1 || err "python3 is needed to save the jail config."
+            case "$want" in
+                auto)
+                    set_config_field "$cfg" loopback "" >/dev/null 2>&1
+                    local got
+                    got="$(jail_loopback_addr "$name")"
+                    [ -n "$got" ] || err "No free address left in $LOOPBACK_PREFIX.0.0/16."
+                    log "'$name' now uses $got (takes effect on the next 'jroot enter')."
+                    record_event "$name" "net" "loopback=$got (auto)"
+                    ;;
+                off|shared|disabled)
+                    set_config_field "$cfg" loopback "off" >/dev/null 2>&1
+                    log "'$name' now shares 127.0.0.1 with the host and other jails."
+                    warn "Ports can collide with other jails again."
+                    record_event "$name" "net" "loopback=off (shared 127.0.0.1)"
+                    ;;
+                *)
+                    [[ "$want" =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+                        || err "Address must be inside 127/8 (e.g. 127.2.0.9), 'auto', or 'off'. Got '$want'."
+                    [ "$want" != "127.0.0.1" ] \
+                        || err "127.0.0.1 is the shared address - use 'jroot net set $name off' for that."
+                    local octet other
+                    for octet in $(printf '%s' "$want" | tr '.' ' '); do
+                        [ "$octet" -le 255 ] || err "Invalid address: $want"
+                    done
+                    other="$(for c in "$CONFIGS_DIR"/*.json; do
+                        [ -f "$c" ] || continue
+                        [ "$c" = "$cfg" ] && continue
+                        [ "$(config_field "$c" loopback)" = "$want" ] && basename "$c" .json
+                    done)"
+                    [ -z "$other" ] || err "$want is already used by jail '$other'."
+                    set_config_field "$cfg" loopback "$want" >/dev/null 2>&1
+                    log "'$name' now uses $want (takes effect on the next 'jroot enter')."
+                    record_event "$name" "net" "loopback=$want (manual)"
+                    ;;
+            esac
+            ;;
+        list|"")
+            net_list ""
+            ;;
+        --help|-h)
+            net_usage
+            ;;
+        *)
+            [ -f "$CONFIGS_DIR/$op.json" ] || { net_usage; err "Jail '$op' not found. Run 'jroot list' to see jails."; }
+            net_list "$op"
+            ;;
+    esac
+}
+
+net_list() {
+    local only="$1" cfgs=() cfg name lb ports shim_note=""
+    shopt -s nullglob
+    cfgs=("$CONFIGS_DIR"/*.json)
+    shopt -u nullglob
+    [ "${#cfgs[@]}" -gt 0 ] || err "No jails found. Create one first: jroot init ubuntu:22.04"
+    [ -x "$PORT_SHIM" ] || shim_note="shim not built (needs gcc) - addresses are NOT applied yet"
+
+    printf '%b%-16s %-16s %-14s %s%b\n' "$D" "JAIL" "ADDRESS" "PUBLIC PORTS" "DISTRO" "$N"
+    for cfg in "${cfgs[@]}"; do
+        name="$(basename "$cfg" .json)"
+        [ -z "$only" ] || [ "$only" = "$name" ] || continue
+        lb="$(config_field "$cfg" loopback)"
+        ports="$(config_ports "$cfg")"
+        case "$lb" in
+            off|shared|disabled) lb="127.0.0.1 (shared)" ;;
+            "")                  lb="auto (on next enter)" ;;
+        esac
+        printf '%b%-16s%b %-16s %-14s %s\n' "$G" "$name" "$N" "$lb" "${ports:-none}" \
+            "$(jail_distro_of "$name")"
+    done
+    [ -z "$shim_note" ] || warn "$shim_note"
+    printf '\n'
+    printf '  A server on a non-public port is reachable from the host at that\n'
+    printf '  jail'"'"'s ADDRESS, e.g. %bcurl http://127.2.0.1:8080%b. Public ports\n' "$G" "$N"
+    printf '  (%bjroot port <name> add%b) bind 0.0.0.0 and ignore the address.\n' "$G" "$N"
+    printf '  Alpine jails cannot load the shim, so they keep plain 127.0.0.1.\n'
 }
 
 cmd_port() {
@@ -2511,12 +3005,14 @@ cmd_port() {
 
     case "$op" in
         list)
-            local ports cur
+            local ports cur lb
             cur="$(config_ports "$cfg")"
+            lb="$(config_field "$cfg" loopback)"
+            case "$lb" in off|shared|disabled|"") lb="127.0.0.1" ;; esac
             if [ -z "$cur" ]; then
-                log "No public ports for '$name'. Servers are loopback-only (127.0.0.1)."
+                log "No public ports for '$name'. Servers stay on $lb (see 'jroot net')."
             else
-                log "Public ports for '$name': $cur (bind to 0.0.0.0)"
+                log "Public ports for '$name': $cur (bind to 0.0.0.0). Everything else stays on $lb."
             fi
             ;;
         add)
@@ -3735,6 +4231,9 @@ cmd_help_cmd() {
         port)
             port_usage
             ;;
+        net)
+            net_usage
+            ;;
         mnt)
             mnt_usage "<name>"
             ;;
@@ -3862,6 +4361,7 @@ cmd_help() {
     help_row "jroot file" "cp|mv <name> <src> <dst>" "Copy/move a file in or out of a jail"
     printf '                                      %b (prefix jail paths with %b:%b, e.g. %b:/root/file%b)\n' "$B" "$G" "$N" "$G" "$N"
     help_row "jroot port" "list|add|rm <name>"    "Control which jailed ports may bind publicly"
+    help_row "jroot net" "[set <name> auto|off]"  "Per-jail loopback address (no port collisions)"
     help_row "jroot mnt" "<name> <label> <dir>"   "Bind-mount a host directory at /mnt/<label>"
     help_row "jroot install" "<name> <pkg...>"     "Install packages inside a jail (apt/apk)"
     help_row "jroot config" "<name>"               "View or change a jail's settings"
@@ -3929,6 +4429,7 @@ jroot_cmd() {
         exec)          shift; cmd_exec "$@" ;;
         file)          shift; cmd_file "$@" ;;
         port)          shift; cmd_port "$@" ;;
+        net)           shift; cmd_net "$@" ;;
         mnt)           shift; cmd_mnt "$@" ;;
         mount)         shift; cmd_mnt "$@" ;;
         install)       shift; cmd_install "$@" ;;
