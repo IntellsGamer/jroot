@@ -565,11 +565,15 @@ const char jroot_shim_version[] = "jroot-shim-v3";
  * dlsym@GLIBC_2.34, which a jail on an older glibc cannot satisfy. The base
  * version node (2.2.5 on x86-64, 2.17 on aarch64) exists in every glibc of that
  * architecture, and 2.34+ keeps it as a compat alias, so pinning here is what
- * lets ONE host-built shim load in jails from 16.04 to 26.04. */
-#if defined(__aarch64__)
+ * lets ONE host-built shim load in jails from 16.04 to 26.04.
+ * musl has no symbol versioning at all, so the directive must not be emitted
+ * when this file is compiled inside an Alpine jail. */
+#if defined(__GLIBC__)
+# if defined(__aarch64__)
 __asm__(".symver dlsym,dlsym@GLIBC_2.17");
-#elif defined(__x86_64__)
+# elif defined(__x86_64__)
 __asm__(".symver dlsym,dlsym@GLIBC_2.2.5");
+# endif
 #endif
 
 /* Parse a non-negative decimal. Deliberately hand-rolled: with _GNU_SOURCE on
@@ -1466,8 +1470,11 @@ CEOF
     # Keeping DT_NEEDED libdl.so.2 matters for the same reason: on jails older
     # than glibc 2.34 that is where dlsym lives (on newer ones it is a stub).
     local cflags="-shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+    # Link attempts, in order: keep DT_NEEDED libdl (glibc 2.34+), plain -ldl
+    # (older glibc), then nothing at all (musl has dlsym in libc and no libdl).
     if gcc $cflags -o "$PORT_SHIM" "$src" -Wl,--no-as-needed -l:libdl.so.2 2>/dev/null \
-       || gcc $cflags -o "$PORT_SHIM" "$src" -ldl 2>/dev/null; then
+       || gcc $cflags -o "$PORT_SHIM" "$src" -ldl 2>/dev/null \
+       || gcc $cflags -o "$PORT_SHIM" "$src" 2>/dev/null; then
         log "Built port shim: $PORT_SHIM"
         shim_glibc_floor_warn
         return 0
@@ -1526,7 +1533,9 @@ jail_local_shim() {
 # ".jroot" - using nothing but `ls`, which every image has.
 # Runs proot directly (not run_in_jail) to stay out of the resolution path.
 shim_probe() {
-    local name="$1" rootfs="$ROOTS_DIR/$name" out rc=0 dir
+    local name="$1"
+    local rootfs="$ROOTS_DIR/$name"
+    local out rc=0 dir
     [ -x "$PROOT_BIN" ] || return 1
     [ -x "$PORT_SHIM" ] || return 1
     dir="$rootfs/tmp/.jroot-shimprobe"
@@ -1553,7 +1562,9 @@ shim_probe() {
 # Compile the shim with the jail's own toolchain. Fixes both the old-glibc case
 # and musl, when the jail has gcc (build_essential, or build-base on Alpine).
 build_shim_in_jail() {
-    local name="$1" rootfs="$ROOTS_DIR/$name" so
+    local name="$1"
+    local rootfs="$ROOTS_DIR/$name"
+    local so
     so="$(jail_local_shim "$name")"
     [ -f "$PORT_SHIM_SRC" ] || return 1
     SHIM_RESOLVING=1 run_in_jail --root "$name" /bin/sh -c \
@@ -1563,8 +1574,10 @@ build_shim_in_jail() {
     log "Building the jroot shim inside '$name' (its libc differs from the host's)..."
     SHIM_RESOLVING=1 run_in_jail --root "$name" /bin/sh -c \
         'CF="-shared -fPIC -O2 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
-         gcc $CF -o /usr/local/lib/libjroot.so /tmp/libjroot.c -Wl,--no-as-needed -l:libdl.so.2 \
-             || gcc $CF -o /usr/local/lib/libjroot.so /tmp/libjroot.c -ldl' >/dev/null 2>&1 || {
+         OUT=/usr/local/lib/libjroot.so
+         gcc $CF -o $OUT /tmp/libjroot.c -Wl,--no-as-needed -l:libdl.so.2 2>/dev/null \
+             || gcc $CF -o $OUT /tmp/libjroot.c -ldl 2>/dev/null \
+             || gcc $CF -o $OUT /tmp/libjroot.c' >/dev/null 2>&1 || {
         rm -f "$rootfs/tmp/libjroot.c"
         return 1
     }
@@ -2134,7 +2147,13 @@ loopback_next_free() {
 # nothing when the jail opted out or when python3 is missing (the config
 # cannot be updated safely without it).
 jail_loopback_addr() {
-    local name="$1" cfg="$CONFIGS_DIR/$name.json" cur
+    # NOTE: each `local` assignment gets its own statement on purpose. In bash,
+    # `local a="$1" b="$a"` expands b BEFORE a is assigned, so b silently picks
+    # up the CALLER's a through dynamic scoping - which works by accident when
+    # called from run_in_jail and breaks everywhere else.
+    local name="$1"
+    local cfg="$CONFIGS_DIR/$name.json"
+    local cur
     [ -f "$cfg" ] || return 0
     cur="$(config_field "$cfg" loopback)"
     case "$cur" in
@@ -2260,7 +2279,8 @@ PYEOF
 }
 
 mount_list() {
-    local name="$1" cfg="$CONFIGS_DIR/$name.json"
+    local name="$1"
+    local cfg="$CONFIGS_DIR/$name.json"
     local mpath
     if ! config_mounts "$cfg" | grep -q .; then
         log "No custom mounts for '$name'."
