@@ -708,20 +708,26 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     if (addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in a = *((struct sockaddr_in *)addr);
         int port = ntohs(a.sin_port);
+        int mapped = port_remap(port);
+        /* Publicness is decided on the port the application ASKED for, not the
+         * one it ends up on: `jroot port add 22` must keep meaning "22". */
         if (!port_is_public(port)) {
             a.sin_addr.s_addr = jail_loopback();  /* this jail's own 127.x.y.z */
         }
+        if (mapped != port) a.sin_port = htons((unsigned short)mapped);
         return real_bind(fd, (struct sockaddr *)&a, sizeof(a));
     }
     if (addr->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
         struct sockaddr_in6 a = *((struct sockaddr_in6 *)addr);
         int port = ntohs(a.sin6_port);
+        int mapped = port_remap(port);
         if (!port_is_public(port)) {
             /* IPv6 has exactly one loopback address, so v6-only listeners
              * cannot be separated per jail the way v4 ones can. */
             memset(&a.sin6_addr, 0, sizeof(a.sin6_addr));
             a.sin6_addr.s6_addr[15] = 1; /* force ::1 */
         }
+        if (mapped != port) a.sin6_port = htons((unsigned short)mapped);
         return real_bind(fd, (struct sockaddr *)&a, sizeof(a));
     }
     return real_bind(fd, addr, len);
@@ -732,10 +738,14 @@ int connect(int fd, const struct sockaddr *addr, socklen_t len) {
     if (!real) real = (connect_fn)dlsym(RTLD_NEXT, "connect");
     if (addr && addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in a = *((struct sockaddr_in *)addr);
-        if (a.sin_addr.s_addr == htonl(INADDR_LOOPBACK)
-            && ntohs(a.sin_port) != 53
-            && jail_loopback() != htonl(INADDR_LOOPBACK)) {
-            a.sin_addr.s_addr = jail_loopback();
+        int port = ntohs(a.sin_port);
+        int mapped = port_remap(port);
+        int loop = (a.sin_addr.s_addr == htonl(INADDR_LOOPBACK)
+                    && port != 53
+                    && jail_loopback() != htonl(INADDR_LOOPBACK));
+        if (loop || mapped != port) {
+            if (loop) a.sin_addr.s_addr = jail_loopback();
+            if (mapped != port) a.sin_port = htons((unsigned short)mapped);
             return real(fd, (struct sockaddr *)&a, sizeof(a));
         }
     }
@@ -748,10 +758,14 @@ ssize_t sendto(int fd, const void *buf, size_t n, int flags,
     if (!real) real = (sendto_fn)dlsym(RTLD_NEXT, "sendto");
     if (addr && addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in a = *((struct sockaddr_in *)addr);
-        if (a.sin_addr.s_addr == htonl(INADDR_LOOPBACK)
-            && ntohs(a.sin_port) != 53
-            && jail_loopback() != htonl(INADDR_LOOPBACK)) {
-            a.sin_addr.s_addr = jail_loopback();
+        int port = ntohs(a.sin_port);
+        int mapped = port_remap(port);
+        int loop = (a.sin_addr.s_addr == htonl(INADDR_LOOPBACK)
+                    && port != 53
+                    && jail_loopback() != htonl(INADDR_LOOPBACK));
+        if (loop || mapped != port) {
+            if (loop) a.sin_addr.s_addr = jail_loopback();
+            if (mapped != port) a.sin_port = htons((unsigned short)mapped);
             return real(fd, buf, n, flags, (struct sockaddr *)&a, sizeof(a));
         }
     }
@@ -873,6 +887,22 @@ static int denied_errno(void) {
     return -1;
 }
 
+/* Forward declarations for the /proc filter, which lives further down next to
+ * the readdir hooks. path_is_denied() below needs it: hiding a foreign
+ * /proc/<pid> is the same operation as hiding ~/.jroot, so both are decided in
+ * one place, but the pid-membership logic belongs with the rest of the /proc
+ * code rather than up here. */
+static int jp_enabled(void);
+static int jp_member(pid_t pid);
+
+/* Re-entrancy guard. jp_member() answers "does this pid belong to my jail?" by
+ * READING /proc/<pid>/status and /proc/<pid>/stat - through open(), which is
+ * itself one of our shims, which calls path_is_denied(), which asks jp_member()
+ * again. That recursion overflows the stack and the process dies with SIGSEGV.
+ * While a membership lookup is in flight, the /proc check is therefore skipped
+ * so the lookup's own reads go straight through. */
+static __thread int jp_in_lookup = 0;
+
 /* A path inside the ~/.jroot config/rootfs tree, or the installed jroot
  * binary itself, must look NON-EXISTENT from inside every jail - regardless
  * of how host directories are bind-mounted in (custom mounts, / at /mnt/host,
@@ -911,8 +941,9 @@ static int path_is_denied(const char *path) {
      * look non-existent. This blocks open(), stat(), access(), readlink() etc.
      * on paths like /proc/1234/cmdline when pid 1234 is not part of this jail.
      * Combined with the readdir() filter above, host processes become fully
-     * invisible to glibc-linked programs inside the jail. */
-    if (jp_enabled() && strncmp(norm, "/proc/", 6) == 0) {
+     * invisible to glibc-linked programs inside the jail.
+     * jp_in_lookup keeps jp_member's own /proc reads from recursing back here. */
+    if (!jp_in_lookup && jp_enabled() && strncmp(norm, "/proc/", 6) == 0) {
         const char *after = norm + 6;
         if (*after >= '0' && *after <= '9') {
             long pid = 0;
@@ -1374,13 +1405,20 @@ static pid_t jp_my_tracer(void) {
 }
 
 static int jp_member(pid_t pid) {
-    pid_t root = jp_root(), mine = jp_my_tracer(), cur;
+    pid_t root = jp_root(), mine, cur;
     int slot, depth, verdict = 0;
     if (root <= 0) return 1;
-    if (pid == root || pid == mine) return 1;
+    if (pid == root) return 1;
     slot = (int)(pid & 255);
     if (jp_cache_pid[slot] == (int)pid) return jp_cache_val[slot];
-    if (mine > 0 && jp_tracer(pid) == mine) {
+
+    /* Everything below reads /proc, and those reads must not come back through
+     * the /proc filter - see jp_in_lookup. */
+    jp_in_lookup++;
+    mine = jp_my_tracer();
+    if (pid == mine) {
+        verdict = 1;
+    } else if (mine > 0 && jp_tracer(pid) == mine) {
         /* Traced by the same proot: a jail process, even if it double-forked
          * and got reparented to host pid 1. */
         verdict = 1;
@@ -1393,6 +1431,8 @@ static int jp_member(pid_t pid) {
             if (cur < 0) break;
         }
     }
+    jp_in_lookup--;
+
     jp_cache_pid[slot] = (int)pid;
     jp_cache_val[slot] = (char)verdict;
     return verdict;
@@ -3672,7 +3712,9 @@ cmd_rm() {
     rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json"
     rm -f "$(history_file "$name")"
     rm -f "$JROOT_HOME/pids/$name.pid" 2>/dev/null || true
-    rm -f "$JROOT_HOME/pids/$name.sshd" "$JROOT_HOME/pids/$name.sshport" "$JROOT_HOME/pids/$name.socat" 2>/dev/null || true
+    rm -f "$JROOT_HOME/pids/$name.sshd" "$JROOT_HOME/pids/$name.sshport" \
+          "$JROOT_HOME/pids/$name.socat" "$JROOT_HOME/pids/$name.sshinner" \
+          "$JROOT_HOME/pids/$name.sshlog" 2>/dev/null || true
     log "Jail '$name' deleted."
 }
 
@@ -3760,7 +3802,7 @@ cmd_ps() {
             printf '%-16s %-8s %-6s %s\n' "$name" "$pid" "sshd" "port $port"
             found=1
         else
-            rm -f "$pidfile" "$JROOT_HOME/pids/$name.sshport" "$JROOT_HOME/pids/$name.socat" 2>/dev/null
+            rm -f "$pidfile" "$JROOT_HOME/pids/$name.sshport" "$JROOT_HOME/pids/$name.socat" "$JROOT_HOME/pids/$name.sshinner" 2>/dev/null
         fi
     done
     [ "$found" -eq 0 ] && log "No running jails."
@@ -4513,8 +4555,8 @@ ssh_port_in_use() {
     elif command -v netstat >/dev/null 2>&1; then
         netstat -tlnp 2>/dev/null | grep -q ":$port " && return 0
     fi
-    # Fallback: try to bind
-    (echo >/dev/tcp/127.0.0.1/"$port") 2>/dev/null && return 0
+    # Fallback: see whether anything accepts a connection there.
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
     return 1
 }
 
@@ -4675,6 +4717,30 @@ ssh_install_key() {
     return 0
 }
 
+# The unprivileged port sshd actually binds inside the jail. Scanned rather than
+# fixed, so several jails can run SSH even when they share 127.0.0.1
+# (`jroot net set <name> off`). $1 is a port to avoid - the external one.
+ssh_free_high_port() {
+    local avoid="$1" port claimed=() f c skip
+    shopt -s nullglob
+    for f in "$JROOT_HOME/pids"/*.sshinner; do
+        claimed+=("$(cat "$f" 2>/dev/null)")
+    done
+    shopt -u nullglob
+    for port in $(seq 22100 22199); do
+        [ "$port" = "$avoid" ] && continue
+        skip=0
+        for c in "${claimed[@]}"; do
+            [ "$c" = "$port" ] && { skip=1; break; }
+        done
+        [ "$skip" = 1 ] && continue
+        ssh_port_in_use "$port" && continue
+        printf '%s' "$port"
+        return 0
+    done
+    return 1
+}
+
 ssh_status() {
     local name="$1"
     local pidfile portfile pid port user auth
@@ -4694,11 +4760,17 @@ ssh_status() {
     user="$(config_field "$CONFIGS_DIR/$name.json" ssh_user)"
     [ -n "$user" ] || user="$(ssh_default_user "$name")"
     auth="$(config_field "$CONFIGS_DIR/$name.json" ssh_auth)"
+    local inner
+    inner="$(cat "$JROOT_HOME/pids/$name.sshinner" 2>/dev/null || true)"
     log "SSH for '$name': running (pid $pid, port $port)"
     printf '  login user:  %s\n' "$user"
     printf '  auth:        %s\n' "${auth:-password}"
+    if [ -n "$inner" ] && [ "$inner" != "$port" ]; then
+        printf '  inside jail: port 22 (real socket on %s)\n' "$inner"
+    fi
     printf '  connect:     ssh -p %s %s@<host-ip>\n' "$port" "$user"
     printf '  locally:     ssh -p %s %s@127.0.0.1\n' "$port" "$user"
+    printf '  sshd log:    %s\n' "$JROOT_HOME/pids/$name.sshlog"
     printf '  new password: jroot ssh %s passwd\n' "$name"
     return 0
 }
@@ -4714,18 +4786,31 @@ ssh_stop() {
     fi
     pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
     port="$(cat "$portfile" 2>/dev/null || echo '?')"
-    if kill -0 "$pid" 2>/dev/null; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         log "Stopping SSH for '$name' (pid $pid, port $port)..."
-        # Kill the entire process group (proot + sshd + socat)
-        local pgid
+        # ssh_start launched this with job control on, so $pid leads its own
+        # process group and a group kill reaches proot and sshd without
+        # touching jroot or the user's shell. Only signal the group when it
+        # really is a separate one - killing our own group would take the
+        # caller's terminal down with it.
+        local pgid mypgid
         pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
-        if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
+        mypgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+        if [ -n "$pgid" ] && [ "$pgid" != "0" ] && [ "$pgid" != "$mypgid" ]; then
             kill -TERM -"$pgid" 2>/dev/null || true
             sleep 0.3
             kill -KILL -"$pgid" 2>/dev/null || true
         else
+            # Fall back to the process itself plus its direct descendants.
+            local kid
+            for kid in $(pgrep -P "$pid" 2>/dev/null || true); do
+                kill -TERM "$kid" 2>/dev/null || true
+            done
             kill -TERM "$pid" 2>/dev/null || true
             sleep 0.3
+            for kid in $(pgrep -P "$pid" 2>/dev/null || true); do
+                kill -KILL "$kid" 2>/dev/null || true
+            done
             kill -KILL "$pid" 2>/dev/null || true
         fi
     fi
@@ -4733,12 +4818,14 @@ ssh_stop() {
     local socatfile="$JROOT_HOME/pids/$name.socat" socat_pid
     if [ -f "$socatfile" ]; then
         socat_pid="$(cat "$socatfile" 2>/dev/null | tr -d ' ')"
-        [ -n "$socat_pid" ] && kill -TERM "$socat_pid" 2>/dev/null || true
-        sleep 0.2
-        [ -n "$socat_pid" ] && kill -KILL "$socat_pid" 2>/dev/null || true
+        if [ -n "$socat_pid" ]; then
+            kill -TERM "$socat_pid" 2>/dev/null || true
+            sleep 0.2
+            kill -KILL "$socat_pid" 2>/dev/null || true
+        fi
         rm -f "$socatfile"
     fi
-    rm -f "$pidfile" "$portfile"
+    rm -f "$pidfile" "$portfile" "$JROOT_HOME/pids/$name.sshinner"
     log "SSH for '$name' stopped."
     record_event "$name" "ssh" "stopped (was port $port)"
 }
@@ -4981,8 +5068,6 @@ SSHEOF
         fi
     fi
 
-    log "Starting SSH daemon for '$name' on external port $port..."
-
     # The jail's loopback address (or 127.0.0.1 if the jail opted out).
     local jail_lb
     jail_lb="$(jail_loopback_addr "$name")"
@@ -4991,70 +5076,145 @@ SSHEOF
     local have_socat=0
     command -v socat >/dev/null 2>&1 && have_socat=1
 
-    if [ "$have_socat" = 0 ]; then
-        # No redirector available: bind sshd to the external port directly.
-        # The jail then genuinely listens on $port instead of 22.
-        warn "socat not found on the host, so sshd listens on port $port directly (the jail sees the real port, not 22). Install socat to keep port 22 inside the jail."
-        run_in_jail --root "$name" /bin/sh -c "
-            sed -i 's/^Port .*/Port $port/' /etc/ssh/sshd_config
-        " >/dev/null 2>&1 || true
+    # ---- where does sshd ACTUALLY listen? -------------------------------
+    # A rootless jail has fake root, not CAP_NET_BIND_SERVICE, so bind() on
+    # port 22 fails with EACCES however convincing getuid() looks. Three cases:
+    #
+    #   shim + socat : sshd is configured for 22 and BELIEVES it owns 22; the
+    #                  bind() shim moves the real socket to a high port and
+    #                  socat forwards the external port to it. The illusion is
+    #                  complete from inside the jail.
+    #   socat only   : no shim to rewrite the port, so sshd is configured for a
+    #                  high port and socat forwards to that.
+    #   neither      : sshd binds the external port directly.
+    local shim_active=0 internal_port="$port" config_port="$port" mode_desc=""
+    case "$(shim_status "$name")" in
+        host|local) shim_active=1 ;;
+    esac
+
+    if [ "$have_socat" = 1 ]; then
+        internal_port="$(ssh_free_high_port "$port")" \
+            || err "No free internal port in 22100..22199 for the SSH redirector."
+        if [ "$shim_active" = 1 ]; then
+            config_port=22
+            mode_desc="jail believes port 22; real socket on $jail_lb:$internal_port"
+        else
+            config_port="$internal_port"
+            mode_desc="sshd on $jail_lb:$internal_port (no shim, so no port-22 illusion)"
+            warn "The bind() shim is not active for '$name', so sshd cannot be told it owns port 22. Fix with: jroot install $name gcc"
+        fi
+    else
+        internal_port="$port"
+        config_port="$port"
+        mode_desc="sshd bound directly to port $port (no redirector)"
+        warn "socat not found on the host, so sshd listens on port $port directly and the jail sees the real port instead of 22. Install socat for the port-22 illusion."
     fi
+
+    run_in_jail --root "$name" /bin/sh -c "
+        sed -i 's/^Port .*/Port $config_port/' /etc/ssh/sshd_config
+    " >/dev/null 2>&1 || true
+
+    log "Starting SSH daemon for '$name' on external port $port..."
+    log "  ($mode_desc)"
+
+    # sshd's own diagnostics are the only way to see why it refused to start,
+    # so keep them instead of discarding them into /dev/null.
+    local logfile="$JROOT_HOME/pids/$name.sshlog"
+    : > "$logfile" 2>/dev/null || true
 
     # Persistent proot + sshd. sshd runs in the foreground (-D) so proot has a
     # live child and the jail stays up after this command returns.
+    #
+    # `set -m` matters: without job control this background subshell inherits
+    # jroot's OWN process group, and ssh_stop's group kill would then take out
+    # the user's shell along with the daemon. With it, the subshell leads its
+    # own group and the teardown is precisely scoped.
+    local was_monitor=0
+    case "$-" in *m*) was_monitor=1 ;; esac
+    set -m
     (
-        run_in_jail --root "$name" /usr/sbin/sshd -D -e >/dev/null 2>&1 &
-        sshd_pid=$!
-        echo "$sshd_pid" > "$pidfile"
-        wait "$sshd_pid" 2>/dev/null || true
-        rm -f "$pidfile" "$portfile" 2>/dev/null || true
+        if [ "$shim_active" = 1 ] && [ "$config_port" = "22" ]; then
+            export JROOT_PORT_MAP="22=$internal_port"
+        fi
+        run_in_jail --root "$name" /usr/sbin/sshd -D -e >>"$logfile" 2>&1
     ) &
+    local daemon_pid=$!
+    [ "$was_monitor" = 1 ] || set +m
+    echo "$daemon_pid" > "$pidfile"
     disown 2>/dev/null || true
 
-    sleep 1
+    # Wait for the listener rather than guessing with a fixed sleep. The probe
+    # opens the socket and closes it again without sending anything, so sshd
+    # only logs a dropped pre-auth connection rather than a protocol error.
+    local waited=0 listening=0
+    while [ "$waited" -lt 60 ]; do
+        if ! kill -0 "$daemon_pid" 2>/dev/null; then
+            break            # died early - the log will say why
+        fi
+        if (exec 3<>"/dev/tcp/$jail_lb/$internal_port") 2>/dev/null; then
+            listening=1
+            break
+        fi
+        sleep 0.25
+        waited=$(( waited + 1 ))
+    done
 
-    if [ "$have_socat" = 1 ]; then
-        # 0.0.0.0:$port -> jail_lb:22, so the jail keeps believing it is on 22.
-        (
-            socat TCP-LISTEN:"$port",fork,reuseaddr TCP:"$jail_lb":22 >/dev/null 2>&1 &
-            socat_pid=$!
-            echo "$socat_pid" > "$JROOT_HOME/pids/$name.socat"
-            wait "$socat_pid" 2>/dev/null || true
-            rm -f "$JROOT_HOME/pids/$name.socat" 2>/dev/null || true
-        ) &
-        disown 2>/dev/null || true
+    if [ "$listening" != 1 ]; then
+        kill -TERM -"$daemon_pid" 2>/dev/null || kill -TERM "$daemon_pid" 2>/dev/null || true
+        rm -f "$pidfile" "$portfile"
+        warn "sshd did not come up inside '$name'."
+        if [ -s "$logfile" ]; then
+            warn "Last lines of $logfile:"
+            tail -n 12 "$logfile" 2>/dev/null | sed 's/^/         /' >&2
+        else
+            warn "No output was captured. Try it in the foreground to see the error:"
+            warn "  jroot exec $name --root /usr/sbin/sshd -D -e -p $internal_port"
+        fi
+        record_event "$name" "ssh" "FAILED to start on port $port as '$user'"
+        return 1
     fi
 
-    # Verify sshd is actually running
-    sleep 0.5
-    if [ -f "$pidfile" ]; then
-        local started_pid
-        started_pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
-        if kill -0 "$started_pid" 2>/dev/null; then
-            echo "$port" > "$portfile"
-            log "SSH for '$name' is running."
-            if [ "$have_socat" = 1 ]; then
-                log "  External port: $port (0.0.0.0:$port -> jail:22)"
-            else
-                log "  External port: $port (sshd bound directly, no redirector)"
-            fi
-            log "  Connect:       ssh -p $port $user@<host-ip>"
-            if [ "$SSH_OPT_NO_PASSWORD" = "1" ]; then
-                log "  Auth:          public key only (password login disabled)"
-            elif [ -n "$SSH_OPT_KEY" ]; then
-                log "  Auth:          password or public key"
-            else
-                log "  Auth:          password"
-            fi
-            log "  Only '$user' may log in; root login is $permit_root."
-            log "  The jail stays alive in the background for SSH access."
-            record_event "$name" "ssh" "started on port $port as '$user' (root login: $permit_root)"
-            return 0
+    # Host-side redirector: external port -> the socket sshd actually holds.
+    if [ "$have_socat" = 1 ]; then
+        local was_monitor2=0
+        case "$-" in *m*) was_monitor2=1 ;; esac
+        set -m
+        (
+            exec socat TCP-LISTEN:"$port",fork,reuseaddr TCP:"$jail_lb":"$internal_port" \
+                >>"$logfile" 2>&1
+        ) &
+        local socat_pid=$!
+        [ "$was_monitor2" = 1 ] || set +m
+        echo "$socat_pid" > "$JROOT_HOME/pids/$name.socat"
+        disown 2>/dev/null || true
+        sleep 0.3
+        if ! kill -0 "$socat_pid" 2>/dev/null; then
+            kill -TERM -"$daemon_pid" 2>/dev/null || true
+            rm -f "$pidfile" "$portfile" "$JROOT_HOME/pids/$name.socat"
+            warn "The redirector could not bind 0.0.0.0:$port (port already in use?)."
+            [ -s "$logfile" ] && tail -n 6 "$logfile" 2>/dev/null | sed 's/^/         /' >&2
+            record_event "$name" "ssh" "FAILED: redirector could not bind $port"
+            return 1
         fi
     fi
-    warn "sshd may not have started correctly. Check 'jroot ssh $name status'."
+
     echo "$port" > "$portfile"
-    record_event "$name" "ssh" "started on port $port as '$user' (unverified)"
+    printf '%s' "$internal_port" > "$JROOT_HOME/pids/$name.sshinner" 2>/dev/null || true
+
+    log "SSH for '$name' is running."
+    log "  External port: $port  ->  $mode_desc"
+    log "  Connect:       ssh -p $port $user@<host-ip>"
+    if [ "$SSH_OPT_NO_PASSWORD" = "1" ]; then
+        log "  Auth:          public key only (password login disabled)"
+    elif [ -n "$SSH_OPT_KEY" ]; then
+        log "  Auth:          password or public key"
+    else
+        log "  Auth:          password"
+    fi
+    log "  Only '$user' may log in; root login is $permit_root."
+    log "  The jail stays alive in the background for SSH access."
+    record_event "$name" "ssh" "started on port $port as '$user' (root login: $permit_root)"
+    return 0
 }
 
 ssh_usage() {
@@ -5081,7 +5241,7 @@ ssh_usage() {
     printf '\n%bPASSWORDS%b\n' "$H" "$N"
     printf '    There is no default and no hardcoded password. With no flags you are\n'
     printf '    prompted (echo off); press Enter at the prompt to have a 24-character\n'
-    printf '    random one generated and printed %bonce%b. Nothing is stored on the host,\n' "$C_BLD" "$N"
+    printf '    random one generated and printed %bonce%b. Nothing is stored on the host,\n' "$H" "$N"
     printf '    written to the history log, or passed through a command line.\n'
     printf '\n'
     printf '    %bExamples:%b\n' "$H" "$N"
