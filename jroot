@@ -116,7 +116,7 @@ PORT_SHIM_SRC="$BIN_DIR/libjroot.c"
 PORT_SHIM="$BIN_DIR/libjroot.so"
 # Build marker for the shim. Bump it whenever libjroot.c changes so existing
 # .so files - including ones compiled inside a jail - are replaced.
-SHIM_VERSION="jroot-shim-v5"
+SHIM_VERSION="jroot-shim-v6"
 
 # Landlock filesystem access masks, used to compose the JROOT_LANDLOCK rule
 # list consumed by the seccomp launcher (see write_seccomp_launcher).
@@ -557,12 +557,12 @@ build_port_shim() {
 #include <sys/prctl.h>
 #include <grp.h>
 
-/* jroot-shim-v5 */
+/* jroot-shim-v6 */
 
 /* Greppable build marker: jroot compares this against the version it expects,
  * so an upgraded jroot always replaces an older .so (including one built inside
  * a jail). */
-const char jroot_shim_version[] = "jroot-shim-v5";
+const char jroot_shim_version[] = "jroot-shim-v6";
 
 /* Pin dlsym() to the oldest symbol version the platform has. Since glibc 2.34
  * the dl* functions live in libc.so.6 and a plain reference records
@@ -1295,6 +1295,36 @@ int initgroups(const char *user, gid_t group) {
     if (fake_privsep()) return 0;
     if (!real) { errno = ENOSYS; return -1; }
     return real(user, group);
+}
+
+/* audit_open() is libaudit's handle onto the kernel audit netlink socket.
+ * Ubuntu builds OpenSSH with --with-audit=linux, and after a SUCCESSFUL
+ * password check sshd records the login:
+ *     linux_audit_write_entry failed: Unknown error -1
+ *     Connection to <host> closed.
+ * The session dies at the last moment, which looks like an auth failure but is
+ * not - the log shows "Accepted password" immediately before it.
+ *
+ * Writing audit records needs CAP_AUDIT_WRITE, which a rootless jail does not
+ * have, and OpenSSH treats the failure as fatal to avoid an unaudited login.
+ * It does, however, have an explicit "this kernel has no audit support" path:
+ * audit_open() failing with EINVAL, EPROTONOSUPPORT or EAFNOSUPPORT is accepted
+ * and the login continues. Reporting EPROTONOSUPPORT is therefore both honest -
+ * this jail genuinely has no usable audit subsystem - and exactly what OpenSSH
+ * is already written to cope with.
+ *
+ * Only ever done under JROOT_FAKE_PRIVSEP, i.e. for the sshd `jroot ssh`
+ * starts; every other process keeps the real libaudit. */
+typedef int (*audit_open_fn)(void);
+
+int audit_open(void) {
+    static audit_open_fn real = NULL;
+    if (!real) real = (audit_open_fn)dlsym(RTLD_NEXT, "audit_open");
+    if (fake_privsep() || !real) {
+        errno = EPROTONOSUPPORT;
+        return -1;
+    }
+    return real();
 }
 
 /* ---- deny layer (read side): make jroot internals look non-existent ---- */
@@ -5317,6 +5347,10 @@ SSHEOF
     # is still in hand.
     local banner=""
     banner="$(ssh_banner_probe 127.0.0.1 "$port")"
+    # Those probes appear in the log as dropped connections. Say so, so the first
+    # thing anyone reads in `jroot ssh <name> log` is not a mystery failure.
+    printf '%s\n' "--- connections above this line are jroot's own startup probes ---" \
+        >> "$logfile" 2>/dev/null || true
     case "$banner" in
         SSH-*)
             : # healthy
@@ -5449,7 +5483,7 @@ cmd_ssh() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            start|stop|status|passwd|log) op="$1" ;;
+            start|stop|status|passwd|log|logs) op="$1"; [ "$op" = "logs" ] && op="log" ;;
             --port=*)          SSH_OPT_PORT="${1#*=}" ;;
             -p)                shift; SSH_OPT_PORT="$1" ;;
             --user=*)          SSH_OPT_USER="${1#*=}" ;;

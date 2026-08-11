@@ -477,52 +477,59 @@ jroot ssh dev start
 jroot ssh dev start 20022
 jroot ssh dev start --port=20022
 
-# Check status
+# Check status (also verifies the handshake, not just the socket)
 jroot ssh dev status
 
 # Rotate the password
 jroot ssh dev passwd
 
+# Read sshd's own log
+jroot ssh dev log
+
 # Stop
 jroot ssh dev stop
 ```
 
-### Why port 22 needs a trick
+### Ports
 
-A rootless jail has *fake* root, not `CAP_NET_BIND_SERVICE`. `getuid()` returns 0, but the kernel still sees your unprivileged host UID, so `bind()` on any port below 1024 fails with `EACCES` — `sshd` on port 22 simply cannot start.
-
-JRoot keeps the illusion intact anyway. `sshd` is configured for port 22, logs port 22, and reports port 22 to anything asking inside the jail; the `bind()` shim silently moves the real socket to a high port, and `socat` on the host forwards the external port to it.
+`sshd` binds the port directly on `0.0.0.0`. The port is added to the jail's public list, so the `bind()` shim leaves it there instead of pinning it to the jail's loopback address — no redirector process, nothing to keep in sync.
 
 ```text
 Remote client
-     │
      │  ssh -p 22001 jail@host
      ▼
 ┌────────────────────────────────────────────┐
-│ HOST                                       │
-│   socat  0.0.0.0:22001                     │
-│              │                             │
-│              ▼                             │
-│   127.2.0.1:22122   ← the real socket      │
-└──────────────┬─────────────────────────────┘
-               │  bind() shim rewrote the port
-               ▼
-┌────────────────────────────────────────────┐
-│ JAIL                                       │
-│   sshd -D   "Port 22"                      │
-│   believes it owns port 22                 │
+│ JAIL   sshd -D   0.0.0.0:22001             │
+│        (persistent proot, own pgroup)      │
 └────────────────────────────────────────────┘
 ```
 
-The shim's mapping is generic (`JROOT_PORT_MAP="from=to"`), so the same mechanism lets any privileged-port service — 80, 443, 25 — run unmodified inside a rootless jail.
+The port must be **above 1024**. Fake root is not `CAP_NET_BIND_SERVICE`: `getuid()` returns 0, but the kernel still sees your unprivileged host UID, so `bind()` below 1024 fails with `EACCES`. JRoot refuses such a port with a suggestion rather than starting a daemon that cannot listen.
 
-Degradation is explicit rather than silent:
+> The shim *can* remap a port a service insists on (`JROOT_PORT_MAP="80=8080"`, useful for daemons with a hardcoded privileged port), but remapping does not make the low port reachable, so `jroot ssh` does not use it.
 
-| Host has | Result |
-| --- | --- |
-| shim + `socat` | `sshd` believes it owns port 22; real socket on a high port |
-| `socat` only | `sshd` is configured for a high port (no port-22 illusion), still reachable at the external port |
-| neither | `sshd` binds the external port directly |
+### Privilege separation
+
+This one is worth knowing about. OpenSSH's pre-auth child hardens itself by chrooting into an empty directory:
+
+```text
+chroot("/run/sshd"): Operation not permitted [preauth]
+```
+
+`chroot(2)` requires `CAP_SYS_CHROOT`, which fake root does not provide, and OpenSSH **removed `UsePrivilegeSeparation` in 7.5** — so it cannot be configured off. The symptom is brutal: the daemon starts, accepts the TCP connection, then closes it before sending its version banner, and the client only says `Connection closed by <host> port <port>`.
+
+JRoot starts `sshd` with `JROOT_FAKE_PRIVSEP=1`, which makes the shim report success for exactly those self-confinement steps:
+
+| Call | Faked | Why |
+| --- | --- | --- |
+| `chroot()` | → `0` | proot already confines the filesystem |
+| `prctl(PR_SET_SECCOMP)` | → `0` | JRoot installed its own filter before proot |
+| `setgroups()` / `initgroups()` | → `0` | no supplementary groups to drop |
+| `prctl(PR_SET_NO_NEW_PRIVS)` | **not faked** | it works, and it costs nothing |
+
+This is a scoped trade, and it is worth being precise about what it costs: it removes a layer of **sshd's own** defence in depth, not a layer of the jail. The rootfs boundary still comes from proot, the syscall filter from JRoot's seccomp launcher, and the path allowlist from Landlock. The variable is opt-in — `jroot ssh` sets it for the `sshd` it starts and nothing else does.
+
+Because the shim is what makes this work, a jail without a working shim cannot run `sshd`. JRoot says so explicitly and points at `jroot install <name> gcc`.
 
 ### Passwords
 
@@ -556,32 +563,38 @@ JRoot refuses a private key by mistake and checks the file actually looks like a
 
 - `PermitRootLogin no` unless the login account *is* root, or you pass `--permit-root`
 - `AllowUsers <the one account>` — nothing else can log in
-- `PermitEmptyPasswords no`, `MaxAuthTries 4`, `LoginGraceTime 30`
+- `PermitEmptyPasswords no`, `MaxAuthTries 4`, `LoginGraceTime 60`
 - `PasswordAuthentication no` when `--no-password` is used
+- `StrictModes no` and `UseDNS no` — both for proot-specific reasons: `StrictModes` rejects logins over home-directory ownership that a fake-root rootfs reports oddly, and `UseDNS` stalls every connection when the jail has no working resolver
+- `LogLevel VERBOSE`, so the log is worth reading when something breaks
 
-The login account defaults to `jail` for unroot jails and `root` for root jails; `--user=<name>` overrides it and the account is created if it does not exist. Only that account is unlocked — in an unroot jail, root stays locked.
+JRoot targets OpenSSH 7.2 (Ubuntu 16.04) through 9.x, and an unrecognised keyword is *fatal* rather than a warning. Instead of guessing per release, JRoot runs `sshd -t`, comments out whatever line it objects to, and repeats — so a deprecated keyword degrades into a comment instead of a daemon that will not start.
+
+The login account defaults to `jail` for unroot jails and `root` for root jails; `--user=<name>` overrides it and the account is created if it does not exist. Only that account is unlocked — in an unroot jail, root stays locked. The unprivileged `sshd` privsep account is created too if the package's postinst failed to (which happens routinely under proot).
 
 ### Lifecycle
 
 - The jail runs as a **persistent background daemon** (proot + `sshd -D`) in its own process group, so it survives closing your terminal, and stopping it cannot take your shell down with it.
-- Startup waits for the socket to actually accept connections instead of sleeping and hoping. If `sshd` dies, JRoot says so and prints the tail of `~/.jroot/pids/<name>.sshlog` rather than reporting success.
+- Startup waits for the socket to accept connections, **then reads the SSH banner**. A listening socket is not a working daemon — reading the banner is what catches a privsep failure at start time instead of leaving you with `Connection closed`.
+- `jroot ssh <name> status` re-runs that handshake check, so it reports `FAILING` rather than `running` when the daemon is broken.
 - `jroot ps` lists SSH daemons alongside interactive shells; `jroot rm` stops the daemon first.
 
 ```bash
 $ jroot ssh dev start --random-password
 [+] Ensuring openssh-server is installed in 'dev'...
-[+] Starting SSH daemon for 'dev' on external port 22001...
-[+]   (jail believes port 22; real socket on 127.2.0.1:22122)
 
   Generated SSH password for jail:  7Kq2mXvB9pLdR4tYwZ3nHcFs
   Write it down now. It is not stored anywhere and cannot be shown again.
   Replace it any time with: jroot ssh dev passwd
 
+[+] Starting SSH daemon for 'dev' on port 22001...
 [+] SSH for 'dev' is running.
-[+]   External port: 22001  ->  jail believes port 22; real socket on 127.2.0.1:22122
+[+]   Port:          22001  (sshd listening on 0.0.0.0:22001)
 [+]   Connect:       ssh -p 22001 jail@<host-ip>
 [+]   Auth:          password
 [+]   Only 'jail' may log in; root login is no.
+[+]   Handshake:     verified (SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.16)
+[+]   sshd log:      /home/user/.jroot/pids/dev.sshlog
 [+]   The jail stays alive in the background for SSH access.
 
 $ jroot ps
@@ -589,7 +602,7 @@ JAIL             PID      TYPE   COMMAND
 dev              54321    sshd   port 22001
 ```
 
-**Requirements:** `openssh-server` is installed inside the jail automatically on first start. On the host, `socat` gives you the port-22 illusion, and `gcc` is needed once so the shim can be built (`jroot doctor` reports both).
+**Requirements:** `openssh-server` is installed inside the jail automatically on first start. On the host, `gcc` is needed once so the shim can be built — without it `sshd`'s `chroot()` cannot be faked and the daemon will not complete a handshake. `jroot doctor` reports whether the shim is active per jail.
 
 ---
 
