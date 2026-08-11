@@ -116,7 +116,7 @@ PORT_SHIM_SRC="$BIN_DIR/libjroot.c"
 PORT_SHIM="$BIN_DIR/libjroot.so"
 # Build marker for the shim. Bump it whenever libjroot.c changes so existing
 # .so files - including ones compiled inside a jail - are replaced.
-SHIM_VERSION="jroot-shim-v3"
+SHIM_VERSION="jroot-shim-v4"
 
 # Landlock filesystem access masks, used to compose the JROOT_LANDLOCK rule
 # list consumed by the seccomp launcher (see write_seccomp_launcher).
@@ -555,12 +555,12 @@ build_port_shim() {
 #include <stdarg.h>
 #include <dirent.h>
 
-/* jroot-shim-v3 */
+/* jroot-shim-v4 */
 
 /* Greppable build marker: jroot compares this against the version it expects,
  * so an upgraded jroot always replaces an older .so (including one built inside
  * a jail). */
-const char jroot_shim_version[] = "jroot-shim-v3";
+const char jroot_shim_version[] = "jroot-shim-v4";
 
 /* Pin dlsym() to the oldest symbol version the platform has. Since glibc 2.34
  * the dl* functions live in libc.so.6 and a plain reference records
@@ -2576,10 +2576,14 @@ run_in_jail() {
         #                 processes. The seccomp launcher overwrites it with
         #                 proot's pid, which is tighter; this value (jroot's own
         #                 pid) is the fallback for hosts without python3.
+        # JROOT_PORT_MAP  rewrites the port a listener asks for (see `jroot ssh`:
+        #                 a rootless jail cannot bind 22, so sshd is told 22 and
+        #                 the shim quietly puts it on a high port instead).
         set -- /usr/bin/env LD_PRELOAD=/usr/local/lib/libjroot.so \
             JROOT_PORTS="${jail_ports:-}" \
             JROOT_LOOPBACK="${jail_lb:-}" \
             JROOT_PROC_ROOT="${JROOT_PROC_ROOT:-$$}" \
+            JROOT_PORT_MAP="${JROOT_PORT_MAP:-}" \
             JROOT_RO_MOUNTS="${ro_mounts#:}" "$@"
     fi
 
@@ -4430,14 +4434,26 @@ cmd_which() {
 }
 
 # ---------------------------------------------------------------------------
-# jroot ssh <name> start|stop|status [--port|-p <port>|<port>]
+# jroot ssh <name> start|stop|status|passwd [flags]
 #
 # Starts an SSH daemon inside the jail via a PERSISTENT background proot
 # instance (so the jail keeps running even after the user exits their
 # interactive shell). The jail thinks sshd listens on port 22, but the host
 # redirects an external port (default: auto 2200xx) to the jail's loopback
-# address. This means the jail is reachable at:
-#   ssh -p <port> jail@<host-ip>
+# address.
+#
+# CREDENTIALS - the design rules, because this is a network-facing service:
+#   * No password is ever hardcoded, defaulted, or reused across jails.
+#   * The plaintext password is NEVER written to the host filesystem, never
+#     placed in a command line (argv is world-readable via /proc on the host),
+#     and never recorded in the jail history log. It reaches `chpasswd` only
+#     through a pipe on stdin.
+#   * If the caller gives nothing, jroot prompts with echo off. In a
+#     non-interactive run it generates a strong random password and prints it
+#     exactly once - it cannot be recovered afterwards, only replaced.
+#   * `--password=` exists for automation but warns, because the value lands
+#     in shell history and is briefly visible in the host's process list.
+#   * root login over SSH is refused unless explicitly asked for.
 #
 # Auto-port: 22001, 22002, ... picking the first one that is not already
 # in use by another jail's SSH or occupied on the host.
@@ -4482,9 +4498,144 @@ ssh_auto_port() {
     return 1
 }
 
+# The account SSH logins should use, unless --user says otherwise. An unroot
+# jail already has the non-root 'jail' user as its daily identity, so that is
+# the natural SSH account; a root jail has only root.
+ssh_default_user() {
+    local name="$1" user_mode
+    user_mode="$(config_field "$CONFIGS_DIR/$name.json" user)"
+    if [ "$user_mode" = "unroot" ]; then
+        printf 'jail'
+    else
+        printf 'root'
+    fi
+}
+
+# A strong random password, printed once and never stored. Tries the best
+# available source and falls back through them rather than silently producing
+# something weak.
+ssh_random_password() {
+    local pw=""
+    if command -v python3 >/dev/null 2>&1; then
+        pw="$(python3 -c 'import secrets,string
+a=string.ascii_letters+string.digits
+print("".join(secrets.choice(a) for _ in range(24)))' 2>/dev/null || true)"
+    fi
+    if [ -z "$pw" ] && command -v openssl >/dev/null 2>&1; then
+        pw="$(openssl rand -base64 32 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-24 || true)"
+    fi
+    if [ -z "$pw" ] && [ -r /dev/urandom ]; then
+        pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 24 || true)"
+    fi
+    [ -n "$pw" ] || return 1
+    printf '%s' "$pw"
+}
+
+# Prompt for a password twice with echo off. Writes prompts to stderr so the
+# password itself is the only thing on stdout.
+ssh_prompt_password() {
+    local user="$1" pw1 pw2
+    [ -t 0 ] || return 1
+    while true; do
+        printf 'New SSH password for %s (not echoed, empty = generate one): ' "$user" >&2
+        read -rs pw1 || { printf '\n' >&2; return 1; }
+        printf '\n' >&2
+        if [ -z "$pw1" ]; then
+            return 1   # caller falls back to a generated password
+        fi
+        printf 'Repeat password: ' >&2
+        read -rs pw2 || { printf '\n' >&2; return 1; }
+        printf '\n' >&2
+        if [ "$pw1" != "$pw2" ]; then
+            warn "Passwords do not match. Try again."
+            continue
+        fi
+        if [ "${#pw1}" -lt 8 ]; then
+            warn "That password is ${#pw1} characters. This service can be reachable from the network - 12+ is strongly recommended."
+            local yn
+            printf 'Use it anyway? [y/N]: ' >&2
+            read -r yn || yn="N"
+            case "$yn" in y|Y|yes|YES) ;; *) continue ;; esac
+        fi
+        printf '%s' "$pw1"
+        return 0
+    done
+}
+
+# ssh_set_password <jail> <user> - password arrives on STDIN, never in argv.
+# Tries chpasswd, then passwd fed twice, then a host-computed SHA-512 hash
+# written straight into /etc/shadow. Returns non-zero only if all three fail.
+ssh_set_password() {
+    local name="$1" user="$2" pw
+    IFS= read -r pw || true
+    [ -n "$pw" ] || return 1
+
+    # 1) chpasswd reads "user:password" from stdin (shadow-utils and busybox).
+    if printf '%s:%s\n' "$user" "$pw" \
+        | run_in_jail --root "$name" /bin/sh -c 'chpasswd 2>/dev/null' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # 2) passwd, fed the password twice.
+    if printf '%s\n%s\n' "$pw" "$pw" \
+        | run_in_jail --root "$name" /bin/sh -c "passwd '$user' >/dev/null 2>&1"; then
+        return 0
+    fi
+
+    # 3) Hash on the host, then rewrite the shadow entry. crypt() lives in the
+    # host's libc here, so the hash is portable to the jail's /etc/shadow.
+    local hash=""
+    if command -v python3 >/dev/null 2>&1; then
+        hash="$(printf '%s' "$pw" | python3 -c '
+import crypt, sys
+try:
+    print(crypt.crypt(sys.stdin.read(), crypt.mksalt(crypt.METHOD_SHA512)))
+except Exception:
+    pass' 2>/dev/null || true)"
+    fi
+    if [ -z "$hash" ] && command -v openssl >/dev/null 2>&1; then
+        hash="$(printf '%s' "$pw" | openssl passwd -6 -stdin 2>/dev/null || true)"
+    fi
+    [ -n "$hash" ] || return 1
+    printf '%s' "$hash" | run_in_jail --root "$name" /bin/sh -c "
+        IFS= read -r h
+        [ -n \"\$h\" ] || exit 1
+        [ -f /etc/shadow ] || exit 1
+        awk -v u='$user' -v h=\"\$h\" -F: 'BEGIN{OFS=\":\"} \$1==u{\$2=h} {print}' \
+            /etc/shadow > /etc/shadow.jroot.new 2>/dev/null || exit 1
+        grep -q \"^$user:\" /etc/shadow.jroot.new || { rm -f /etc/shadow.jroot.new; exit 1; }
+        cat /etc/shadow.jroot.new > /etc/shadow
+        rm -f /etc/shadow.jroot.new
+        chmod 640 /etc/shadow 2>/dev/null || true
+    " >/dev/null 2>&1
+}
+
+# Install a public key into <user>'s authorized_keys inside the jail.
+ssh_install_key() {
+    local name="$1" user="$2" keyfile="$3"
+    [ -f "$keyfile" ] || err "Public key file not found: $keyfile"
+    case "$(head -c 4 "$keyfile" 2>/dev/null)" in
+        ssh-|ecds|sk-s) ;;
+        *) grep -qE '^(ssh|ecdsa|sk)-' "$keyfile" 2>/dev/null \
+               || err "$keyfile does not look like an OpenSSH public key. Point --key at a .pub file, not a private key." ;;
+    esac
+    grep -q 'PRIVATE KEY' "$keyfile" 2>/dev/null \
+        && err "$keyfile is a PRIVATE key. Use the matching .pub file instead."
+    local home
+    if [ "$user" = "root" ]; then home="/root"; else home="/home/$user"; fi
+    cat "$keyfile" | run_in_jail --root "$name" /bin/sh -c "
+        mkdir -p '$home/.ssh' 2>/dev/null || exit 1
+        cat >> '$home/.ssh/authorized_keys' || exit 1
+        chmod 700 '$home/.ssh' 2>/dev/null || true
+        chmod 600 '$home/.ssh/authorized_keys' 2>/dev/null || true
+        chown -R '$user' '$home/.ssh' 2>/dev/null || true
+    " >/dev/null 2>&1 || return 1
+    return 0
+}
+
 ssh_status() {
     local name="$1"
-    local pidfile portfile pid port
+    local pidfile portfile pid port user auth
     pidfile="$(ssh_pid_file "$name")"
     portfile="$(ssh_port_file "$name")"
     if [ ! -f "$pidfile" ]; then
@@ -4498,9 +4649,15 @@ ssh_status() {
         return 1
     fi
     port="$(cat "$portfile" 2>/dev/null || echo '?')"
+    user="$(config_field "$CONFIGS_DIR/$name.json" ssh_user)"
+    [ -n "$user" ] || user="$(ssh_default_user "$name")"
+    auth="$(config_field "$CONFIGS_DIR/$name.json" ssh_auth)"
     log "SSH for '$name': running (pid $pid, port $port)"
-    printf '  Connect: ssh -p %s jail@<host-ip>\n' "$port"
-    printf '  Or locally: ssh -p %s jail@127.0.0.1\n' "$port"
+    printf '  login user:  %s\n' "$user"
+    printf '  auth:        %s\n' "${auth:-password}"
+    printf '  connect:     ssh -p %s %s@<host-ip>\n' "$port" "$user"
+    printf '  locally:     ssh -p %s %s@127.0.0.1\n' "$port" "$user"
+    printf '  new password: jroot ssh %s passwd\n' "$name"
     return 0
 }
 
@@ -4530,13 +4687,92 @@ ssh_stop() {
             kill -KILL "$pid" 2>/dev/null || true
         fi
     fi
+    # Stop the host-side redirector too, or the port stays bound.
+    local socatfile="$JROOT_HOME/pids/$name.socat" socat_pid
+    if [ -f "$socatfile" ]; then
+        socat_pid="$(cat "$socatfile" 2>/dev/null | tr -d ' ')"
+        [ -n "$socat_pid" ] && kill -TERM "$socat_pid" 2>/dev/null || true
+        sleep 0.2
+        [ -n "$socat_pid" ] && kill -KILL "$socat_pid" 2>/dev/null || true
+        rm -f "$socatfile"
+    fi
     rm -f "$pidfile" "$portfile"
     log "SSH for '$name' stopped."
     record_event "$name" "ssh" "stopped (was port $port)"
 }
 
+# Resolve the requested credential into an actual password and apply it.
+# Echoes nothing sensitive to the log; the generated case is the only time a
+# password is printed, and it is printed for the user, once.
+# Args: <jail> <user> <mode> <value>
+#   mode: prompt | stdin | arg | random | keep
+ssh_apply_credential() {
+    local name="$1" user="$2" mode="$3" value="$4" pw="" generated=0
+
+    case "$mode" in
+        keep)
+            return 0
+            ;;
+        arg)
+            pw="$value"
+            warn "A password passed on the command line is visible in your shell history and, briefly, in the host's process list. Prefer 'jroot ssh $name start' and the prompt, or --password-stdin."
+            ;;
+        stdin)
+            IFS= read -r pw || true
+            [ -n "$pw" ] || err "--password-stdin was given but stdin was empty."
+            ;;
+        random)
+            pw="$(ssh_random_password)" || err "Could not generate a password (no python3, openssl, or /dev/urandom)."
+            generated=1
+            ;;
+        prompt)
+            if pw="$(ssh_prompt_password "$user")"; then
+                :
+            else
+                pw="$(ssh_random_password)" || err "Could not generate a password (no python3, openssl, or /dev/urandom)."
+                generated=1
+            fi
+            ;;
+    esac
+
+    [ -n "$pw" ] || err "Empty password refused."
+    if [ "${#pw}" -lt 8 ] && [ "$mode" != "prompt" ]; then
+        warn "That password is only ${#pw} characters and this service can be reachable from the network."
+    fi
+
+    printf '%s\n' "$pw" | ssh_set_password "$name" "$user" \
+        || err "Could not set the password for '$user' inside '$name'. Is the shadow suite installed? Try: jroot install $name passwd"
+
+    if [ "$generated" = 1 ]; then
+        printf '\n'
+        printf '%b  Generated SSH password for %s:%b  %b%s%b\n' "$C_YEL" "$user" "$C_NC" "$C_BLD" "$pw" "$C_NC"
+        printf '%b  Write it down now. It is not stored anywhere and cannot be shown again.%b\n' "$D" "$N"
+        printf '%b  Replace it any time with: jroot ssh %s passwd%b\n' "$D" "$name" "$N"
+        printf '\n'
+    else
+        log "Password set for '$user' in '$name'."
+    fi
+    # Provenance only - never the secret itself.
+    record_event "$name" "ssh" "password set for '$user' (source: $mode)"
+    return 0
+}
+
+ssh_passwd() {
+    # jroot ssh <name> passwd [user] - rotate the SSH password.
+    local name="$1" user="$2" mode="$3" value="$4"
+    [ -n "$user" ] || user="$(config_field "$CONFIGS_DIR/$name.json" ssh_user)"
+    [ -n "$user" ] || user="$(ssh_default_user "$name")"
+    run_in_jail --root "$name" /bin/sh -c "id '$user' >/dev/null 2>&1" >/dev/null 2>&1 \
+        || err "User '$user' does not exist inside '$name'. Create it first, or pick another with 'jroot ssh $name passwd <user>'."
+    [ -n "$mode" ] || mode="prompt"
+    ssh_apply_credential "$name" "$user" "$mode" "$value"
+}
+
 ssh_start() {
-    local name="$1" want_port="$2"
+    # Options arrive as globals set by cmd_ssh so this stays readable:
+    #   SSH_OPT_PORT SSH_OPT_USER SSH_OPT_PW_MODE SSH_OPT_PW_VALUE
+    #   SSH_OPT_KEY SSH_OPT_PERMIT_ROOT SSH_OPT_NO_PASSWORD
+    local name="$1"
     local cfg="$CONFIGS_DIR/$name.json"
     local rootfs="$ROOTS_DIR/$name"
     local pidfile portfile
@@ -4559,13 +4795,32 @@ ssh_start() {
 
     # Resolve port
     local port
-    if [ -n "$want_port" ]; then
-        port="$want_port"
+    if [ -n "$SSH_OPT_PORT" ]; then
+        port="$SSH_OPT_PORT"
     else
         port="$(ssh_auto_port)" || err "No free SSH port in range ${SSH_BASE_PORT}..$(( SSH_BASE_PORT + 98 )). Specify one manually."
     fi
     [[ "$port" =~ ^[0-9]+$ ]] || err "Port must be a number, got '$port'"
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || err "Port out of range: $port"
+
+    # Resolve the login account.
+    local user="$SSH_OPT_USER"
+    [ -n "$user" ] || user="$(ssh_default_user "$name")"
+    [[ "$user" =~ ^[a-z_][a-z0-9_-]*$ ]] || err "Invalid SSH user name: '$user'"
+
+    # Credentials must be settled BEFORE the daemon is exposed to the network.
+    local pw_mode="$SSH_OPT_PW_MODE"
+    if [ "$SSH_OPT_NO_PASSWORD" = "1" ]; then
+        [ -n "$SSH_OPT_KEY" ] || err "--no-password disables password login, so a key is required. Add --key=<path-to-.pub>."
+        pw_mode="keep"
+    elif [ -z "$pw_mode" ]; then
+        # Nothing specified: prompt when we can, generate when we cannot.
+        if [ -t 0 ] && [ -z "${NONINTERACTIVE:-}" ]; then
+            pw_mode="prompt"
+        else
+            pw_mode="random"
+        fi
+    fi
 
     # Detect distro
     local image_tag distro
@@ -4578,7 +4833,7 @@ ssh_start() {
         run_in_jail --root "$name" /bin/sh -c '
             command -v sshd >/dev/null 2>&1 && exit 0
             apk update >/dev/null 2>&1
-            apk add --no-cache openssh-server openssh-sftp-server >/dev/null 2>&1
+            apk add --no-cache openssh-server openssh-sftp-server shadow >/dev/null 2>&1
         ' || warn "Could not install openssh-server inside '$name'."
     else
         run_in_jail --root "$name" /bin/sh -c '
@@ -4597,43 +4852,86 @@ ssh_start() {
         [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q
     ' 2>/dev/null || warn "Could not generate SSH host keys."
 
-    # Configure sshd to listen on port 22 inside the jail, allow password auth
-    run_in_jail --root "$name" /bin/sh -c '
+    # Make sure the login account exists before we try to give it a password.
+    if [ "$user" != "root" ]; then
+        run_in_jail --root "$name" /bin/sh -c "
+            id '$user' >/dev/null 2>&1 && exit 0
+            useradd -m -s /bin/bash '$user' 2>/dev/null \
+                || adduser -D -s /bin/bash '$user' 2>/dev/null \
+                || exit 1
+        " >/dev/null 2>&1 || warn "Could not create user '$user' inside '$name'."
+    fi
+
+    # sshd config. Root login and password auth are both opt-in rather than
+    # inherited defaults: an exposed port with PermitRootLogin yes and a
+    # guessable password is exactly the failure mode this command must not have.
+    local permit_root="no" password_auth="yes"
+    [ "$SSH_OPT_PERMIT_ROOT" = "1" ] && permit_root="yes"
+    [ "$user" = "root" ] && permit_root="yes"
+    [ "$SSH_OPT_NO_PASSWORD" = "1" ] && password_auth="no"
+
+    run_in_jail --root "$name" /bin/sh -c "
         mkdir -p /etc/ssh /run/sshd
         chmod 755 /run/sshd
         cat > /etc/ssh/sshd_config << SSHEOF
 Port 22
 ListenAddress 0.0.0.0
-PermitRootLogin yes
-PasswordAuthentication yes
+PermitRootLogin $permit_root
+PasswordAuthentication $password_auth
+PubkeyAuthentication yes
+PermitEmptyPasswords no
 ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 UsePAM no
+MaxAuthTries 4
+LoginGraceTime 30
+AllowUsers $user
 Subsystem sftp /usr/lib/openssh/sftp-server
 PidFile /run/sshd/sshd.pid
 SSHEOF
-        # Alpine uses a different sftp path
+        # Alpine keeps sftp-server elsewhere.
         if [ -f /usr/lib/ssh/sftp-server ]; then
-            sed -i "s|/usr/lib/openssh/sftp-server|/usr/lib/ssh/sftp-server|" /etc/ssh/sshd_config
+            sed -i 's|/usr/lib/openssh/sftp-server|/usr/lib/ssh/sftp-server|' /etc/ssh/sshd_config
         fi
-    ' 2>/dev/null || warn "Could not configure sshd."
+    " 2>/dev/null || warn "Could not configure sshd."
 
-    # Set a password for the jail user if none is set
-    local user_mode
-    user_mode="$(config_field "$cfg" user)"; [ -n "$user_mode" ] || user_mode="root"
-    run_in_jail --root "$name" /bin/sh -c '
-        # Ensure user "jail" exists and has a password (default: "jail")
-        id jail >/dev/null 2>&1 || useradd -m -s /bin/bash jail 2>/dev/null || adduser -D -s /bin/bash jail 2>/dev/null || true
-        echo "jail:jail" | chpasswd 2>/dev/null || true
-        echo "root:root" | chpasswd 2>/dev/null || true
-        # Unlock root for sshd
-        passwd -u root 2>/dev/null || sed -i "s/^root:!/root:*/" /etc/shadow 2>/dev/null || true
-    ' 2>/dev/null || warn "Could not set SSH user passwords."
+    # Apply the credential. Errors here abort the start: a jail must never end
+    # up listening with an unset or inherited password. stdin is left alone -
+    # 'prompt' needs the terminal and 'stdin' needs the pipe.
+    ssh_apply_credential "$name" "$user" "$pw_mode" "$SSH_OPT_PW_VALUE"
+
+    # Optional public key.
+    if [ -n "$SSH_OPT_KEY" ]; then
+        if ssh_install_key "$name" "$user" "$SSH_OPT_KEY"; then
+            log "Installed public key for '$user' from $SSH_OPT_KEY"
+            record_event "$name" "ssh" "authorized_key added for '$user'"
+        else
+            err "Could not install the public key into '$name'."
+        fi
+    fi
+
+    # Unlock the login account so sshd will accept it, and leave every other
+    # account exactly as it was - in particular, root stays locked in unroot
+    # jails unless root is the account being used.
+    run_in_jail --root "$name" /bin/sh -c "
+        passwd -u '$user' >/dev/null 2>&1 || true
+        usermod -U '$user' >/dev/null 2>&1 || true
+    " >/dev/null 2>&1 || true
+
+    # Remember the login account and auth method (never the password).
+    set_config_field "$cfg" ssh_user "$user" >/dev/null 2>&1 || true
+    if [ "$SSH_OPT_NO_PASSWORD" = "1" ]; then
+        set_config_field "$cfg" ssh_auth "key-only" >/dev/null 2>&1 || true
+    elif [ -n "$SSH_OPT_KEY" ]; then
+        set_config_field "$cfg" ssh_auth "password+key" >/dev/null 2>&1 || true
+    else
+        set_config_field "$cfg" ssh_auth "password" >/dev/null 2>&1 || true
+    fi
 
     # Make sure the port is exposed publicly for this jail
     local cur_ports
     cur_ports="$(config_ports "$cfg")"
     if ! echo ",$cur_ports," | grep -q ",$port,"; then
-        # Add the external port to the public list so socat can bind it
         if [ -n "$cur_ports" ]; then
             set_config_ports "$cfg" $(echo "$cur_ports,$port" | tr ',' ' ') >/dev/null 2>&1
         else
@@ -4641,73 +4939,43 @@ SSHEOF
         fi
     fi
 
-    # Start proot in the background running sshd in the foreground.
-    # Then socat on the host redirects external_port -> jail_loopback:22
-    # This way the jail thinks sshd is on port 22, while externally it's on $port.
     log "Starting SSH daemon for '$name' on external port $port..."
 
-    # We need a redirector: socat listens on 0.0.0.0:$port and forwards to
-    # the jail's internal sshd on port 22. The jail's sshd runs via proot.
-    # The jail's loopback address (or 127.0.0.1 if off).
+    # The jail's loopback address (or 127.0.0.1 if the jail opted out).
     local jail_lb
     jail_lb="$(jail_loopback_addr "$name")"
     [ -n "$jail_lb" ] || jail_lb="127.0.0.1"
 
-    # Start proot+sshd in background as a daemon
+    local have_socat=0
+    command -v socat >/dev/null 2>&1 && have_socat=1
+
+    if [ "$have_socat" = 0 ]; then
+        # No redirector available: bind sshd to the external port directly.
+        # The jail then genuinely listens on $port instead of 22.
+        warn "socat not found on the host, so sshd listens on port $port directly (the jail sees the real port, not 22). Install socat to keep port 22 inside the jail."
+        run_in_jail --root "$name" /bin/sh -c "
+            sed -i 's/^Port .*/Port $port/' /etc/ssh/sshd_config
+        " >/dev/null 2>&1 || true
+    fi
+
+    # Persistent proot + sshd. sshd runs in the foreground (-D) so proot has a
+    # live child and the jail stays up after this command returns.
     (
-        # This subshell becomes the persistent proot process.
-        # sshd needs to run in the foreground (-D) so proot stays alive.
-        run_in_jail --root "$name" /usr/sbin/sshd -D -e 2>/dev/null &
-        local sshd_pid=$!
+        run_in_jail --root "$name" /usr/sbin/sshd -D -e >/dev/null 2>&1 &
+        sshd_pid=$!
         echo "$sshd_pid" > "$pidfile"
         wait "$sshd_pid" 2>/dev/null || true
         rm -f "$pidfile" "$portfile" 2>/dev/null || true
     ) &
     disown 2>/dev/null || true
 
-    # Give sshd a moment to start
     sleep 1
 
-    # Now start socat as the port redirector: 0.0.0.0:$port -> jail_lb:22
-    # socat must be on the host
-    if ! command -v socat >/dev/null 2>&1; then
-        warn "socat not found on host. Installing alternative: using bash /dev/tcp redirector."
-        # Fallback: use a simple shell-based TCP redirector
+    if [ "$have_socat" = 1 ]; then
+        # 0.0.0.0:$port -> jail_lb:22, so the jail keeps believing it is on 22.
         (
-            while true; do
-                # Simple accept loop using bash built-ins is not practical.
-                # Without socat, we bind sshd directly to the external port.
-                sleep 86400
-            done
-        ) &
-        disown 2>/dev/null || true
-        # Without socat, reconfigure sshd to listen on $port directly inside the jail
-        warn "No socat available. Configuring sshd to listen on port $port directly."
-        run_in_jail --root "$name" /bin/sh -c "
-            sed -i 's/^Port .*/Port $port/' /etc/ssh/sshd_config
-        " 2>/dev/null
-        # Kill the already-started sshd and restart with the new port
-        if [ -f "$pidfile" ]; then
-            local old_sshd
-            old_sshd="$(cat "$pidfile" 2>/dev/null)"
-            kill -TERM "$old_sshd" 2>/dev/null || true
-            sleep 0.3
-        fi
-        (
-            run_in_jail --root "$name" /usr/sbin/sshd -D -e 2>/dev/null &
-            local sshd_pid=$!
-            echo "$sshd_pid" > "$pidfile"
-            wait "$sshd_pid" 2>/dev/null || true
-            rm -f "$pidfile" "$portfile" 2>/dev/null || true
-        ) &
-        disown 2>/dev/null || true
-        sleep 1
-    else
-        # socat redirector: listens on 0.0.0.0:$port, forwards to jail_lb:22
-        (
-            socat TCP-LISTEN:"$port",fork,reuseaddr TCP:"$jail_lb":22 2>/dev/null &
-            local socat_pid=$!
-            # Store socat pid alongside
+            socat TCP-LISTEN:"$port",fork,reuseaddr TCP:"$jail_lb":22 >/dev/null 2>&1 &
+            socat_pid=$!
             echo "$socat_pid" > "$JROOT_HOME/pids/$name.socat"
             wait "$socat_pid" 2>/dev/null || true
             rm -f "$JROOT_HOME/pids/$name.socat" 2>/dev/null || true
@@ -4723,56 +4991,122 @@ SSHEOF
         if kill -0 "$started_pid" 2>/dev/null; then
             echo "$port" > "$portfile"
             log "SSH for '$name' is running."
-            log "  External port: $port (0.0.0.0:$port -> jail:22)"
-            log "  Connect: ssh -p $port jail@<host-ip>  (password: jail)"
-            log "  Or:      ssh -p $port root@<host-ip>  (password: root)"
+            if [ "$have_socat" = 1 ]; then
+                log "  External port: $port (0.0.0.0:$port -> jail:22)"
+            else
+                log "  External port: $port (sshd bound directly, no redirector)"
+            fi
+            log "  Connect:       ssh -p $port $user@<host-ip>"
+            if [ "$SSH_OPT_NO_PASSWORD" = "1" ]; then
+                log "  Auth:          public key only (password login disabled)"
+            elif [ -n "$SSH_OPT_KEY" ]; then
+                log "  Auth:          password or public key"
+            else
+                log "  Auth:          password"
+            fi
+            log "  Only '$user' may log in; root login is $permit_root."
             log "  The jail stays alive in the background for SSH access."
-            record_event "$name" "ssh" "started on port $port"
+            record_event "$name" "ssh" "started on port $port as '$user' (root login: $permit_root)"
             return 0
         fi
     fi
     warn "sshd may not have started correctly. Check 'jroot ssh $name status'."
     echo "$port" > "$portfile"
-    record_event "$name" "ssh" "started on port $port (unverified)"
+    record_event "$name" "ssh" "started on port $port as '$user' (unverified)"
 }
 
 ssh_usage() {
     printf '%bjroot ssh%b - SSH access into a jail\n\n' "$H" "$N"
-    printf '    %bjroot ssh <name> start [port]%b       start sshd (auto port if omitted)\n' "$G" "$N"
-    printf '    %bjroot ssh <name> start --port=N%b     start on a specific port\n' "$G" "$N"
-    printf '    %bjroot ssh <name> stop%b               stop the SSH daemon\n' "$G" "$N"
-    printf '    %bjroot ssh <name> status%b             show if SSH is running\n' "$G" "$N"
-    printf '    %bjroot ssh <name>%b                    same as status\n' "$G" "$N"
+    printf '    %bjroot ssh <name> start [port]%b        start sshd (auto port if omitted)\n' "$G" "$N"
+    printf '    %bjroot ssh <name> stop%b                stop the SSH daemon\n' "$G" "$N"
+    printf '    %bjroot ssh <name> status%b              show if SSH is running\n' "$G" "$N"
+    printf '    %bjroot ssh <name> passwd [user]%b       set a new password\n' "$G" "$N"
+    printf '    %bjroot ssh <name>%b                     same as status\n' "$G" "$N"
+    printf '\n%bFLAGS%b\n' "$H" "$N"
+    help_row "--port=N | -p N" ""        "External port (default: first free 2200x)"
+    help_row "--user=<name>" ""          "Login account (default: jail for unroot, root for root)"
+    help_row "--password-stdin" ""        "Read the password from stdin (best for scripts)"
+    help_row "--password=<pw>" ""         "Set it inline (warns: lands in shell history)"
+    help_row "--random-password" ""       "Generate a strong one and print it once"
+    help_row "--key=<file.pub>" ""        "Add a public key to authorized_keys"
+    help_row "--no-password" ""           "Key-only login (requires --key)"
+    help_row "--permit-root" ""           "Also allow root to log in over SSH"
     printf '\n'
-    printf '    The jail runs sshd on port 22 internally. A port redirector on the\n'
-    printf '    host exposes it at 0.0.0.0:<port> (default: auto-assigned 2200x).\n'
-    printf '    The jail stays alive in the background so SSH connections work\n'
-    printf '    even when no interactive shell is open.\n'
+    printf '    The jail runs sshd on port 22 internally. A redirector on the host\n'
+    printf '    exposes it at 0.0.0.0:<port>, so the jail keeps believing it owns\n'
+    printf '    port 22. The jail stays alive in the background, so SSH works even\n'
+    printf '    when no interactive shell is open.\n'
+    printf '\n%bPASSWORDS%b\n' "$H" "$N"
+    printf '    There is no default and no hardcoded password. With no flags you are\n'
+    printf '    prompted (echo off); press Enter at the prompt to have a 24-character\n'
+    printf '    random one generated and printed %bonce%b. Nothing is stored on the host,\n' "$C_BLD" "$N"
+    printf '    written to the history log, or passed through a command line.\n'
     printf '\n'
-    printf '    Default credentials:  jail/jail  or  root/root\n'
-    printf '    Change password: jroot enter <name> --root passwd jail\n'
+    printf '    %bExamples:%b\n' "$H" "$N"
+    printf '      %bjroot ssh dev start%b                        prompt for a password\n' "$G" "$N"
+    printf '      %bjroot ssh dev start 20022 --random-password%b  fixed port, generated password\n' "$G" "$N"
+    printf '      %bpass show jail/dev | jroot ssh dev start --password-stdin%b\n' "$G" "$N"
+    printf '      %bjroot ssh dev start --key=~/.ssh/id_ed25519.pub --no-password%b\n' "$G" "$N"
+    printf '      %bjroot ssh dev passwd%b                       rotate the password\n' "$G" "$N"
 }
 
 cmd_ssh() {
     ensure_runtime
     [ -x "$PROOT_BIN" ] || install_proot
-    [ $# -ge 1 ] || { ssh_usage; err "Usage: jroot ssh <name> [start|stop|status] [port]"; }
+    [ $# -ge 1 ] || { ssh_usage; err "Usage: jroot ssh <name> [start|stop|status|passwd] [flags]"; }
+
+    case "$1" in
+        -h|--help|help) ssh_usage; return 0 ;;
+    esac
 
     local name="$1"; shift
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
     [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing."
 
-    local op="status" port=""
+    local op="status" pw_user=""
+    SSH_OPT_PORT=""
+    SSH_OPT_USER=""
+    SSH_OPT_PW_MODE=""
+    SSH_OPT_PW_VALUE=""
+    SSH_OPT_KEY=""
+    SSH_OPT_PERMIT_ROOT=0
+    SSH_OPT_NO_PASSWORD=0
+
     while [ $# -gt 0 ]; do
         case "$1" in
-            start|stop|status) op="$1" ;;
-            --port=*)          port="${1#*=}" ;;
-            -p)                shift; port="$1" ;;
+            start|stop|status|passwd) op="$1" ;;
+            --port=*)          SSH_OPT_PORT="${1#*=}" ;;
+            -p)                shift; SSH_OPT_PORT="$1" ;;
+            --user=*)          SSH_OPT_USER="${1#*=}" ;;
+            -u)                shift; SSH_OPT_USER="$1" ;;
+            --password=*)
+                [ -z "$SSH_OPT_PW_MODE" ] || err "Pick only one of --password / --password-stdin / --random-password."
+                SSH_OPT_PW_MODE="arg"; SSH_OPT_PW_VALUE="${1#*=}"
+                ;;
+            --password)        err "--password needs a value: --password=<pw>. Better still, use --password-stdin so it stays out of your shell history." ;;
+            --password-stdin)
+                [ -z "$SSH_OPT_PW_MODE" ] || err "Pick only one of --password / --password-stdin / --random-password."
+                SSH_OPT_PW_MODE="stdin"
+                ;;
+            --random-password|--generate-password)
+                [ -z "$SSH_OPT_PW_MODE" ] || err "Pick only one of --password / --password-stdin / --random-password."
+                SSH_OPT_PW_MODE="random"
+                ;;
+            --ask-password|--prompt-password)
+                [ -z "$SSH_OPT_PW_MODE" ] || err "Pick only one of --password / --password-stdin / --random-password."
+                SSH_OPT_PW_MODE="prompt"
+                ;;
+            --key=*)           SSH_OPT_KEY="${1#*=}" ;;
+            --key)             shift; SSH_OPT_KEY="$1" ;;
+            --no-password|--keys-only) SSH_OPT_NO_PASSWORD=1 ;;
+            --permit-root)     SSH_OPT_PERMIT_ROOT=1 ;;
+            -h|--help)         ssh_usage; return 0 ;;
             --*)               err "Unknown flag: $1 (try '${CMD_HINT}help ssh')" ;;
             *)
-                # Bare number = port
                 if [[ "$1" =~ ^[0-9]+$ ]]; then
-                    port="$1"
+                    SSH_OPT_PORT="$1"
+                elif [ "$op" = "passwd" ] && [ -z "$pw_user" ]; then
+                    pw_user="$1"          # jroot ssh <name> passwd <user>
                 else
                     err "Unknown argument: $1"
                 fi
@@ -4781,10 +5115,19 @@ cmd_ssh() {
         shift
     done
 
+    # Expand a leading ~ in --key by hand: it arrives quoted from --key=~/...
+    case "$SSH_OPT_KEY" in
+        "~/"*) SSH_OPT_KEY="$REAL_HOME/${SSH_OPT_KEY#\~/}" ;;
+    esac
+
     case "$op" in
-        start)  ssh_start "$name" "$port" ;;
+        start)  ssh_start "$name" ;;
         stop)   ssh_stop "$name" ;;
         status) ssh_status "$name" ;;
+        passwd)
+            [ "$SSH_OPT_NO_PASSWORD" != "1" ] || err "--no-password makes no sense for 'passwd'."
+            ssh_passwd "$name" "${pw_user:-$SSH_OPT_USER}" "$SSH_OPT_PW_MODE" "$SSH_OPT_PW_VALUE"
+            ;;
     esac
 }
 

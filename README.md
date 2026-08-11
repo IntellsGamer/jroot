@@ -640,13 +640,14 @@ The jail's hostname, `/etc/hosts`, and shell prompt are also updated to reflect 
 
 ### `jroot ps` – list running jails
 
-Shows every jail that currently has an active interactive shell:
+Shows every jail that currently has an active interactive shell or SSH daemon:
 
 ```bash
 jroot ps
-JAIL             PID      COMMAND
-dev              12345    /bin/bash --login
-staging          12346    /bin/bash --login
+JAIL             PID      TYPE   COMMAND
+dev              12345    shell  /bin/bash --login
+staging          12346    shell  /bin/bash --login
+dev              54321    sshd   port 22001
 ```
 
 Stale PID files are automatically cleaned up when a jail exits or is killed.
@@ -668,6 +669,8 @@ jroot kill dev --force
 ```
 
 The jail's rootfs and configuration are left intact — you can restart it with `jroot enter dev` later.
+
+Note that `jroot kill` targets the interactive shell. To stop an SSH daemon, use `jroot ssh <name> stop`.
 
 ---
 
@@ -1026,6 +1029,9 @@ MAINTENANCE
   jroot rename <name> <newname>    Rename a jail
   jroot kill <name>                Terminate a running jail
   jroot ps                         List running jails
+  jroot ssh <name> start [port]    Start SSH daemon (persistent, auto port)
+  jroot ssh <name> stop            Stop SSH daemon
+  jroot ssh <name> status          Check SSH daemon status
   jroot rm <name>                  Delete a jail
   jroot help [command]             Show help
 ```
