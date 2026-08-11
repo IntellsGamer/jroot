@@ -1478,8 +1478,17 @@ static int jp_enabled(void) {
         } else {
             /* No variable: enable only if something is tracing us, which inside
              * a jail is proot. Outside a jail nothing traces us and the filter
-             * stays off, so preloading this shim by hand is still harmless. */
-            pid_t t = jp_self_tracer_raw();
+             * stays off, so preloading this shim by hand is still harmless.
+             *
+             * Reading TracerPid means calling open(), which is one of our own
+             * shims and would ask this function again. Publish a provisional
+             * "off" and raise jp_in_lookup so that nested call answers straight
+             * away instead of recursing until the stack runs out. */
+            pid_t t;
+            e = 0;
+            jp_in_lookup++;
+            t = jp_self_tracer_raw();
+            jp_in_lookup--;
             e = (t > 0) ? 1 : 0;
         }
     }
