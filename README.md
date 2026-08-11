@@ -49,15 +49,33 @@ wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/instal
 wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
 ```
 
-3. Run the installer:
+2. Run the installer:
 ```bash
 bash install-jroot.sh
 ```
 
-4. Use jroot:
+3. Use jroot:
 ```bash
 jroot help
 ```
+
+### From a clone
+
+If you have the repository, the Makefile wraps the same installer and adds the
+verification targets:
+
+```bash
+make install      # to ~/.local/bin, no root needed
+make check        # lint the script, compile the embedded C shim, self-test it
+make test         # check + drive the CLI against a throwaway JROOT_HOME
+make version      # script/shim/proot versions, and whether the install is current
+make uninstall    # remove the script, keep every jail
+make purge        # remove the script AND all jails (asks first)
+```
+
+`make dev-install` symlinks instead of copying, so the installed command tracks
+your checkout. `sudo make install PREFIX=/usr/local` installs system-wide, if
+you would rather have that than a user-local install.
 
 ---
 
