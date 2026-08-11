@@ -86,6 +86,7 @@ HOST
 │  /proc process filtering           │
 │  read-only mounts (LD_PRELOAD)     │
 │  port binding control              │
+│  ssh access (persistent daemon)    │
 │  file transfer (host ↔ jail)       │
 └────────────┬───────────────────────┘
              │
@@ -173,6 +174,7 @@ That's the core idea.
 | 🗺️ | Filesystem mapping          | **Yes** |
 | 🔒 | Read-only mount enforcement | **Yes** |
 | 🚪 | Port binding control        | **Yes** |
+| 🔑 | SSH into a jail             | **Yes** |
 | 📁 | File transfer (host ↔ jail) | **Yes** |
 |  📸 | Full rootfs snapshots       | **Yes** |
 |  ↩️ | Snapshot restoration        | **Yes** |
@@ -508,9 +510,11 @@ The port must be **above 1024**. Fake root is not `CAP_NET_BIND_SERVICE`: `getui
 
 > The shim *can* remap a port a service insists on (`JROOT_PORT_MAP="80=8080"`, useful for daemons with a hardcoded privileged port), but remapping does not make the low port reachable, so `jroot ssh` does not use it.
 
-### Privilege separation
+### Privilege separation and auditing
 
-This one is worth knowing about. OpenSSH's pre-auth child hardens itself by chrooting into an empty directory:
+Two things in OpenSSH assume real root and treat failure as fatal. Both had to be handled, and both are worth knowing about because the symptoms are misleading.
+
+**1. The pre-auth chroot.** OpenSSH's privilege-separated child hardens itself by chrooting into an empty directory:
 
 ```text
 chroot("/run/sshd"): Operation not permitted [preauth]
@@ -518,16 +522,29 @@ chroot("/run/sshd"): Operation not permitted [preauth]
 
 `chroot(2)` requires `CAP_SYS_CHROOT`, which fake root does not provide, and OpenSSH **removed `UsePrivilegeSeparation` in 7.5** — so it cannot be configured off. The symptom is brutal: the daemon starts, accepts the TCP connection, then closes it before sending its version banner, and the client only says `Connection closed by <host> port <port>`.
 
-JRoot starts `sshd` with `JROOT_FAKE_PRIVSEP=1`, which makes the shim report success for exactly those self-confinement steps:
+**2. The audit record.** This one is worse, because it happens *after* a successful password check:
+
+```text
+Accepted password for root from 127.0.0.1 port 52744 ssh2
+Starting session: shell on pts/2 for root
+linux_audit_write_entry failed: Unknown error -1
+```
+
+The client sees `Connection to <host> closed` right after typing the correct password, which looks exactly like an auth failure. Writing audit records needs `CAP_AUDIT_WRITE`, and OpenSSH refuses to allow an unaudited login.
+
+JRoot starts `sshd` with `JROOT_FAKE_PRIVSEP=1`, and the shim reports success for exactly those steps:
 
 | Call | Faked | Why |
 | --- | --- | --- |
 | `chroot()` | → `0` | proot already confines the filesystem |
 | `prctl(PR_SET_SECCOMP)` | → `0` | JRoot installed its own filter before proot |
 | `setgroups()` / `initgroups()` | → `0` | no supplementary groups to drop |
+| `audit_open()` | → `EPROTONOSUPPORT` | OpenSSH already has a "kernel has no audit support" path; this jail genuinely has none |
 | `prctl(PR_SET_NO_NEW_PRIVS)` | **not faked** | it works, and it costs nothing |
 
-This is a scoped trade, and it is worth being precise about what it costs: it removes a layer of **sshd's own** defence in depth, not a layer of the jail. The rootfs boundary still comes from proot, the syscall filter from JRoot's seccomp launcher, and the path allowlist from Landlock. The variable is opt-in — `jroot ssh` sets it for the `sshd` it starts and nothing else does.
+The `audit_open()` case is not a lie so much as an accurate answer: OpenSSH explicitly accepts `EINVAL`, `EPROTONOSUPPORT` and `EAFNOSUPPORT` as "no audit subsystem here, carry on", and a rootless jail has no usable one.
+
+This is a scoped trade, and it is worth being precise about what it costs: it removes a layer of **sshd's own** defence in depth, not a layer of the jail. The rootfs boundary still comes from proot, the syscall filter from JRoot's seccomp launcher, and the path allowlist from Landlock. The variable is opt-in — `jroot ssh` sets it for the `sshd` it starts, and nothing else does.
 
 Because the shim is what makes this work, a jail without a working shim cannot run `sshd`. JRoot says so explicitly and points at `jroot install <name> gcc`.
 
@@ -952,9 +969,12 @@ Both are best effort: a kernel without `CONFIG_SECCOMP_FILTER` or without Landlo
 3. **Host mount warnings** – JRoot warns when host `/` or `$HOME` are deliberately mounted, and shadows `~/.jroot` inside those mounts
 4. **Unroot mode** – Root account can be locked, daily use is a non-root user
 5. **Clean environment** – `LD_PRELOAD`, `LD_LIBRARY_PATH`, and proxy env vars are unset on enter
-6. **Host processes hidden** – a jailed `ps` sees only the jail's own process tree
+6. **Host processes hidden** – a jailed `ps` sees only the jail's own process tree, and `/proc/<foreign-pid>` returns `ENOENT` even when opened by exact path
+7. **No default SSH credentials** – `jroot ssh` never sets a known password; it prompts, or generates one and shows it once. Only the chosen account may log in, and root login is opt-in
 
-**Shim caveat:** the LD_PRELOAD layer needs a libc the jail can load. JRoot verifies this per jail and falls back to compiling the shim inside the jail, but a jail with neither a compatible host build nor `gcc` loses the shim-based features (per-jail address, `jroot port`, `/proc` filtering). Landlock and seccomp are libc-independent and always apply.
+**Shim caveat:** the LD_PRELOAD layer needs a libc the jail can load. JRoot verifies this per jail and falls back to compiling the shim inside the jail, but a jail with neither a compatible host build nor `gcc` loses the shim-based features (per-jail address, `jroot port`, `/proc` filtering, and `jroot ssh`). Landlock and seccomp are libc-independent and always apply.
+
+**SSH caveat:** `jroot ssh` runs `sshd` with `JROOT_FAKE_PRIVSEP=1`, which makes the daemon's own `chroot()`, seccomp and audit hardening report success instead of killing the login. That weakens sshd's internal defence in depth — not the jail's boundaries — and it applies only to the `sshd` JRoot starts. See the SSH section for the full reasoning.
 
 ### Important
 
@@ -1108,7 +1128,9 @@ MAINTENANCE
   jroot ps                         List running jails
   jroot ssh <name> start [port]    Start SSH daemon (persistent, auto port)
   jroot ssh <name> stop            Stop SSH daemon
-  jroot ssh <name> status          Check SSH daemon status
+  jroot ssh <name> status          Check SSH daemon status (verifies handshake)
+  jroot ssh <name> passwd [user]   Set a new SSH password
+  jroot ssh <name> log             Show sshd's own log
   jroot rm <name>                  Delete a jail
   jroot help [command]             Show help
 ```
@@ -1164,8 +1186,10 @@ JROOT_KERNEL=x.y.z     kernel version reported inside jails (default 6.8.0)
 JROOT_SHIM_OFF=1       do not load the LD_PRELOAD shim
 JROOT_SHOW_ALL_PROCS=1 let jails see every host process in /proc
 JROOT_LANDLOCK_OFF=1   skip the Landlock allowlist
-JROOT_PORT_MAP=22=2212 remap a port a jailed listener asks for (used by 'jroot ssh'
-                       so sshd can believe it owns privileged port 22)
+JROOT_PORT_MAP=80=8080 remap a port a jailed listener asks for, so a service with
+                       a hardcoded privileged port can run in a rootless jail
+JROOT_FAKE_PRIVSEP=1   report success for chroot()/PR_SET_SECCOMP/setgroups()/
+                       audit_open() - what lets sshd run (set by 'jroot ssh')
 ```
 
 That means you don't have to rebuild an environment just because you want to change how it behaves.
@@ -1205,6 +1229,8 @@ Instead:
                 │  security (seccomp + landlock)    │
                 │  port shim (bind() LD_PRELOAD)    │
                 │  mount shim (write syscalls)      │
+                │  /proc shim (process hiding)      │
+                │  ssh daemon (persistent, keyed)   │
                 └───────────┬───────────────────────┘
                             │
                             ▼
@@ -1339,6 +1365,7 @@ The project is focused on improving:
 * port management
 * mount management
 * file transfer
+* remote access (SSH)
 * interactive shell
 * tab completion
 

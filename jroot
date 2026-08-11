@@ -116,7 +116,7 @@ PORT_SHIM_SRC="$BIN_DIR/libjroot.c"
 PORT_SHIM="$BIN_DIR/libjroot.so"
 # Build marker for the shim. Bump it whenever libjroot.c changes so existing
 # .so files - including ones compiled inside a jail - are replaced.
-SHIM_VERSION="jroot-shim-v6"
+SHIM_VERSION="jroot-shim-v7"
 
 # Landlock filesystem access masks, used to compose the JROOT_LANDLOCK rule
 # list consumed by the seccomp launcher (see write_seccomp_launcher).
@@ -557,12 +557,12 @@ build_port_shim() {
 #include <sys/prctl.h>
 #include <grp.h>
 
-/* jroot-shim-v6 */
+/* jroot-shim-v7 */
 
 /* Greppable build marker: jroot compares this against the version it expects,
  * so an upgraded jroot always replaces an older .so (including one built inside
  * a jail). */
-const char jroot_shim_version[] = "jroot-shim-v6";
+const char jroot_shim_version[] = "jroot-shim-v7";
 
 /* Pin dlsym() to the oldest symbol version the platform has. Since glibc 2.34
  * the dl* functions live in libc.so.6 and a plain reference records
@@ -1431,10 +1431,18 @@ int chdir(const char *path) {
  * host pid 1 - or when its parent chain leads back to JROOT_PROC_ROOT, which
  * covers the no-python fallback path where the root is jroot's own shell.
  *
- * Cosmetic by design: glibc's readdir() path is covered (ls, ps, htop, python's
- * os.listdir), but a program issuing getdents64() itself - statically linked
- * tools, Go binaries - still sees every pid, /proc/<pid> stays readable when
- * opened by exact path, and Alpine (musl) jails never load this shim. Set
+ * When the variable is missing the filter falls back to "whoever is tracing me",
+ * which inside a jail is always proot. That matters for sessions jroot did not
+ * launch directly: sshd builds a clean environment for each login and drops
+ * LD_PRELOAD and every JROOT_* variable, so an SSH session used to end up with
+ * no filtering at all. `jroot ssh` restores the environment through a
+ * ForceCommand wrapper, and this fallback is the second line of defence for any
+ * process that still slips through.
+ *
+ * Coverage: glibc's readdir() path (ls, ps, htop, python's os.listdir) and
+ * direct path access (open/stat/access/readlink on /proc/<pid>/...). A program
+ * issuing getdents64() itself - statically linked tools, Go binaries - still
+ * sees every pid, and Alpine (musl) jails never load this shim. Set
  * JROOT_SHOW_ALL_PROCS=1 to disable.
  */
 #define JP_DIRS 64
@@ -1442,11 +1450,38 @@ static void *jp_dirs[JP_DIRS];
 static int jp_cache_pid[256];
 static char jp_cache_val[256];
 
+/* Read TracerPid from /proc/self/status. Used both as the identity of "my
+ * proot" and, when JROOT_PROC_ROOT is absent, as the jail root itself. */
+static pid_t jp_self_tracer_raw(void) {
+    char buf[4096], *p;
+    int fd;
+    ssize_t n;
+    fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) return -1;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    p = strstr(buf, "TracerPid:");
+    if (!p) return -1;
+    return (pid_t)jnum(p + 10);
+}
+
 static int jp_enabled(void) {
     static int e = -1;
     if (e < 0) {
         const char *r = getenv("JROOT_PROC_ROOT");
-        e = (r && *r && !getenv("JROOT_SHOW_ALL_PROCS")) ? 1 : 0;
+        if (getenv("JROOT_SHOW_ALL_PROCS")) {
+            e = 0;
+        } else if (r && *r) {
+            e = 1;
+        } else {
+            /* No variable: enable only if something is tracing us, which inside
+             * a jail is proot. Outside a jail nothing traces us and the filter
+             * stays off, so preloading this shim by hand is still harmless. */
+            pid_t t = jp_self_tracer_raw();
+            e = (t > 0) ? 1 : 0;
+        }
     }
     return e;
 }
@@ -1456,7 +1491,14 @@ static pid_t jp_root(void) {
     if (r < 0) {
         const char *e = getenv("JROOT_PROC_ROOT");
         long v = (e && *e) ? jnum(e) : -1;
-        r = (v > 0) ? (pid_t)v : 0;
+        if (v > 0) {
+            r = (pid_t)v;
+        } else {
+            /* Fall back to our tracer: inside a jail that is proot, which is
+             * exactly the pid the variable would have carried. */
+            pid_t t = jp_self_tracer_raw();
+            r = (t > 0) ? t : 0;
+        }
     }
     return r;
 }
@@ -1519,16 +1561,19 @@ static pid_t jp_my_tracer(void) {
 }
 
 static int jp_member(pid_t pid) {
-    pid_t root = jp_root(), mine, cur;
+    pid_t root, mine, cur;
     int slot, depth, verdict = 0;
-    if (root <= 0) return 1;
-    if (pid == root) return 1;
-    slot = (int)(pid & 255);
-    if (jp_cache_pid[slot] == (int)pid) return jp_cache_val[slot];
 
     /* Everything below reads /proc, and those reads must not come back through
-     * the /proc filter - see jp_in_lookup. */
+     * the /proc filter - see jp_in_lookup. The guard goes up here rather than
+     * lower down because jp_root() itself may read /proc/self/status. */
     jp_in_lookup++;
+    root = jp_root();
+    if (root <= 0) { jp_in_lookup--; return 1; }
+    if (pid == root) { jp_in_lookup--; return 1; }
+    slot = (int)(pid & 255);
+    if (jp_cache_pid[slot] == (int)pid) { jp_in_lookup--; return jp_cache_val[slot]; }
+
     mine = jp_my_tracer();
     if (pid == mine) {
         verdict = 1;
@@ -5140,6 +5185,21 @@ ssh_start() {
     [ "$user" = "root" ] && permit_root="yes"
     [ "$SSH_OPT_NO_PASSWORD" = "1" ] && password_auth="no"
 
+    # ---- session wrapper -------------------------------------------------
+    # sshd builds a CLEAN environment for every login: it does not pass its own
+    # environment through to the session, and LD_PRELOAD is dropped on purpose.
+    # The consequence was that an SSH session ran with no shim at all - a jailed
+    # `ps aux` listed every host process, `~/.jroot` was visible inside host
+    # mounts, and ro mounts stopped being enforced - while `jroot enter` on the
+    # same jail behaved correctly.
+    #
+    # ForceCommand puts the environment back before handing over the shell, so an
+    # SSH session gets what `jroot enter` gets. JROOT_PROC_ROOT is derived from
+    # TracerPid at session time rather than baked in, because the pid tracing the
+    # session IS this jail's proot, and it changes on every daemon restart.
+    local session_wrapper="/usr/local/bin/jroot-session"
+    write_ssh_session_wrapper "$name"
+
     # StrictModes and UseDNS are both off for proot-specific reasons, not
     # laziness. StrictModes rejects a login when the home directory or
     # ~/.ssh permissions look wrong, and ownership inside a fake-root rootfs is
@@ -5166,6 +5226,7 @@ UseDNS no
 MaxAuthTries 4
 LoginGraceTime 60
 AllowUsers $user
+ForceCommand $session_wrapper
 AcceptEnv LANG LC_*
 PrintMotd no
 LogLevel VERBOSE
@@ -5392,6 +5453,79 @@ SSHEOF
     log "  sshd log:      $logfile"
     log "  The jail stays alive in the background for SSH access."
     record_event "$name" "ssh" "started on port $port as '$user' (root login: $permit_root)"
+    return 0
+}
+
+# Install the ForceCommand wrapper that restores the jail environment for every
+# SSH session. Written straight into the rootfs from the host, so there is no
+# nested quoting to get wrong, and regenerated on every `jroot ssh start` so a
+# config change (ports, ro mounts) takes effect on the next login.
+write_ssh_session_wrapper() {
+    local name="$1"
+    local rootfs="$ROOTS_DIR/$name"
+    local cfg="$CONFIGS_DIR/$name.json"
+    local dest="$rootfs/usr/local/bin/jroot-session"
+    local jail_ports jail_lb ro_mounts="" m_label m_hostpath m_mode
+
+    jail_ports="$(config_ports "$cfg")"
+    jail_lb="$(config_field "$cfg" loopback)"
+    case "$jail_lb" in off|shared|disabled) jail_lb="" ;; esac
+    while IFS=$'\t' read -r m_label m_hostpath m_mode; do
+        [ -n "$m_label" ] || continue
+        [ "$m_mode" = "ro" ] && ro_mounts="$ro_mounts:/mnt/$m_label"
+    done < <(config_mounts "$cfg")
+    ro_mounts="${ro_mounts#:}"
+
+    mkdir -p "$rootfs/usr/local/bin" 2>/dev/null || return 1
+    cat > "$dest" << WRAPEOF
+#!/bin/sh
+# Generated by 'jroot ssh $name start' - do not edit, it is rewritten on start.
+#
+# sshd hands each session a clean environment and deliberately drops LD_PRELOAD,
+# so without this wrapper an SSH login runs with no jroot shim: host processes
+# visible in /proc, ~/.jroot readable inside host mounts, ro mounts writable.
+# Put the environment back, then become the shell the user asked for.
+
+JROOT_SHIM=/usr/local/lib/libjroot.so
+
+if [ -f "\$JROOT_SHIM" ]; then
+    # The pid tracing us is this jail's proot, which is exactly what
+    # JROOT_PROC_ROOT is meant to carry. Read it now, before the shim is loaded
+    # and starts filtering /proc.
+    JROOT_TRACER=\$(awk '/^TracerPid:/ { print \$2; exit }' /proc/self/status 2>/dev/null)
+    [ -n "\$JROOT_TRACER" ] && [ "\$JROOT_TRACER" != "0" ] || JROOT_TRACER=""
+
+    JROOT_PORTS='$jail_ports'
+    JROOT_LOOPBACK='$jail_lb'
+    JROOT_RO_MOUNTS='$ro_mounts'
+    export JROOT_PORTS JROOT_LOOPBACK JROOT_RO_MOUNTS
+    [ -n "\$JROOT_TRACER" ] && { JROOT_PROC_ROOT="\$JROOT_TRACER"; export JROOT_PROC_ROOT; }
+    LD_PRELOAD="\$JROOT_SHIM"
+    export LD_PRELOAD
+fi
+
+[ -n "\$SHELL" ] && [ -x "\$SHELL" ] || SHELL=/bin/sh
+export SHELL
+
+# A subsystem request (sftp) arrives here as its bare name, which is not a
+# runnable command, so map it back to the server binary.
+if [ "\$SSH_ORIGINAL_COMMAND" = "sftp" ] || [ "\$SSH_ORIGINAL_COMMAND" = "internal-sftp" ]; then
+    for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/sftp-server; do
+        [ -x "\$p" ] && exec "\$p"
+    done
+    echo "jroot: no sftp-server found in this jail" >&2
+    exit 127
+fi
+
+# 'ssh host <cmd>' and scp both arrive as SSH_ORIGINAL_COMMAND.
+if [ -n "\$SSH_ORIGINAL_COMMAND" ]; then
+    exec "\$SHELL" -c "\$SSH_ORIGINAL_COMMAND"
+fi
+
+# Interactive login: match what 'jroot enter' gives you.
+exec "\$SHELL" -l
+WRAPEOF
+    chmod 755 "$dest" 2>/dev/null || true
     return 0
 }
 
