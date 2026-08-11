@@ -461,9 +461,11 @@ $ jroot exec dev cat /proc/1/cmdline
 cat: /proc/1/cmdline: No such file or directory
 ```
 
-Membership is decided two ways: a process is part of the jail if the same PRoot instance traces it — which covers daemons that double-forked and were reparented to host PID 1 — or if its parent chain leads back to the jail's root process.
+Membership is decided two ways: a process is part of the jail if the same PRoot instance traces it — which covers daemons that double-forked and were reparented to host PID 1 — or if its parent chain leads back to the jail's root process. When `JROOT_PROC_ROOT` is missing, the shim falls back to "whoever is tracing me", which inside a jail is always PRoot.
 
 This covers the glibc `readdir()` path (`ls`, `ps`, `htop`, Python's `os.listdir`) **and** direct path access (`open`, `stat`, `readlink`). A statically-linked binary issuing raw `getdents64()` still sees everything, as does anything that bypasses the dynamic linker. Set `JROOT_SHOW_ALL_PROCS=1` to turn it off.
+
+It applies to SSH sessions too, not just `jroot enter` — see [the session environment](#the-session-environment) for why that needed explicit work.
 
 ---
 
@@ -548,6 +550,43 @@ This is a scoped trade, and it is worth being precise about what it costs: it re
 
 Because the shim is what makes this work, a jail without a working shim cannot run `sshd`. JRoot says so explicitly and points at `jroot install <name> gcc`.
 
+### The session environment
+
+`sshd` builds a **clean environment for every login** and deliberately drops `LD_PRELOAD`. That meant an SSH session originally ran with no shim at all, while `jroot enter` on the same jail behaved correctly — a difference you could see immediately:
+
+```bash
+# over SSH, before the fix: every host process visible
+root@dev1:/$ ps aux | wc -l
+32
+
+# jroot enter, same jail, same moment
+root@dev1:~$ ps aux | wc -l
+4
+```
+
+Losing the shim did not just make `ps` noisy. It also meant `~/.jroot` became visible inside host mounts, read-only mounts stopped returning `EROFS`, and jailed servers no longer bound to the jail's own loopback address.
+
+JRoot fixes this with a generated `ForceCommand` wrapper at `/usr/local/bin/jroot-session` inside the jail, which restores the environment and then becomes the requested shell:
+
+```text
+ssh login
+   │
+   ▼
+sshd  (clean env, no LD_PRELOAD)
+   │  ForceCommand
+   ▼
+jroot-session
+   ├── JROOT_PROC_ROOT  ← read from TracerPid (this jail's proot)
+   ├── JROOT_PORTS / JROOT_LOOPBACK / JROOT_RO_MOUNTS  ← from the jail config
+   ├── LD_PRELOAD=/usr/local/lib/libjroot.so
+   ▼
+exec $SHELL -l      (or $SHELL -c "<command>", or sftp-server)
+```
+
+`JROOT_PROC_ROOT` is read at session time from `/proc/self/status` rather than baked in, because the process tracing the session *is* this jail's proot, and that pid changes every time the daemon restarts.
+
+The wrapper is regenerated on every `jroot ssh <name> start`, so config changes take effect on the next login, and it handles all three session types — interactive shells, `ssh host <command>` and `scp`, and the `sftp` subsystem. As a second line of defence, the shim now also falls back to "whoever is tracing me" when `JROOT_PROC_ROOT` is absent, so a process that somehow bypasses the wrapper still gets `/proc` filtering.
+
 ### Passwords
 
 **There is no default password and nothing is hardcoded.** With no flags, `jroot ssh <name> start` prompts with echo off; pressing Enter instead generates a 24-character random password and prints it exactly once.
@@ -594,6 +633,7 @@ The login account defaults to `jail` for unroot jails and `root` for root jails;
 - The jail runs as a **persistent background daemon** (proot + `sshd -D`) in its own process group, so it survives closing your terminal, and stopping it cannot take your shell down with it.
 - Startup waits for the socket to accept connections, **then reads the SSH banner**. A listening socket is not a working daemon — reading the banner is what catches a privsep failure at start time instead of leaving you with `Connection closed`.
 - `jroot ssh <name> status` re-runs that handshake check, so it reports `FAILING` rather than `running` when the daemon is broken.
+- An SSH session gets the same shim environment as `jroot enter`, via the generated `ForceCommand` wrapper described above.
 - `jroot ps` lists SSH daemons alongside interactive shells; `jroot rm` stops the daemon first.
 
 ```bash
