@@ -105,7 +105,8 @@ HOST
 │  read-only mounts (LD_PRELOAD)     │
 │  port binding control              │
 │  ssh access (persistent daemon)    │
-│  file transfer (host ↔ jail)       │
+│  file transfer (host ↔ jail ↔ jail)│
+│  tab completion (bash/zsh/fish)    │
 └────────────┬───────────────────────┘
              │
              ▼
@@ -193,13 +194,14 @@ That's the core idea.
 | 🔒 | Read-only mount enforcement | **Yes** |
 | 🚪 | Port binding control        | **Yes** |
 | 🔑 | SSH into a jail             | **Yes** |
-| 📁 | File transfer (host ↔ jail) | **Yes** |
+| 📁 | File transfer (any direction) | **Yes** |
 |  📸 | Full rootfs snapshots       | **Yes** |
 |  ↩️ | Snapshot restoration        | **Yes** |
 | 🏷️ | Jail rename                 | **Yes** |
 |  🩺 | Installation diagnostics    | **Yes** |
 | 🛡️ | Seccomp protection          | **Yes** |
 | 🖥️ | Interactive command shell   | **Yes** |
+| ⌨️ | Tab completion (bash/zsh/fish) | **Yes** |
 |  ⚙️ | System-wide daemon          |  **No** |
 
 The project is deliberately aimed at the gap between **"I have a Linux account"** and **"I have administrative control of this machine."**
@@ -708,24 +710,42 @@ Compatibility is then **verified, not assumed**. On first use in each jail, JRoo
 Moving files between host and jail is a common pain point. JRoot solves it with `jroot file`.
 
 ```bash
-# Copy from host to jail
-jroot file cp dev ~/app.tar.gz :/root/app.tar.gz
+# Host to jail
+jroot file cp ~/app.tar.gz dev:/root/app.tar.gz
 
-# Copy from jail to host
-jroot file cp dev :/root/log.txt ./log.txt
+# Jail to host
+jroot file cp dev:/root/log.txt ./log.txt
 
-# Move a file
-jroot file mv dev :/tmp/old.log :/tmp/new.log
+# Jail to jail - either direction, any two jails
+jroot file cp dev:/etc/nginx/nginx.conf web:/etc/nginx/nginx.conf
+
+# Move instead of copy
+jroot file mv dev:/tmp/build.log web:/tmp/build.log
 ```
 
-Paths prefixed with `:` are inside the jail. Everything else is on the host.
+A path written `<jail>:/path` is inside that jail. Anything else is a host path. At least one side has to be a jail path — for host-to-host, `cp` already exists.
 
 ```text
-host path         →  /home/user/app.tar.gz
-jail path (:)     →  /root/app.tar.gz
+dev:/root/app.tar.gz   →  ~/.jroot/roots/dev/root/app.tar.gz
+./app.tar.gz           →  the host path, as written
 ```
 
-The file operation copies or moves directly between the two filesystem views.
+The jail side is resolved on the host, so no jail is started and nothing inside one is executed. Missing parent directories on the destination side are created.
+
+**Paths are checked before anything is written.** `..` is refused outright, and a jail path is rejected when it resolves outside that jail's rootfs — the case that matters is an absolute symlink, which Ubuntu really does ship (`/lib -> /usr/lib`): resolved out here rather than under PRoot, "into the jail" would have meant the host's `/usr/lib`.
+
+```bash
+$ jroot file cp ./x dev:/root/../../../etc/passwd
+[!] A jail path may not contain '..': 'dev:/root/../../../etc/passwd'
+```
+
+The older form still works, where the jail is named up front and a bare `:` means "in that jail":
+
+```bash
+jroot file cp dev ~/app.tar.gz :/root/app.tar.gz
+```
+
+Copies into a jail are recorded in `jroot history`, since they change it.
 
 ---
 
@@ -850,6 +870,42 @@ Bye!
 ```
 
 Type `help` for commands, `exit` to leave. All jroot commands work without the prefix.
+
+---
+
+# ⌨️ Shell completion
+
+Thirty-odd commands with a subcommand grammar is more than anyone should have to remember, so JRoot generates its own completion script.
+
+```bash
+jroot completion bash > ~/.local/share/bash-completion/completions/jroot
+jroot completion zsh > "${fpath[1]}/_jroot"        # then: compinit
+jroot completion fish > ~/.config/fish/completions/jroot.fish
+```
+
+`install-jroot.sh` does the bash one (and fish, if fish is installed) for you. For a single shell, `eval "$(jroot completion bash)"`.
+
+It completes rather more than command names:
+
+```bash
+jroot en<TAB>                    →  enter  exec
+jroot enter <TAB>                →  dev  web  build
+jroot revert dev <TAB>           →  before-upgrade  clean        (this jail's snapshots)
+jroot port dev rm <TAB>          →  3000  8080                   (this jail's public ports)
+jroot mnt dev set <TAB>          →  work  secrets                (this jail's mounts)
+jroot ssh dev start --<TAB>      →  --port=  --key=  --random-password  ...
+```
+
+And, most useful with `jroot file`, **paths inside a jail**:
+
+```bash
+jroot file cp dev:/etc/ng<TAB>   →  dev:/etc/nginx/
+jroot file cp report.pdf web:/v<TAB>  →  web:/var/
+```
+
+Everything it needs is read straight off the host — jail names are files in `configs/`, snapshot labels are files in `snapshots/<jail>/`, ports and mounts come out of the jail config — so pressing TAB never starts a jail, and never forks a python interpreter either.
+
+The scripts are printed rather than installed so you can put them where your shell wants them, and regenerate after an upgrade adds a command. `make check` parses all three with their own shells, because a completion script with a syntax error only ever breaks in somebody else's terminal.
 
 ---
 
@@ -1144,8 +1200,8 @@ CREATE & USE
 
 FILE & PORT MANAGEMENT
 
-  jroot file cp <name> <src> <dst> Copy files (host ↔ jail)
-  jroot file mv <name> <src> <dst> Move files (host ↔ jail)
+  jroot file cp <src> <dst>        Copy files (host ↔ jail, jail ↔ jail)
+  jroot file mv <src> <dst>        Move files (a jail side is dev:/path)
   jroot port <name> list           Show public ports
   jroot port <name> add <port>     Make a port public (0.0.0.0)
   jroot port <name> rm <port>      Keep a port on the jail's own address
@@ -1190,6 +1246,7 @@ MAINTENANCE
   jroot ssh <name> passwd [user]   Set a new SSH password
   jroot ssh <name> log             Show sshd's own log
   jroot rm <name>                  Delete a jail
+  jroot completion bash|zsh|fish   Print a shell completion script
   jroot help [command]             Show help
 ```
 
@@ -1425,7 +1482,7 @@ The project is focused on improving:
 * file transfer
 * remote access (SSH)
 * interactive shell
-* tab completion
+* completion coverage as commands are added
 
 The underlying idea stays the same:
 

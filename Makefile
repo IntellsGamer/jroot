@@ -11,8 +11,10 @@
 #   make install    copy jroot to ~/.local/bin and add PATH + aliases
 #   make uninstall  remove the script, keep every jail
 #   make purge      remove the script AND all jails (asks first)
-#   make check      lint the shell, compile the embedded C shim, run self-tests
-#   make test       check + exercise the CLI against a throwaway JROOT_HOME
+#   make check      lint the shell, compile the embedded C shim, check the
+#                   generated completion scripts, run self-tests
+#   make test       check + exercise the CLI and the tests/ scripts against a
+#                   throwaway JROOT_HOME
 #
 # Nothing here needs sudo. PREFIX defaults to ~/.local so an ordinary account
 # can install jroot the same way jroot itself avoids needing privileges. Set
@@ -67,6 +69,7 @@ help:
 	@printf '    $(GRN)make check$(NC)        Lint the shell, compile the embedded C, self-test\n'
 	@printf '    $(GRN)make lint$(NC)         bash -n (and shellcheck, if installed)\n'
 	@printf '    $(GRN)make shim$(NC)         Extract and compile the LD_PRELOAD shim\n'
+	@printf '    $(GRN)make completion-check$(NC)  Parse the generated bash/zsh/fish scripts\n'
 	@printf '    $(GRN)make test$(NC)         check + drive the CLI in a throwaway JROOT_HOME\n\n'
 	@printf '$(CYAN)INFO$(NC)\n'
 	@printf '    $(GRN)make version$(NC)      Show the script and shim versions\n'
@@ -144,6 +147,10 @@ lint:
 	@printf '$(CYAN)==>$(NC) bash -n %s\n' "$(SCRIPT)"
 	@bash -n "$(SCRIPT)" && printf '    syntax ok\n'
 	@bash -n "$(INSTALLER)" && printf '    %s syntax ok\n' "$(INSTALLER)"
+	@for t in tests/*.sh; do \
+		bash -n "$$t" || exit 1; \
+		printf '    %s syntax ok\n' "$$t"; \
+	done
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		printf '$(CYAN)==>$(NC) shellcheck\n'; \
 		shellcheck -S warning -e SC2086,SC2046,SC1090,SC1091 "$(SCRIPT)" "$(INSTALLER)" \
@@ -264,8 +271,40 @@ shim-selftest: $(SHIM_SO)
 		printf '$(RED)[!]$(NC) chroot() was faked without JROOT_FAKE_PRIVSEP: %s\n' "$$out"; exit 1; \
 	fi
 
-check: lint shim shim-version shim-selftest
+check: lint shim shim-version shim-selftest completion-check
 	@printf '$(GRN)==> check passed$(NC)\n'
+
+# The completion scripts are printed by jroot itself, so a syntax error in one
+# would only ever show up in somebody's shell. Parse each with its own shell
+# where that shell exists, and assert the entry point is still there - a script
+# that parses but registers nothing completes nothing.
+.PHONY: completion-check
+completion-check:
+	@printf '$(CYAN)==>$(NC) generated completion scripts\n'
+	@mkdir -p "$(BUILDDIR)"
+	@bash "$(SCRIPT)" completion bash > "$(BUILDDIR)/jroot-completion.bash"
+	@bash -n "$(BUILDDIR)/jroot-completion.bash"
+	@grep -q 'complete -F _jroot jroot' "$(BUILDDIR)/jroot-completion.bash" \
+		|| { printf '$(RED)[!]$(NC) bash script never calls complete\n'; exit 1; }
+	@printf '    bash   parses, registers _jroot\n'
+	@bash "$(SCRIPT)" completion zsh > "$(BUILDDIR)/_jroot"
+	@head -n1 "$(BUILDDIR)/_jroot" | grep -q '^#compdef jroot' \
+		|| { printf '$(RED)[!]$(NC) zsh script is missing its #compdef line\n'; exit 1; }
+	@if command -v zsh >/dev/null 2>&1; then \
+		zsh -n "$(BUILDDIR)/_jroot" || exit 1; \
+		printf '    zsh    parses, has #compdef\n'; \
+	else \
+		printf '    zsh    has #compdef $(DIM)(zsh not installed, not parsed)$(NC)\n'; \
+	fi
+	@bash "$(SCRIPT)" completion fish > "$(BUILDDIR)/jroot.fish"
+	@grep -q '^complete -c jroot' "$(BUILDDIR)/jroot.fish" \
+		|| { printf '$(RED)[!]$(NC) fish script never calls complete\n'; exit 1; }
+	@if command -v fish >/dev/null 2>&1; then \
+		fish --no-execute "$(BUILDDIR)/jroot.fish" || exit 1; \
+		printf '    fish   parses, registers completions\n'; \
+	else \
+		printf '    fish   registers completions $(DIM)(fish not installed, not parsed)$(NC)\n'; \
+	fi
 
 # Drive the CLI itself, against a JROOT_HOME under $(BUILDDIR) so real jails are
 # never touched. Deliberately avoids 'jroot init': that downloads a rootfs and
@@ -314,6 +353,10 @@ test: check
 		&& printf '      loopback address baked in       ok\n' \
 		|| { printf '$(RED)[!]$(NC) loopback missing from the wrapper\n'; exit 1; }
 	@rm -rf "$(BUILDDIR)/home" "$(BUILDDIR)/jroot-lib.sh"
+	@printf '$(CYAN)==>$(NC) tests/file.sh\n'
+	@bash tests/file.sh
+	@printf '$(CYAN)==>$(NC) tests/completion.sh\n'
+	@bash tests/completion.sh
 	@printf '$(GRN)==> test passed$(NC)\n'
 
 # -----------------------------------------------------------------------------

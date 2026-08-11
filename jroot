@@ -9,7 +9,9 @@
 #   jroot exec <name> [--root] <cmd...>  Run one command, no interactive shell
 #   jroot shell                 Interactive "jroot>" prompt (no command prefix)
 #   jroot install <name> <pkg...>  apt-get/apk install as root inside a jail
-#   jroot file cp|mv <name> <src> <dst>  Move files in/out (jail paths use ":")
+#   jroot file cp|mv <src> <dst>  Move files around ("<jail>:/path" is inside
+#                               that jail, anything else is a host path, and
+#                               both sides may be jails)
 #   jroot port list|add|rm <name> [port]  Ports allowed to bind publicly
 #   jroot net [set <name> auto|off|addr]  Per-jail loopback address
 #   jroot mnt <name> [label dir [rw|ro]]  Bind a host dir at /mnt/<label>
@@ -30,6 +32,7 @@
 #   jroot doctor [--mute=...]   Check the installation for problems
 #   jroot rm <name>             Delete a jail and its config
 #   jroot rename <name> <new>   Rename a jail (rootfs, config, snapshots)
+#   jroot completion <shell>    Print a bash/zsh/fish completion script
 #   jroot help [command]        Show this help, or help for one command
 #
 # Everything lives under ~/.jroot and works without host root:
@@ -3369,15 +3372,104 @@ cmd_exec() {
 }
 
 file_usage() {
-    printf '%bjroot file%b - copy or move files in/out of a jail\n\n' "$H" "$N"
-    printf '    %bjroot file cp <name> <src> <dst>%b\n' "$G" "$N"
-    printf '    %bjroot file mv <name> <src> <dst>%b\n' "$G" "$N"
+    printf '%bjroot file%b - copy or move files between the host and jails\n\n' "$H" "$N"
+    printf '    %bjroot file cp <src> <dst>%b\n' "$G" "$N"
+    printf '    %bjroot file mv <src> <dst>%b\n' "$G" "$N"
     printf '\n'
-    printf '    Paths prefixed with %b:%b are inside the jail, e.g.\n' "$G" "$N"
+    printf '    A path written %b<jail>:/path%b is inside that jail; anything else is a\n' "$G" "$N"
+    printf '    host path. At least one side must be a jail path.\n'
+    printf '\n'
+    printf '        %b$%b jroot file cp ~/app.tar.gz dev:/root/app.tar.gz    %b(host -> jail)%b\n' "$G" "$N" "$B" "$N"
+    printf '        %b$%b jroot file cp dev:/root/log.txt ./log.txt          %b(jail -> host)%b\n' "$G" "$N" "$B" "$N"
+    printf '        %b$%b jroot file mv dev:/etc/app.conf web:/etc/app.conf  %b(jail -> jail)%b\n' "$G" "$N" "$B" "$N"
+    printf '\n'
+    printf '    The older form still works, where a bare %b:%b means "that jail":\n' "$G" "$N"
     printf '        %b$%b jroot file cp dev ~/app.tar.gz :/root/app.tar.gz   %b(host -> jail)%b\n' "$G" "$N" "$B" "$N"
-    printf '        %b$%b jroot file cp dev :/root/log.txt ./log.txt          %b(jail -> host)%b\n' "$G" "$N" "$B" "$N"
-    printf '\n'
-    printf '    Exactly one of <src>/<dst> must be a jail path.\n'
+}
+
+# file_parse_side <token> [legacy-jail]
+# Splits one argument into a jail (empty for a host path) and a path, in
+# FILE_SIDE_JAIL / FILE_SIDE_PATH. Two locals would be cleaner than globals, but
+# a function can only return one string and both sides need both halves.
+#
+# The rule is "the text before the first colon names an existing jail". Requiring
+# the jail to exist is what keeps a host path that merely contains a colon
+# working, and the shape check below keeps './odd:name.txt' out of the guessing
+# game entirely.
+FILE_SIDE_JAIL=""
+FILE_SIDE_PATH=""
+file_parse_side() {
+    local tok="$1" ctx="${2:-}" cand
+    FILE_SIDE_JAIL=""
+    FILE_SIDE_PATH="$tok"
+    case "$tok" in
+        :*)
+            [ -n "$ctx" ] || err "'$tok' does not say which jail. Write '<jail>$tok' (e.g. 'dev$tok'), or name the jail first: ${CMD_HINT}file cp <jail> <src> <dst>"
+            FILE_SIDE_JAIL="$ctx"
+            FILE_SIDE_PATH="${tok#:}"
+            ;;
+        *:*)
+            cand="${tok%%:*}"
+            if [[ "$cand" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                [ -f "$CONFIGS_DIR/$cand.json" ] \
+                    || err "Jail '$cand' not found (from '$tok'). Run '${CMD_HINT}list' to see jails, or write './$tok' for a host path with a colon in it."
+                FILE_SIDE_JAIL="$cand"
+                FILE_SIDE_PATH="${tok#*:}"
+            fi
+            ;;
+    esac
+}
+
+# file_host_path <jail> <jail-path> src|dst
+# Turns a jail-side path into the real host path under roots/<jail>, refusing
+# anything that would land outside it.
+#
+# '..' is rejected outright. Symlinks are the subtle case: this runs on the host,
+# not under proot, so an absolute link inside the jail (/lib -> /usr/lib, which
+# Ubuntu really does ship) resolves against the HOST root. Copying "into the
+# jail" would then write to the host's /usr/lib. Comparing the physical parent
+# directory against the physical rootfs catches that, and the final component is
+# checked too, on both sides, since cp follows it either way.
+file_host_path() {
+    local name="$1" p="$2" side="${3:-src}" root parent base phys target
+    root="$(cd "$ROOTS_DIR/$name" 2>/dev/null && pwd -P)" \
+        || err "Rootfs for '$name' is missing. Recreate it: ${CMD_HINT}rm $name && ${CMD_HINT}init <image>"
+    [ -n "$p" ] || err "No path given for jail '$name'. Write '$name:/path/to/file'."
+    case "$p" in
+        /*) ;;
+        *)  err "A jail path must be absolute: '$name:$p' (did you mean '$name:/$p'?)" ;;
+    esac
+    case "/$p/" in
+        */../*) err "A jail path may not contain '..': '$name:$p'" ;;
+    esac
+
+    parent="${p%/*}"
+    [ -n "$parent" ] || parent="/"
+    base="${p##*/}"
+    if [ "$side" = "dst" ] && [ ! -d "$root$parent" ]; then
+        mkdir -p "$root$parent" 2>/dev/null || true
+    fi
+    [ -d "$root$parent" ] || err "No such directory in '$name': $parent"
+    phys="$(cd "$root$parent" && pwd -P)" || err "Cannot read '$name:$parent'"
+    case "$phys/" in
+        "$root/"*) ;;
+        *) err "'$name:$p' leaves the rootfs of '$name' (a symlink inside the jail points at the host). Refusing." ;;
+    esac
+
+    local out="$phys"
+    [ -n "$base" ] && out="$phys/$base"
+    # The final component matters on both sides: cp follows a symlink when
+    # reading it and writes through one when it is the destination.
+    if [ -L "$out" ] && command -v readlink >/dev/null 2>&1; then
+        target="$(readlink -f "$out" 2>/dev/null || true)"
+        if [ -n "$target" ]; then
+            case "$target/" in
+                "$root/"*) ;;
+                *) err "'$name:$p' is a symlink pointing outside the jail ($target on the host). Refusing." ;;
+            esac
+        fi
+    fi
+    printf '%s' "$out"
 }
 
 cmd_file() {
@@ -3391,24 +3483,36 @@ cmd_file() {
             err "Unknown file op '$op'. Use cp or mv."
             ;;
     esac
-    [ $# -eq 3 ] || { file_usage; err "jroot file $op needs <name> <src> <dst>."; }
-    local name="$1" src="$2" dest="$3"
-    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
-    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
 
-    local src_is_jail=0 dest_is_jail=0 real_src real_dest
-    [[ "$src" == :* ]] && src_is_jail=1
-    [[ "$dest" == :* ]] && dest_is_jail=1
-    if [ "$src_is_jail" = "$dest_is_jail" ]; then
-        err "Exactly one of <src>/<dest> must be a jail path (prefix with ':', e.g. :/root/file)"
+    # Legacy form: <jail> <src> <dst>, with a bare ':' meaning that jail. Only
+    # taken when the first of three arguments carries no colon of its own and
+    # does name a jail, so a genuine three-argument mistake still gets usage.
+    local ctx=""
+    if [ $# -eq 3 ] && [[ "$1" != *:* ]]; then
+        [ -f "$CONFIGS_DIR/$1.json" ] \
+            || err "Jail '$1' not found. Run '${CMD_HINT}list' to see jails, or use: ${CMD_HINT}file $op <src> <dst>"
+        ctx="$1"; shift
+    fi
+    [ $# -eq 2 ] || { file_usage; err "${CMD_HINT}file $op needs <src> <dst>."; }
+
+    local src="$1" dest="$2" src_jail src_path dest_jail dest_path
+    file_parse_side "$src" "$ctx"
+    src_jail="$FILE_SIDE_JAIL"; src_path="$FILE_SIDE_PATH"
+    file_parse_side "$dest" "$ctx"
+    dest_jail="$FILE_SIDE_JAIL"; dest_path="$FILE_SIDE_PATH"
+
+    if [ -z "$src_jail" ] && [ -z "$dest_jail" ]; then
+        err "Neither '$src' nor '$dest' is a jail path. Write '<jail>:/path' for the jail side (see '${CMD_HINT}help file')."
     fi
 
-    real_src="$src"; real_dest="$dest"
-    [ "$src_is_jail" = 1 ] && real_src="$ROOTS_DIR/$name/${src#:}"
-    [ "$dest_is_jail" = 1 ] && real_dest="$ROOTS_DIR/$name/${dest#:}"
-
-    if [ "$dest_is_jail" = 1 ]; then
-        mkdir -p "$(dirname "$real_dest")" 2>/dev/null || true
+    # err() inside a command substitution only exits the subshell, so the status
+    # has to be checked here or an escaping path would carry on as "".
+    local real_src="$src_path" real_dest="$dest_path"
+    if [ -n "$src_jail" ]; then
+        real_src="$(file_host_path "$src_jail" "$src_path" src)" || exit 1
+    fi
+    if [ -n "$dest_jail" ]; then
+        real_dest="$(file_host_path "$dest_jail" "$dest_path" dst)" || exit 1
     fi
 
     if [ "$op" = "cp" ]; then
@@ -3417,6 +3521,16 @@ cmd_file() {
     else
         mv "$real_src" "$real_dest" || err "Move failed: '$src' -> '$dest'"
         log "Moved '$src' -> '$dest'"
+    fi
+
+    # Landing a file in a jail changes that jail, so it belongs in its history.
+    # Plain '&&' chains here would be the last command in the function and take
+    # 'set -e' with them when the test is false.
+    if [ -n "$dest_jail" ]; then
+        record_event "$dest_jail" file "$op $src -> $dest"
+    fi
+    if [ -n "$src_jail" ] && [ "$op" = "mv" ] && [ "$src_jail" != "$dest_jail" ]; then
+        record_event "$src_jail" file "$op $src -> $dest"
     fi
 }
 
@@ -5861,15 +5975,19 @@ cmd_help_cmd() {
         file)
             if [ $# -ge 1 ]; then
                 case "$1" in
-                    cp) printf '%bjroot file cp%b - copy a file between host and jail\n\n' "$H" "$N"
-                        printf '    %bjroot file cp <name> <src> <dst>%b\n' "$G" "$N"
-                        printf '\n    One of <src>/<dst> must be a jail path (prefix %b:%b).\n' "$G" "$N"
-                        printf '    %bhost -> jail:%b  jroot file cp dev ~/app.tar.gz :/root/app.tar.gz\n' "$G" "$N"
-                        printf '    %bjail -> host:%b  jroot file cp dev :/root/log.txt ./log.txt\n' "$G" "$N"
+                    cp) printf '%bjroot file cp%b - copy a file between the host and jails\n\n' "$H" "$N"
+                        printf '    %bjroot file cp <src> <dst>%b\n' "$G" "$N"
+                        printf '\n    A path written %b<jail>:/path%b is inside that jail; anything else is\n' "$G" "$N"
+                        printf '    a host path. At least one side must be a jail path.\n'
+                        printf '    %bhost -> jail:%b  jroot file cp ~/app.tar.gz dev:/root/app.tar.gz\n' "$G" "$N"
+                        printf '    %bjail -> host:%b  jroot file cp dev:/root/log.txt ./log.txt\n' "$G" "$N"
+                        printf '    %bjail -> jail:%b  jroot file cp dev:/etc/app.conf web:/etc/app.conf\n' "$G" "$N"
+                        printf '    %bolder form:%b    jroot file cp dev ~/app.tar.gz :/root/app.tar.gz\n' "$G" "$N"
                         ;;
-                    mv) printf '%bjroot file mv%b - move a file between host and jail\n\n' "$H" "$N"
-                        printf '    %bjroot file mv <name> <src> <dst>%b\n' "$G" "$N"
-                        printf '\n    Same rules as %bjroot file cp%b. One path is a jail path (prefix %b:%b).\n' "$G" "$N" "$G" "$N"
+                    mv) printf '%bjroot file mv%b - move a file between the host and jails\n\n' "$H" "$N"
+                        printf '    %bjroot file mv <src> <dst>%b\n' "$G" "$N"
+                        printf '\n    Same rules as %bjroot file cp%b: %b<jail>:/path%b is inside that jail,\n' "$G" "$N" "$G" "$N"
+                        printf '    anything else is a host path, and both sides may be jails.\n'
                         ;;
                     *)  err "Unknown file subcommand: $1 (try 'jroot help file cp' or 'jroot help file mv')" ;;
                 esac
@@ -5996,6 +6114,9 @@ cmd_help_cmd() {
         ssh)
             ssh_usage
             ;;
+        completion|completions)
+            completion_usage
+            ;;
         help)
             printf '%bjroot help%b - show this help\n\n' "$H" "$N"
             printf '    %bjroot help%b            (all commands)\n' "$G" "$N"
@@ -6023,8 +6144,8 @@ cmd_help() {
     help_row "jroot enter" "<name> <cmd...>"       "Run one command inside a jail"
     help_row "jroot enter" "<name> --root <cmd>"   "Run a command as root (admin)"
     help_row "jroot exec" "<name> [--root] <cmd>"  "Run one command inside a jail"
-    help_row "jroot file" "cp|mv <name> <src> <dst>" "Copy/move a file in or out of a jail"
-    printf '                                      %b (prefix jail paths with %b:%b, e.g. %b:/root/file%b)\n' "$B" "$G" "$N" "$G" "$N"
+    help_row "jroot file" "cp|mv <src> <dst>"      "Copy/move files between the host and jails"
+    printf '                                      %b (a jail side is written %bdev:/path%b)\n' "$B" "$G" "$N"
     help_row "jroot port" "list|add|rm <name>"    "Control which jailed ports may bind publicly"
     help_row "jroot net" "[set <name> auto|off]"  "Per-jail loopback address (no port collisions)"
     help_row "jroot mnt" "<name> <label> <dir>"   "Bind-mount a host directory at /mnt/<label>"
@@ -6055,6 +6176,7 @@ cmd_help() {
     help_row "jroot kill" "<name>"      "Terminate a running jail"
     help_row "jroot ps" ""              "List running jails"
     help_row "jroot ssh" "<name> start|stop|status" "SSH access into a jail (persistent daemon)"
+    help_row "jroot completion" "bash|zsh|fish" "Print a shell completion script"
     help_row "jroot help" "[command]"     "Show help (for one command too)"
     printf '\n'
 
@@ -6090,6 +6212,786 @@ cmd_help() {
     printf '    %b$%b %s\n' "$G" "$N" "jroot enter dev apt-get install htop  # for Ubuntu"
 }
 
+# ---------------------------------------------------------------------------
+# Shell completion
+#
+# The scripts are printed rather than installed so they can be piped wherever a
+# given shell wants them, and regenerated after an upgrade adds a command.
+# Everything they need is readable straight off the host - jail names are files
+# in configs/, snapshot labels are files in snapshots/<jail>/ - so completing a
+# name never starts a jail or shells out to jroot itself.
+# ---------------------------------------------------------------------------
+completion_usage() {
+    printf '%bjroot completion%b - print a shell completion script\n\n' "$H" "$N"
+    printf '    %bjroot completion bash%b\n' "$G" "$N"
+    printf '    %bjroot completion zsh%b\n' "$G" "$N"
+    printf '    %bjroot completion fish%b\n' "$G" "$N"
+    printf '\n'
+    printf '    Completes commands, jail names, subcommands, snapshot and mount labels,\n'
+    printf '    public ports and flags - and paths %binside%b a jail after %b<jail>:%b\n' "$H" "$N" "$G" "$N"
+    printf '\n'
+    printf '    %bInstall it once:%b\n' "$H" "$N"
+    printf '      %bbash%b   jroot completion bash > ~/.local/share/bash-completion/completions/jroot\n' "$G" "$N"
+    printf '      %bzsh%b    jroot completion zsh > "${fpath[1]}/_jroot"   %b(then run compinit)%b\n' "$G" "$N" "$D" "$N"
+    printf '      %bfish%b   jroot completion fish > ~/.config/fish/completions/jroot.fish\n' "$G" "$N"
+    printf '\n'
+    printf '    %bJust this shell:%b  eval "$(jroot completion bash)"\n' "$H" "$N"
+}
+
+cmd_completion() {
+    case "${1:-}" in
+        bash)            completion_bash ;;
+        zsh)             completion_zsh ;;
+        fish)            completion_fish ;;
+        ""|-h|--help)    completion_usage ;;
+        *)               completion_usage
+                         err "Unknown shell '$1'. Use bash, zsh or fish." ;;
+    esac
+}
+
+completion_bash() {
+cat <<'BASH_COMPLETION_EOF'
+# jroot completion for bash.   Generated by: jroot completion bash
+#
+# Arguments are parsed out of COMP_LINE instead of COMP_WORDS on purpose: a jail
+# path is written "<jail>:/path", ':' is in COMP_WORDBREAKS, so COMP_WORDS splits
+# that one argument into three words and every position test after it is wrong.
+# The trade-off is that a quoted argument containing spaces counts as several
+# words; jail names, subcommands and flags never contain spaces.
+
+_jroot_home() { printf '%s' "${JROOT_HOME:-$HOME/.jroot}"; }
+
+_jroot_jails() {
+    local f n
+    for f in "$(_jroot_home)"/configs/*.json; do
+        [ -e "$f" ] || continue
+        n="${f##*/}"
+        printf '%s\n' "${n%.json}"
+    done
+}
+
+_jroot_snapshots() {
+    local f n
+    [ -n "$1" ] || return 0
+    for f in "$(_jroot_home)"/snapshots/"$1"/*.tar.gz; do
+        [ -e "$f" ] || continue
+        n="${f##*/}"
+        printf '%s\n' "${n%.tar.gz}"
+    done
+}
+
+# Public ports and mount labels out of the jail config. python3 writes it with
+# indent=2, so the file is flattened first rather than read a line at a time -
+# and a TAB press has no business forking a python interpreter.
+_jroot_cfg_list() {
+    local cfg flat rest
+    cfg="$(_jroot_home)/configs/$1.json"
+    [ -f "$cfg" ] || return 0
+    flat="$(tr -d ' \n\t' < "$cfg" 2>/dev/null)" || return 0
+    if [ "$2" = "ports" ]; then
+        rest="${flat#*\"ports\":[}"
+        [ "$rest" != "$flat" ] || return 0
+        printf '%s\n' "${rest%%]*}" | tr ',' '\n'
+    else
+        rest="${flat#*\"mounts\":[}"
+        [ "$rest" != "$flat" ] || return 0
+        printf '%s\n' "${rest%%]]*}" | grep -o '\["[^"]*"' | sed 's/\["//; s/"$//'
+    fi
+}
+
+# Complete a path inside a jail's rootfs, read straight off the host.
+#   $1 jail   $2 partial absolute path   $3 prefix to keep on every match
+_jroot_jail_path() {
+    local jail="$1" p="$2" prefix="$3" root dir base e rel had_nullglob=0
+    root="$(_jroot_home)/roots/$jail"
+    [ -d "$root" ] || return 0
+    dir="${p%/*}/"
+    base="${p##*/}"
+    shopt -q nullglob && had_nullglob=1
+    shopt -s nullglob
+    COMPREPLY=()
+    for e in "$root$dir$base"*; do
+        rel="${e#"$root"}"
+        if [ -d "$e" ]; then rel="$rel/"; fi
+        COMPREPLY+=("$prefix$rel")
+    done
+    [ "$had_nullglob" = 1 ] || shopt -u nullglob
+    # A directory match must not get a space, or the next TAB has nothing to
+    # continue from.
+    if [ "${#COMPREPLY[@]}" -eq 1 ] && [[ "${COMPREPLY[0]}" == */ ]]; then
+        compopt -o nospace 2>/dev/null
+    fi
+}
+
+# One side of 'jroot file cp|mv': "<jail>:/path", a host path, or ':/path' when
+# the legacy form named the jail up front ($2).
+_jroot_file_arg() {
+    local cur="$1" ctx="$2" jail j list="" njail=0
+    local -a fm
+    case "$cur" in
+        :*)
+            [ -n "$ctx" ] || return 0
+            _jroot_jail_path "$ctx" "${cur#:}" ":"
+            return 0
+            ;;
+        *:*)
+            jail="${cur%%:*}"
+            if [ -d "$(_jroot_home)/roots/$jail" ]; then
+                _jroot_jail_path "$jail" "${cur#*:}" "$jail:"
+                return 0
+            fi
+            ;;
+    esac
+    while read -r j; do
+        [ -n "$j" ] && list="$list $j:"
+    done < <(_jroot_jails)
+    COMPREPLY=()
+    if [ -n "$list" ]; then
+        COMPREPLY=($(compgen -W "$list" -- "$cur"))
+        njail="${#COMPREPLY[@]}"
+    fi
+    fm=($(compgen -f -- "$cur"))
+    if [ "${#fm[@]}" -gt 0 ]; then
+        COMPREPLY+=("${fm[@]}")
+        compopt -o filenames 2>/dev/null
+    elif [ "$njail" -ge 1 ]; then
+        compopt -o nospace 2>/dev/null
+    fi
+}
+
+# COMPREPLY is built against our idea of the current word, which may contain ':'
+# or '=' - both in COMP_WORDBREAKS, so bash replaces only the text after the last
+# break character. Trim off the part bash is keeping.
+_jroot_trim() {
+    local ours="$1" tail="${COMP_WORDS[COMP_CWORD]}" pre i
+    [ "$ours" = "$tail" ] && return 0
+    case "$ours" in *"$tail") ;; *) return 0 ;; esac
+    pre="${ours%"$tail"}"
+    [ -n "$pre" ] || return 0
+    for ((i = 0; i < ${#COMPREPLY[@]}; i++)); do
+        COMPREPLY[i]="${COMPREPLY[i]#"$pre"}"
+    done
+}
+
+_jroot() {
+    local line cur cmd idx jails ctx
+    local -a w
+    line="${COMP_LINE:0:COMP_POINT}"
+    read -r -a w <<<"$line"
+    if [ "${#w[@]}" -eq 0 ] || [[ "$line" =~ [[:space:]]$ ]]; then
+        cur=""
+        idx="${#w[@]}"
+    else
+        idx=$(( ${#w[@]} - 1 ))
+        cur="${w[$idx]}"
+    fi
+    COMPREPLY=()
+
+    local cmds="init enter exec shell install config file port net mnt ssh list info
+size history compare which doctor snapshot snapshots revert rm-snapshot update
+clean rename kill ps rm completion help"
+
+    if [ "$idx" -le 1 ]; then
+        COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
+        _jroot_trim "$cur"
+        return 0
+    fi
+
+    cmd="${w[1]}"
+    jails="$(_jroot_jails)"
+
+    case "$cmd" in
+        init)
+            # 'jroot init --list' is the authoritative list; these are the ones
+            # worth offering without shelling out.
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "--list ubuntu:16.04 ubuntu:18.04 ubuntu:20.04
+ubuntu:22.04 ubuntu:24.04 ubuntu:24.10 alpine:3.19 alpine:3.20 alpine:3.21
+alpine:3.22 alpine:edge" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--name= --user=root --user=unroot
+--build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1
+--mount-home=0 --mount-home=1" -- "$cur"))
+            fi
+            ;;
+        enter|exec)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--root" -- "$cur"))
+            fi
+            ;;
+        install|info|size|snapshots|update|snapshot|rename|rm|delete)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            fi
+            ;;
+        clean)
+            COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            ;;
+        config)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--show --user=root --user=unroot
+--build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1
+--mount-home=0 --mount-home=1" -- "$cur"))
+            fi
+            ;;
+        file)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "cp mv" -- "$cur"))
+            else
+                ctx=""
+                if [ -n "${w[3]:-}" ] && [ -f "$(_jroot_home)/configs/${w[3]}.json" ]; then
+                    ctx="${w[3]}"
+                fi
+                _jroot_file_arg "$cur" "$ctx"
+            fi
+            ;;
+        port)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "list add rm" -- "$cur")) ;;
+                4) if [ "${w[3]:-}" = "rm" ]; then
+                       COMPREPLY=($(compgen -W "$(_jroot_cfg_list "${w[2]}" ports)" -- "$cur"))
+                   fi ;;
+            esac
+            ;;
+        net)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "set" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                4) COMPREPLY=($(compgen -W "auto off" -- "$cur")) ;;
+            esac
+            ;;
+        mnt|mount)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "list set rm $(_jroot_cfg_list "${w[2]}" labels)" -- "$cur")) ;;
+                4) case "${w[3]:-}" in
+                       set|rm) COMPREPLY=($(compgen -W "$(_jroot_cfg_list "${w[2]}" labels)" -- "$cur")) ;;
+                       list)   ;;
+                       *)      COMPREPLY=($(compgen -d -- "$cur"))
+                               compopt -o filenames 2>/dev/null ;;
+                   esac ;;
+                5) COMPREPLY=($(compgen -W "rw ro" -- "$cur")) ;;
+            esac
+            ;;
+        ssh)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "start stop status passwd log" -- "$cur")) ;;
+                *) if [ "${w[3]:-}" = "start" ]; then
+                       COMPREPLY=($(compgen -W "--port= --user= --key= --password=
+--password-stdin --random-password --ask-password --no-password --permit-root" -- "$cur"))
+                   fi ;;
+            esac
+            ;;
+        revert|rm-snapshot)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "$(_jroot_snapshots "${w[2]}")" -- "$cur")) ;;
+            esac
+            ;;
+        list|ls)
+            COMPREPLY=($(compgen -W "--json" -- "$cur"))
+            ;;
+        history)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails --json --limit= --clear" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--json --limit= --clear" -- "$cur"))
+            fi
+            ;;
+        compare|diff)
+            if [ "$idx" -le 3 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--all" -- "$cur"))
+            fi
+            ;;
+        which)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--all" -- "$cur"))
+            fi
+            ;;
+        kill|stop)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--force" -- "$cur"))
+            fi
+            ;;
+        doctor)
+            COMPREPLY=($(compgen -W "--mute=7d --mute=forever --mute=off" -- "$cur"))
+            ;;
+        completion)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+            fi
+            ;;
+        help)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
+            elif [ "${w[2]:-}" = "file" ]; then
+                COMPREPLY=($(compgen -W "cp mv" -- "$cur"))
+            fi
+            ;;
+    esac
+
+    _jroot_trim "$cur"
+    return 0
+}
+
+complete -F _jroot jroot
+BASH_COMPLETION_EOF
+}
+
+completion_zsh() {
+cat <<'ZSH_COMPLETION_EOF'
+#compdef jroot
+# jroot completion for zsh.   Generated by: jroot completion zsh
+#
+# Install:  jroot completion zsh > "${fpath[1]}/_jroot"   (then run compinit)
+#
+# Positions are numbered the way the bash script numbers them - 2 is the first
+# argument after the command - so the two stay easy to compare. zsh words are
+# 1-based with words[1]="jroot", hence words[pos+1].
+
+_jroot_home() { print -r -- "${JROOT_HOME:-$HOME/.jroot}" }
+
+_jroot_jails() {
+    local -a names
+    local f
+    for f in $(_jroot_home)/configs/*.json(N); do
+        names+=("${f:t:r}")
+    done
+    (( ${#names} )) || return 1
+    _describe -t jails 'jail' names
+}
+
+_jroot_snaps() {
+    local -a labels
+    local f
+    [[ -n "$1" ]] || return 1
+    for f in $(_jroot_home)/snapshots/$1/*.tar.gz(N); do
+        labels+=("${${f:t}%.tar.gz}")
+    done
+    (( ${#labels} )) || return 1
+    _describe -t snapshots 'snapshot' labels
+}
+
+# Public ports and mount labels out of the jail config, which is written with
+# indent=2 - so it gets flattened first rather than read a line at a time.
+_jroot_cfg_list() {
+    local cfg="$(_jroot_home)/configs/$1.json"
+    [[ -f "$cfg" ]] || return 1
+    local -a items
+    if [[ "$2" == ports ]]; then
+        items=(${(f)"$(tr -d ' \n\t' < $cfg | sed -n 's/.*"ports":\[\([^]]*\)\].*/\1/p' | tr ',' '\n')"})
+    else
+        items=(${(f)"$(tr -d ' \n\t' < $cfg | sed -n 's/.*"mounts":\[\(.*\)\]\].*/\1/p' | grep -o '\["[^"]*"' | sed 's/\["//; s/"$//')"})
+    fi
+    (( ${#items} )) || return 1
+    compadd -- $items
+}
+
+# One side of 'jroot file cp|mv'. compset -P strips the "<jail>:" prefix so
+# _files completes inside the rootfs and the insertion lands after the colon,
+# the same trick scp's completion uses for host:path.
+_jroot_file_arg() {
+    local cur="${words[CURRENT]}" jail root
+    if [[ "$cur" == :* ]]; then
+        jail="${words[4]}"
+        root="$(_jroot_home)/roots/$jail"
+        if [[ -n "$jail" && -d "$root" ]]; then
+            compset -P ':'
+            _files -W "$root"
+            return
+        fi
+    fi
+    if [[ "$cur" == *:* ]]; then
+        jail="${cur%%:*}"
+        root="$(_jroot_home)/roots/$jail"
+        if [[ -d "$root" ]]; then
+            compset -P '*:'
+            _files -W "$root"
+            return
+        fi
+    fi
+    local -a names
+    local f
+    for f in $(_jroot_home)/configs/*.json(N); do
+        names+=("${f:t:r}:")
+    done
+    (( ${#names} )) && compadd -S '' -- $names
+    _files
+}
+
+_jroot() {
+    local -a cmds
+    cmds=(
+        'init:create a jail from an Ubuntu or Alpine image'
+        'enter:open a shell, or run a command, inside a jail'
+        'exec:run one command inside a jail'
+        'shell:interactive jroot prompt'
+        'install:install packages inside a jail'
+        'config:view or change jail settings'
+        'file:copy or move files between host and jails'
+        'port:control which jailed ports may bind publicly'
+        'net:per-jail loopback address'
+        'mnt:bind-mount a host directory into a jail'
+        'ssh:SSH access into a jail'
+        'list:list all jails'
+        'info:show jail details'
+        'size:show disk usage per jail'
+        'history:what was done to a jail, and when'
+        'compare:diff two jails'
+        'which:find a program across jails'
+        'doctor:check the installation'
+        'snapshot:save a snapshot'
+        'snapshots:list snapshots'
+        'revert:restore a snapshot'
+        'rm-snapshot:delete a snapshot'
+        'update:update runtime and jail packages'
+        'clean:free disk space inside a jail'
+        'rename:rename a jail'
+        'kill:terminate a running jail'
+        'ps:list running jails'
+        'rm:delete a jail'
+        'completion:print a shell completion script'
+        'help:show help'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'jroot command' cmds
+        return
+    fi
+
+    local cmd="${words[2]}"
+    local pos=$(( CURRENT - 1 ))
+
+    case "$cmd" in
+        init)
+            local -a images
+            if (( pos == 2 )); then
+                images=(--list ubuntu:16.04 ubuntu:18.04 ubuntu:20.04 ubuntu:22.04
+                        ubuntu:24.04 ubuntu:24.10 alpine:3.19 alpine:3.20
+                        alpine:3.21 alpine:3.22 alpine:edge)
+                compadd -- $images
+            else
+                compadd -S '' -- --name= --user= --build-essential= --mount-host= --mount-home=
+            fi
+            ;;
+        enter|exec)
+            if (( pos == 2 )); then _jroot_jails; else compadd -- --root; fi
+            ;;
+        install|info|size|snapshots|update|snapshot|rename|rm|delete)
+            (( pos == 2 )) && _jroot_jails
+            ;;
+        clean)
+            _jroot_jails
+            ;;
+        config)
+            if (( pos == 2 )); then
+                _jroot_jails
+            else
+                compadd -- --show
+                compadd -S '' -- --user= --build-essential= --mount-host= --mount-home=
+            fi
+            ;;
+        file)
+            if (( pos == 2 )); then compadd -- cp mv; else _jroot_file_arg; fi
+            ;;
+        port)
+            case $pos in
+                2) _jroot_jails ;;
+                3) compadd -- list add rm ;;
+                4) [[ "${words[4]}" == rm ]] && _jroot_cfg_list "${words[3]}" ports ;;
+            esac
+            ;;
+        net)
+            case $pos in
+                2) compadd -- set ;;
+                3) _jroot_jails ;;
+                4) compadd -- auto off ;;
+            esac
+            ;;
+        mnt|mount)
+            case $pos in
+                2) _jroot_jails ;;
+                3) compadd -- list set rm
+                   _jroot_cfg_list "${words[3]}" labels ;;
+                4) case "${words[4]}" in
+                       set|rm) _jroot_cfg_list "${words[3]}" labels ;;
+                       list)   ;;
+                       *)      _files -/ ;;
+                   esac ;;
+                5) compadd -- rw ro ;;
+            esac
+            ;;
+        ssh)
+            case $pos in
+                2) _jroot_jails ;;
+                3) compadd -- start stop status passwd log ;;
+                *) if [[ "${words[4]}" == start ]]; then
+                       compadd -- --password-stdin --random-password --ask-password \
+                                  --no-password --permit-root
+                       compadd -S '' -- --port= --user= --key= --password=
+                   fi ;;
+            esac
+            ;;
+        revert|rm-snapshot)
+            case $pos in
+                2) _jroot_jails ;;
+                3) _jroot_snaps "${words[3]}" ;;
+            esac
+            ;;
+        list|ls)      compadd -- --json ;;
+        history)
+            (( pos == 2 )) && _jroot_jails
+            compadd -- --json --clear
+            compadd -S '' -- --limit=
+            ;;
+        compare|diff)
+            if (( pos <= 3 )); then _jroot_jails; else compadd -- --all; fi
+            ;;
+        which)
+            (( pos == 2 )) && _jroot_jails
+            compadd -- --all
+            ;;
+        kill|stop)
+            if (( pos == 2 )); then _jroot_jails; else compadd -- --force; fi
+            ;;
+        doctor)       compadd -- --mute=7d --mute=forever --mute=off ;;
+        completion)   (( pos == 2 )) && compadd -- bash zsh fish ;;
+        help)
+            if (( pos == 2 )); then
+                _describe -t commands 'jroot command' cmds
+            elif [[ "${words[3]}" == file ]]; then
+                compadd -- cp mv
+            fi
+            ;;
+    esac
+}
+
+_jroot "$@"
+ZSH_COMPLETION_EOF
+}
+
+completion_fish() {
+cat <<'FISH_COMPLETION_EOF'
+# jroot completion for fish.   Generated by: jroot completion fish
+#
+# Install:  jroot completion fish > ~/.config/fish/completions/jroot.fish
+#
+# Positions are numbered the way the bash script numbers them - 2 is the first
+# argument after the command. 'commandline -poc' drops the word being typed, so
+# the count of tokens is exactly that position.
+
+function __jroot_home
+    if set -q JROOT_HOME
+        echo $JROOT_HOME
+    else
+        echo $HOME/.jroot
+    end
+end
+
+# 'ls' rather than a glob: an unmatched glob is an error in fish, and "no jails
+# yet" is a completely normal state.
+function __jroot_jails
+    set -l dir (__jroot_home)/configs
+    test -d $dir; or return
+    for f in (command ls $dir 2>/dev/null)
+        string match -q '*.json' -- $f; and string replace -r '\.json$' '' -- $f
+    end
+end
+
+function __jroot_snapshots -a jail
+    test -n "$jail"; or return
+    set -l dir (__jroot_home)/snapshots/$jail
+    test -d $dir; or return
+    for f in (command ls $dir 2>/dev/null)
+        string match -q '*.tar.gz' -- $f; and string replace -r '\.tar\.gz$' '' -- $f
+    end
+end
+
+function __jroot_cfg_list -a jail kind
+    test -n "$jail"; or return
+    set -l cfg (__jroot_home)/configs/$jail.json
+    test -f $cfg; or return
+    # Flattened first: the config is written with indent=2, so nothing useful
+    # sits on a single line.
+    if test "$kind" = ports
+        tr -d ' \n\t' < $cfg | sed -n 's/.*"ports":\[\([^]]*\)\].*/\1/p' | tr ',' '\n'
+    else
+        tr -d ' \n\t' < $cfg | sed -n 's/.*"mounts":\[\(.*\)\]\].*/\1/p' | grep -o '\["[^"]*"' | sed 's/\["//; s/"$//'
+    end
+end
+
+function __jroot_pos
+    set -l tokens (commandline -poc)
+    count $tokens
+end
+
+function __jroot_cmd
+    set -l tokens (commandline -poc)
+    test (count $tokens) -ge 2; or return
+    echo $tokens[2]
+end
+
+# The argument at <pos>, numbered like the bash script (2 = first after cmd).
+function __jroot_arg -a n
+    set -l tokens (commandline -poc)
+    set -l i (math $n + 1)
+    test (count $tokens) -ge $i; or return
+    echo $tokens[$i]
+end
+
+function __jroot_at -a want
+    test (__jroot_pos) -eq $want
+end
+
+function __jroot_from -a want
+    test (__jroot_pos) -ge $want
+end
+
+function __jroot_is
+    set -l c (__jroot_cmd)
+    test -n "$c"; or return 1
+    contains -- $c $argv
+end
+
+function __jroot_arg_is
+    set -l v (__jroot_arg $argv[1])
+    test -n "$v"; or return 1
+    contains -- $v $argv[2..-1]
+end
+
+function __jroot_jail_paths -a jail rest prefix
+    set -l root (__jroot_home)/roots/$jail
+    test -d $root; or return
+    set -l dir (string replace -r '[^/]*$' '' -- $rest)
+    set -l base (string replace -r '^.*/' '' -- $rest)
+    test -d "$root$dir"; or return
+    for e in (command find "$root$dir" -maxdepth 1 -mindepth 1 -name "$base*" 2>/dev/null | sort)
+        set -l rel (string replace -- "$root" '' $e)
+        if test -d $e
+            printf '%s%s/\n' $prefix $rel
+        else
+            printf '%s%s\n' $prefix $rel
+        end
+    end
+end
+
+function __jroot_file_arg
+    set -l tok (commandline -ct)
+    if string match -q ':*' -- $tok
+        # Older form: 'jroot file cp <jail> <src> <dst>', where ':' is that jail.
+        set -l jail (__jroot_arg 3)
+        test -n "$jail"; or return
+        __jroot_jail_paths $jail (string sub -s 2 -- $tok) ':'
+        return
+    end
+    if string match -q '*:*' -- $tok
+        set -l parts (string split -m1 ':' -- $tok)
+        if test -d (__jroot_home)/roots/$parts[1]
+            __jroot_jail_paths $parts[1] $parts[2] "$parts[1]:"
+            return
+        end
+    end
+    for j in (__jroot_jails)
+        printf '%s:\tjail\n' $j
+    end
+end
+
+complete -c jroot -f
+
+# Commands
+complete -c jroot -n '__jroot_at 1' -a init        -d 'Create a jail from an image'
+complete -c jroot -n '__jroot_at 1' -a enter       -d 'Open a shell inside a jail'
+complete -c jroot -n '__jroot_at 1' -a exec        -d 'Run one command inside a jail'
+complete -c jroot -n '__jroot_at 1' -a shell       -d 'Interactive jroot prompt'
+complete -c jroot -n '__jroot_at 1' -a install     -d 'Install packages inside a jail'
+complete -c jroot -n '__jroot_at 1' -a config      -d 'View or change jail settings'
+complete -c jroot -n '__jroot_at 1' -a file        -d 'Copy or move files host <-> jail'
+complete -c jroot -n '__jroot_at 1' -a port        -d 'Ports allowed to bind publicly'
+complete -c jroot -n '__jroot_at 1' -a net         -d 'Per-jail loopback address'
+complete -c jroot -n '__jroot_at 1' -a mnt         -d 'Bind-mount a host directory'
+complete -c jroot -n '__jroot_at 1' -a ssh         -d 'SSH access into a jail'
+complete -c jroot -n '__jroot_at 1' -a list        -d 'List all jails'
+complete -c jroot -n '__jroot_at 1' -a info        -d 'Show jail details'
+complete -c jroot -n '__jroot_at 1' -a size        -d 'Show disk usage per jail'
+complete -c jroot -n '__jroot_at 1' -a history     -d 'What was done to a jail'
+complete -c jroot -n '__jroot_at 1' -a compare     -d 'Diff two jails'
+complete -c jroot -n '__jroot_at 1' -a which       -d 'Find a program across jails'
+complete -c jroot -n '__jroot_at 1' -a doctor      -d 'Check the installation'
+complete -c jroot -n '__jroot_at 1' -a snapshot    -d 'Save a snapshot'
+complete -c jroot -n '__jroot_at 1' -a snapshots   -d 'List snapshots'
+complete -c jroot -n '__jroot_at 1' -a revert      -d 'Restore a snapshot'
+complete -c jroot -n '__jroot_at 1' -a rm-snapshot -d 'Delete a snapshot'
+complete -c jroot -n '__jroot_at 1' -a update      -d 'Update runtime and packages'
+complete -c jroot -n '__jroot_at 1' -a clean       -d 'Free disk space in a jail'
+complete -c jroot -n '__jroot_at 1' -a rename      -d 'Rename a jail'
+complete -c jroot -n '__jroot_at 1' -a kill        -d 'Terminate a running jail'
+complete -c jroot -n '__jroot_at 1' -a ps          -d 'List running jails'
+complete -c jroot -n '__jroot_at 1' -a rm          -d 'Delete a jail'
+complete -c jroot -n '__jroot_at 1' -a completion  -d 'Print a completion script'
+complete -c jroot -n '__jroot_at 1' -a help        -d 'Show help'
+
+# A jail name as the first argument. One long line per rule on purpose: fish
+# splits an -a list on whitespace and a backslash inside single quotes stays a
+# literal backslash, so there is no safe way to wrap these.
+complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec install config info size snapshots snapshot update rename rm delete clean port mnt mount ssh which history compare kill stop revert rm-snapshot' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is clean; and __jroot_from 2' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is compare diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
+
+# init
+complete -c jroot -n '__jroot_is init; and __jroot_at 2' -a '--list ubuntu:16.04 ubuntu:18.04 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 ubuntu:24.10 alpine:3.19 alpine:3.20 alpine:3.21 alpine:3.22 alpine:edge'
+complete -c jroot -n '__jroot_is init; and __jroot_from 3' -a '--name= --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1'
+
+# enter / exec / config
+complete -c jroot -n '__jroot_is enter exec; and __jroot_from 3' -a --root
+complete -c jroot -n '__jroot_is config; and __jroot_from 3' -a '--show --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1'
+
+# file: 'cp'/'mv', then jail-aware paths. -F so ordinary host paths still work.
+complete -c jroot -n '__jroot_is file; and __jroot_at 2' -a 'cp mv'
+complete -c jroot -n '__jroot_is file; and __jroot_from 3' -a '(__jroot_file_arg)' -F
+
+# port / net / mnt
+complete -c jroot -n '__jroot_is port; and __jroot_at 3' -a 'list add rm'
+complete -c jroot -n '__jroot_is port; and __jroot_at 4; and __jroot_arg_is 3 rm' -a '(__jroot_cfg_list (__jroot_arg 2) ports)'
+complete -c jroot -n '__jroot_is net; and __jroot_at 2' -a set
+complete -c jroot -n '__jroot_is net; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is net; and __jroot_at 4' -a 'auto off'
+complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 3' -a 'list set rm'
+complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 3' -a '(__jroot_cfg_list (__jroot_arg 2) labels)' -d 'mount label'
+complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 4; and __jroot_arg_is 3 set rm' -a '(__jroot_cfg_list (__jroot_arg 2) labels)' -d 'mount label'
+complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 4; and not __jroot_arg_is 3 set rm list' -F
+complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 5' -a 'rw ro'
+
+# ssh. Value-taking flags keep the '=' attached, because jroot accepts
+# --port=22001 and not --port 22001.
+complete -c jroot -n '__jroot_is ssh; and __jroot_at 3' -a 'start stop status passwd log'
+complete -c jroot -n '__jroot_is ssh; and __jroot_arg_is 3 start' -a '--password-stdin --random-password --ask-password --no-password --permit-root --port= --user= --key= --password='
+
+# snapshots and the rest
+complete -c jroot -n '__jroot_is revert rm-snapshot; and __jroot_at 3' -a '(__jroot_snapshots (__jroot_arg 2))' -d snapshot
+complete -c jroot -n '__jroot_is list ls' -a --json
+complete -c jroot -n '__jroot_is history' -a '--json --clear --limit='
+complete -c jroot -n '__jroot_is compare diff; and __jroot_from 4' -a --all
+complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
+complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
+complete -c jroot -n '__jroot_is doctor' -a '--mute=7d --mute=forever --mute=off'
+complete -c jroot -n '__jroot_is completion; and __jroot_at 2' -a 'bash zsh fish'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init enter exec shell install config file port net mnt ssh list info size history compare which doctor snapshot snapshots revert rm-snapshot update clean rename kill ps rm completion help'
+complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
+FISH_COMPLETION_EOF
+}
+
 jroot_cmd() {
     [ $# -ge 1 ] || { cmd_help; return 0; }
     case "$1" in
@@ -6121,6 +7023,7 @@ jroot_cmd() {
         kill|stop)     shift; cmd_kill "$@" ;;
         ps)            shift; cmd_ps "$@" ;;
         ssh)           shift; cmd_ssh "$@" ;;
+        completion|completions) shift; cmd_completion "$@" ;;
         help|--help|-h) shift; cmd_help "$@" ;;
         *)             err "Unknown command: $1 (run '${CMD_HINT}help')" ;;
     esac
