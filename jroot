@@ -659,6 +659,48 @@ static in_addr_t jail_loopback(void) {
     return cached;
 }
 
+/* ---- port remapping ---------------------------------------------------- *
+ * JROOT_PORT_MAP carries "from=to" pairs, comma separated, e.g. "22=22022".
+ *
+ * The reason this exists: a rootless jail has fake root, not CAP_NET_BIND_
+ * SERVICE, so bind() on any port below 1024 fails with EACCES no matter what
+ * getuid() claims. `jroot ssh` still wants sshd to *believe* it owns port 22 -
+ * its config says 22, its logs say 22, `ss` inside the jail says 22 - so the
+ * shim silently moves the actual socket to a high port and the host-side
+ * redirector forwards to that instead. The mapping is applied to bind(),
+ * connect() and sendto() symmetrically, so a client inside the jail dialling
+ * localhost:22 also lands on the real socket.
+ *
+ * Deliberately generic rather than hardcoded to 22: the same mechanism lets any
+ * privileged-port service (80, 443, 25) run inside a rootless jail unchanged.
+ */
+static int port_remap(int port) {
+    static char *map = NULL;
+    static int loaded = 0;
+    char *tok, *save = NULL;
+    int from, to, result = port;
+    if (!loaded) {
+        const char *e = getenv("JROOT_PORT_MAP");
+        map = (e && *e) ? strdup(e) : NULL;
+        loaded = 1;
+    }
+    if (!map) return port;
+    {
+        char *dup = strdup(map);
+        if (!dup) return port;
+        for (tok = strtok_r(dup, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            char *eq = strchr(tok, '=');
+            if (!eq) continue;
+            *eq = 0;
+            from = parse_port(tok);
+            to = parse_port(eq + 1);
+            if (from == port && to > 0) { result = to; break; }
+        }
+        free(dup);
+    }
+    return result;
+}
+
 int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     if (!real_bind) real_bind = (bind_fn)dlsym(RTLD_NEXT, "bind");
     if (!addr) return real_bind(fd, addr, len);
