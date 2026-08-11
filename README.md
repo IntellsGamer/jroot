@@ -438,7 +438,10 @@ Public ports are unaffected: `jroot port web add 8080` binds `0.0.0.0` and ignor
 
 PRoot binds the host `/proc`, so without help a jailed `ps aux` lists every process on the machine, command lines included, and `pkill` inside a jail can match host processes by accident.
 
-The shim filters directory reads of `/proc` down to the jail's own process tree:
+The shim filters `/proc` at **two levels**:
+
+1. **Directory listing** — `readdir()` on `/proc` skips numeric entries (PIDs) that don't belong to this jail
+2. **Direct path access** — `open()`, `stat()`, `access()`, `readlink()`, and every other syscall on `/proc/<pid>/...` returns `ENOENT` for foreign PIDs
 
 ```bash
 $ ps -e | wc -l      # on the host
@@ -450,11 +453,79 @@ $ jroot exec dev ps -e
   28980 ?        00:00:00 proot
   28981 ?        00:00:00 sh
   28982 ?        00:00:00 ps
+
+# Even direct access to a host PID is blocked:
+$ jroot exec dev cat /proc/1/cmdline
+cat: /proc/1/cmdline: No such file or directory
 ```
 
 Membership is decided two ways: a process is part of the jail if the same PRoot instance traces it — which covers daemons that double-forked and were reparented to host PID 1 — or if its parent chain leads back to the jail's root process.
 
-This is a usability and privacy feature, not a security boundary. It covers the glibc `readdir()` path (`ls`, `ps`, `htop`, Python's `os.listdir`), but a program issuing `getdents64()` itself still sees everything, and `/proc/<pid>` remains readable when opened by exact path. Set `JROOT_SHOW_ALL_PROCS=1` to turn it off.
+This covers the glibc `readdir()` path (`ls`, `ps`, `htop`, Python's `os.listdir`) **and** direct path access (`open`, `stat`, `readlink`). A statically-linked binary issuing raw `getdents64()` still sees everything, as does anything that bypasses the dynamic linker. Set `JROOT_SHOW_ALL_PROCS=1` to turn it off.
+
+---
+
+# 🔑 SSH access
+
+JRoot can expose a jail over SSH so you can connect from another machine — or from the same machine in a different terminal — without needing an interactive `jroot enter` session open.
+
+```bash
+# Start SSH (auto-assigns a port in 22001-22099)
+jroot ssh dev start
+
+# Start on a specific port
+jroot ssh dev start 20022
+jroot ssh dev start --port=20022
+
+# Check status
+jroot ssh dev status
+
+# Stop
+jroot ssh dev stop
+```
+
+The jail thinks `sshd` is listening on port 22 internally. A redirector on the host (`socat` if available, otherwise sshd is reconfigured to listen directly) exposes it at `0.0.0.0:<port>`, so remote machines can reach it.
+
+```text
+Remote client
+     │
+     │  ssh -p 22001 jail@host
+     ▼
+┌──────────────────────────┐
+│  Host: socat             │
+│  0.0.0.0:22001           │
+│         │                │
+│         ▼                │
+│  jail loopback:22        │
+│  (proot + sshd -D)       │
+└──────────────────────────┘
+```
+
+**Key design decisions:**
+
+- The jail runs as a **persistent background daemon** (proot + sshd). It stays alive even after you close your terminal or exit your interactive session.
+- Auto-port picks the first free port in 22001-22099, checking both other jails' claims and what's already bound on the host.
+- Default credentials: `jail`/`jail` and `root`/`root`. Change them with `jroot enter dev --root passwd jail`.
+- `jroot ps` shows SSH daemons alongside interactive shells.
+- `jroot rm` automatically stops the SSH daemon before deleting a jail.
+- `jroot ssh dev stop` terminates the daemon and releases the port.
+
+```bash
+$ jroot ssh dev start
+[+] Ensuring openssh-server is installed in 'dev'...
+[+] Starting SSH daemon for 'dev' on external port 22001...
+[+] SSH for 'dev' is running.
+[+]   External port: 22001 (0.0.0.0:22001 -> jail:22)
+[+]   Connect: ssh -p 22001 jail@<host-ip>  (password: jail)
+[+]   Or:      ssh -p 22001 root@<host-ip>  (password: root)
+[+]   The jail stays alive in the background for SSH access.
+
+$ jroot ps
+JAIL             PID      TYPE   COMMAND
+dev              54321    sshd   port 22001
+```
+
+**Requirements:** `openssh-server` is installed inside the jail automatically on first `jroot ssh start`. On the host, `socat` is recommended for port redirection (it separates the internal port 22 from the external port); without it, sshd is configured to listen directly on the external port.
 
 ---
 

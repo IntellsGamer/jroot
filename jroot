@@ -13,6 +13,7 @@
 #   jroot port list|add|rm <name> [port]  Ports allowed to bind publicly
 #   jroot net [set <name> auto|off|addr]  Per-jail loopback address
 #   jroot mnt <name> [label dir [rw|ro]]  Bind a host dir at /mnt/<label>
+#   jroot ssh <name> start|stop|status [port]  SSH into a jail (persistent daemon)
 #   jroot config <name>         Show / change a jail's settings
 #   jroot list [--json]         List all jails (machine-readable with --json)
 #   jroot info [name]           Show a jail's details and rootfs size
@@ -864,6 +865,27 @@ static int path_is_denied(const char *path) {
         size_t bl = sizeof(bin) - 1;
         if (nl >= bl && strcmp(norm + nl - bl, bin) == 0) return 1;
     }
+    /* /proc process hiding: make /proc/<foreign_pid> and everything under it
+     * look non-existent. This blocks open(), stat(), access(), readlink() etc.
+     * on paths like /proc/1234/cmdline when pid 1234 is not part of this jail.
+     * Combined with the readdir() filter above, host processes become fully
+     * invisible to glibc-linked programs inside the jail. */
+    if (jp_enabled() && strncmp(norm, "/proc/", 6) == 0) {
+        const char *after = norm + 6;
+        if (*after >= '0' && *after <= '9') {
+            long pid = 0;
+            const char *p = after;
+            while (*p >= '0' && *p <= '9') {
+                pid = pid * 10 + (*p - '0');
+                if (pid > 0x7fffffff) goto proc_pass;
+                p++;
+            }
+            if (*p == '\0' || *p == '/') {
+                if (!jp_member((pid_t)pid)) return 1;
+            }
+        }
+    }
+proc_pass:
     return 0;
 }
 
@@ -2181,6 +2203,19 @@ show_config() {
     printf '  mount_home (~):   %s   (host $HOME at /mnt/home)\n' "$(config_field "$cfg" mount_home)"
     printf '  loopback addr:    %s\n' "${lb:-auto (assigned on first enter)}"
     printf '  public ports:     %s\n' "$(config_ports "$cfg" | sed 's/^$/none/')"
+    # SSH status
+    if [ -f "$(ssh_pid_file "$name")" ]; then
+        local ssh_pid ssh_port
+        ssh_pid="$(cat "$(ssh_pid_file "$name")" 2>/dev/null | tr -d ' ')"
+        ssh_port="$(cat "$(ssh_port_file "$name")" 2>/dev/null || echo '?')"
+        if kill -0 "$ssh_pid" 2>/dev/null; then
+            printf '  ssh:              running (port %s)\n' "$ssh_port"
+        else
+            printf '  ssh:              stopped (stale)\n'
+        fi
+    else
+        printf '  ssh:              stopped\n'
+    fi
     if config_mounts "$cfg" | grep -q .; then
         printf '  custom mounts:\n'
         while IFS=$'\t' read -r m_label m_hostpath m_mode; do
@@ -3584,9 +3619,14 @@ cmd_rm() {
         y|Y|yes|YES) ;;
         *) log "Aborted."; return 0 ;;
     esac
+    # Stop SSH daemon if running
+    if [ -f "$(ssh_pid_file "$name")" ]; then
+        ssh_stop "$name" 2>/dev/null || true
+    fi
     rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json"
     rm -f "$(history_file "$name")"
     rm -f "$JROOT_HOME/pids/$name.pid" 2>/dev/null || true
+    rm -f "$JROOT_HOME/pids/$name.sshd" "$JROOT_HOME/pids/$name.sshport" "$JROOT_HOME/pids/$name.socat" 2>/dev/null || true
     log "Jail '$name' deleted."
 }
 
@@ -3651,18 +3691,30 @@ cmd_kill() {
 
 cmd_ps() {
     local found=0
-    printf '%-16s %-8s %s\n' "JAIL" "PID" "COMMAND"
+    printf '%-16s %-8s %-6s %s\n' "JAIL" "PID" "TYPE" "COMMAND"
     for pidfile in "$JROOT_HOME/pids"/*.pid; do
         [ -f "$pidfile" ] || continue
         local name="$(basename "$pidfile" .pid)"
         local pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
         if kill -0 "$pid" 2>/dev/null; then
             local cmd="$(ps -o cmd= -p "$pid" 2>/dev/null | head -c 50)"
-            printf '%-16s %-8s %s\n' "$name" "$pid" "${cmd:-unknown}"
+            printf '%-16s %-8s %-6s %s\n' "$name" "$pid" "shell" "${cmd:-unknown}"
             found=1
         else
-            # Stale PID file
             rm -f "$pidfile"
+        fi
+    done
+    # Also show SSH daemons
+    for pidfile in "$JROOT_HOME/pids"/*.sshd; do
+        [ -f "$pidfile" ] || continue
+        local name="$(basename "$pidfile" .sshd)"
+        local pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+        if kill -0 "$pid" 2>/dev/null; then
+            local port="$(cat "$JROOT_HOME/pids/$name.sshport" 2>/dev/null || echo '?')"
+            printf '%-16s %-8s %-6s %s\n' "$name" "$pid" "sshd" "port $port"
+            found=1
+        else
+            rm -f "$pidfile" "$JROOT_HOME/pids/$name.sshport" "$JROOT_HOME/pids/$name.socat" 2>/dev/null
         fi
     done
     [ "$found" -eq 0 ] && log "No running jails."
@@ -4378,6 +4430,365 @@ cmd_which() {
 }
 
 # ---------------------------------------------------------------------------
+# jroot ssh <name> start|stop|status [--port|-p <port>|<port>]
+#
+# Starts an SSH daemon inside the jail via a PERSISTENT background proot
+# instance (so the jail keeps running even after the user exits their
+# interactive shell). The jail thinks sshd listens on port 22, but the host
+# redirects an external port (default: auto 2200xx) to the jail's loopback
+# address. This means the jail is reachable at:
+#   ssh -p <port> jail@<host-ip>
+#
+# Auto-port: 22001, 22002, ... picking the first one that is not already
+# in use by another jail's SSH or occupied on the host.
+# ---------------------------------------------------------------------------
+SSH_BASE_PORT=22001
+
+ssh_port_file() { printf '%s' "$JROOT_HOME/pids/$1.sshport"; }
+ssh_pid_file()  { printf '%s' "$JROOT_HOME/pids/$1.sshd"; }
+
+ssh_port_in_use() {
+    # Returns 0 if port $1 is already bound on the host.
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tlnH "sport = :$port" 2>/dev/null | grep -q . && return 0
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tlnp 2>/dev/null | grep -q ":$port " && return 0
+    fi
+    # Fallback: try to bind
+    (echo >/dev/tcp/127.0.0.1/"$port") 2>/dev/null && return 0
+    return 1
+}
+
+ssh_auto_port() {
+    # Find the lowest free port in 22001..22099 that is not claimed by another
+    # jail AND not already bound on the host.
+    local port claimed=()
+    shopt -s nullglob
+    for f in "$JROOT_HOME/pids"/*.sshport; do
+        claimed+=("$(cat "$f" 2>/dev/null)")
+    done
+    shopt -u nullglob
+    for port in $(seq "$SSH_BASE_PORT" $(( SSH_BASE_PORT + 98 )) ); do
+        local skip=0 c
+        for c in "${claimed[@]}"; do
+            [ "$c" = "$port" ] && { skip=1; break; }
+        done
+        [ "$skip" = 1 ] && continue
+        ssh_port_in_use "$port" && continue
+        printf '%s' "$port"
+        return 0
+    done
+    return 1
+}
+
+ssh_status() {
+    local name="$1"
+    local pidfile portfile pid port
+    pidfile="$(ssh_pid_file "$name")"
+    portfile="$(ssh_port_file "$name")"
+    if [ ! -f "$pidfile" ]; then
+        log "SSH for '$name': stopped"
+        return 1
+    fi
+    pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        warn "SSH for '$name': stale pid file (pid $pid is gone). Cleaning up."
+        rm -f "$pidfile" "$portfile"
+        return 1
+    fi
+    port="$(cat "$portfile" 2>/dev/null || echo '?')"
+    log "SSH for '$name': running (pid $pid, port $port)"
+    printf '  Connect: ssh -p %s jail@<host-ip>\n' "$port"
+    printf '  Or locally: ssh -p %s jail@127.0.0.1\n' "$port"
+    return 0
+}
+
+ssh_stop() {
+    local name="$1"
+    local pidfile portfile pid port
+    pidfile="$(ssh_pid_file "$name")"
+    portfile="$(ssh_port_file "$name")"
+    if [ ! -f "$pidfile" ]; then
+        log "SSH for '$name' is not running."
+        return 0
+    fi
+    pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+    port="$(cat "$portfile" 2>/dev/null || echo '?')"
+    if kill -0 "$pid" 2>/dev/null; then
+        log "Stopping SSH for '$name' (pid $pid, port $port)..."
+        # Kill the entire process group (proot + sshd + socat)
+        local pgid
+        pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
+            kill -TERM -"$pgid" 2>/dev/null || true
+            sleep 0.3
+            kill -KILL -"$pgid" 2>/dev/null || true
+        else
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 0.3
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$pidfile" "$portfile"
+    log "SSH for '$name' stopped."
+    record_event "$name" "ssh" "stopped (was port $port)"
+}
+
+ssh_start() {
+    local name="$1" want_port="$2"
+    local cfg="$CONFIGS_DIR/$name.json"
+    local rootfs="$ROOTS_DIR/$name"
+    local pidfile portfile
+    pidfile="$(ssh_pid_file "$name")"
+    portfile="$(ssh_port_file "$name")"
+
+    # Already running?
+    if [ -f "$pidfile" ]; then
+        local old_pid
+        old_pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+        if kill -0 "$old_pid" 2>/dev/null; then
+            local old_port
+            old_port="$(cat "$portfile" 2>/dev/null || echo '?')"
+            warn "SSH for '$name' is already running on port $old_port (pid $old_pid). Stop first: jroot ssh $name stop"
+            return 1
+        fi
+        # Stale
+        rm -f "$pidfile" "$portfile"
+    fi
+
+    # Resolve port
+    local port
+    if [ -n "$want_port" ]; then
+        port="$want_port"
+    else
+        port="$(ssh_auto_port)" || err "No free SSH port in range ${SSH_BASE_PORT}..$(( SSH_BASE_PORT + 98 )). Specify one manually."
+    fi
+    [[ "$port" =~ ^[0-9]+$ ]] || err "Port must be a number, got '$port'"
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || err "Port out of range: $port"
+
+    # Detect distro
+    local image_tag distro
+    image_tag="$(config_field "$cfg" image)"
+    distro="${image_tag%%:*}"
+
+    # Install openssh-server inside the jail if not already present
+    log "Ensuring openssh-server is installed in '$name'..."
+    if [ "$distro" = "alpine" ]; then
+        run_in_jail --root "$name" /bin/sh -c '
+            command -v sshd >/dev/null 2>&1 && exit 0
+            apk update >/dev/null 2>&1
+            apk add --no-cache openssh-server openssh-sftp-server >/dev/null 2>&1
+        ' || warn "Could not install openssh-server inside '$name'."
+    else
+        run_in_jail --root "$name" /bin/sh -c '
+            command -v sshd >/dev/null 2>&1 && exit 0
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update >/dev/null 2>&1
+            apt-get install -y --no-install-recommends openssh-server >/dev/null 2>&1
+        ' || warn "Could not install openssh-server inside '$name'."
+    fi
+
+    # Generate host keys if missing
+    run_in_jail --root "$name" /bin/sh -c '
+        mkdir -p /etc/ssh /run/sshd
+        chmod 755 /run/sshd
+        [ -f /etc/ssh/ssh_host_rsa_key ] || ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -N "" -q
+        [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q
+    ' 2>/dev/null || warn "Could not generate SSH host keys."
+
+    # Configure sshd to listen on port 22 inside the jail, allow password auth
+    run_in_jail --root "$name" /bin/sh -c '
+        mkdir -p /etc/ssh /run/sshd
+        chmod 755 /run/sshd
+        cat > /etc/ssh/sshd_config << SSHEOF
+Port 22
+ListenAddress 0.0.0.0
+PermitRootLogin yes
+PasswordAuthentication yes
+ChallengeResponseAuthentication no
+UsePAM no
+Subsystem sftp /usr/lib/openssh/sftp-server
+PidFile /run/sshd/sshd.pid
+SSHEOF
+        # Alpine uses a different sftp path
+        if [ -f /usr/lib/ssh/sftp-server ]; then
+            sed -i "s|/usr/lib/openssh/sftp-server|/usr/lib/ssh/sftp-server|" /etc/ssh/sshd_config
+        fi
+    ' 2>/dev/null || warn "Could not configure sshd."
+
+    # Set a password for the jail user if none is set
+    local user_mode
+    user_mode="$(config_field "$cfg" user)"; [ -n "$user_mode" ] || user_mode="root"
+    run_in_jail --root "$name" /bin/sh -c '
+        # Ensure user "jail" exists and has a password (default: "jail")
+        id jail >/dev/null 2>&1 || useradd -m -s /bin/bash jail 2>/dev/null || adduser -D -s /bin/bash jail 2>/dev/null || true
+        echo "jail:jail" | chpasswd 2>/dev/null || true
+        echo "root:root" | chpasswd 2>/dev/null || true
+        # Unlock root for sshd
+        passwd -u root 2>/dev/null || sed -i "s/^root:!/root:*/" /etc/shadow 2>/dev/null || true
+    ' 2>/dev/null || warn "Could not set SSH user passwords."
+
+    # Make sure the port is exposed publicly for this jail
+    local cur_ports
+    cur_ports="$(config_ports "$cfg")"
+    if ! echo ",$cur_ports," | grep -q ",$port,"; then
+        # Add the external port to the public list so socat can bind it
+        if [ -n "$cur_ports" ]; then
+            set_config_ports "$cfg" $(echo "$cur_ports,$port" | tr ',' ' ') >/dev/null 2>&1
+        else
+            set_config_ports "$cfg" "$port" >/dev/null 2>&1
+        fi
+    fi
+
+    # Start proot in the background running sshd in the foreground.
+    # Then socat on the host redirects external_port -> jail_loopback:22
+    # This way the jail thinks sshd is on port 22, while externally it's on $port.
+    log "Starting SSH daemon for '$name' on external port $port..."
+
+    # We need a redirector: socat listens on 0.0.0.0:$port and forwards to
+    # the jail's internal sshd on port 22. The jail's sshd runs via proot.
+    # The jail's loopback address (or 127.0.0.1 if off).
+    local jail_lb
+    jail_lb="$(jail_loopback_addr "$name")"
+    [ -n "$jail_lb" ] || jail_lb="127.0.0.1"
+
+    # Start proot+sshd in background as a daemon
+    (
+        # This subshell becomes the persistent proot process.
+        # sshd needs to run in the foreground (-D) so proot stays alive.
+        run_in_jail --root "$name" /usr/sbin/sshd -D -e 2>/dev/null &
+        local sshd_pid=$!
+        echo "$sshd_pid" > "$pidfile"
+        wait "$sshd_pid" 2>/dev/null || true
+        rm -f "$pidfile" "$portfile" 2>/dev/null || true
+    ) &
+    disown 2>/dev/null || true
+
+    # Give sshd a moment to start
+    sleep 1
+
+    # Now start socat as the port redirector: 0.0.0.0:$port -> jail_lb:22
+    # socat must be on the host
+    if ! command -v socat >/dev/null 2>&1; then
+        warn "socat not found on host. Installing alternative: using bash /dev/tcp redirector."
+        # Fallback: use a simple shell-based TCP redirector
+        (
+            while true; do
+                # Simple accept loop using bash built-ins is not practical.
+                # Without socat, we bind sshd directly to the external port.
+                sleep 86400
+            done
+        ) &
+        disown 2>/dev/null || true
+        # Without socat, reconfigure sshd to listen on $port directly inside the jail
+        warn "No socat available. Configuring sshd to listen on port $port directly."
+        run_in_jail --root "$name" /bin/sh -c "
+            sed -i 's/^Port .*/Port $port/' /etc/ssh/sshd_config
+        " 2>/dev/null
+        # Kill the already-started sshd and restart with the new port
+        if [ -f "$pidfile" ]; then
+            local old_sshd
+            old_sshd="$(cat "$pidfile" 2>/dev/null)"
+            kill -TERM "$old_sshd" 2>/dev/null || true
+            sleep 0.3
+        fi
+        (
+            run_in_jail --root "$name" /usr/sbin/sshd -D -e 2>/dev/null &
+            local sshd_pid=$!
+            echo "$sshd_pid" > "$pidfile"
+            wait "$sshd_pid" 2>/dev/null || true
+            rm -f "$pidfile" "$portfile" 2>/dev/null || true
+        ) &
+        disown 2>/dev/null || true
+        sleep 1
+    else
+        # socat redirector: listens on 0.0.0.0:$port, forwards to jail_lb:22
+        (
+            socat TCP-LISTEN:"$port",fork,reuseaddr TCP:"$jail_lb":22 2>/dev/null &
+            local socat_pid=$!
+            # Store socat pid alongside
+            echo "$socat_pid" > "$JROOT_HOME/pids/$name.socat"
+            wait "$socat_pid" 2>/dev/null || true
+            rm -f "$JROOT_HOME/pids/$name.socat" 2>/dev/null || true
+        ) &
+        disown 2>/dev/null || true
+    fi
+
+    # Verify sshd is actually running
+    sleep 0.5
+    if [ -f "$pidfile" ]; then
+        local started_pid
+        started_pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+        if kill -0 "$started_pid" 2>/dev/null; then
+            echo "$port" > "$portfile"
+            log "SSH for '$name' is running."
+            log "  External port: $port (0.0.0.0:$port -> jail:22)"
+            log "  Connect: ssh -p $port jail@<host-ip>  (password: jail)"
+            log "  Or:      ssh -p $port root@<host-ip>  (password: root)"
+            log "  The jail stays alive in the background for SSH access."
+            record_event "$name" "ssh" "started on port $port"
+            return 0
+        fi
+    fi
+    warn "sshd may not have started correctly. Check 'jroot ssh $name status'."
+    echo "$port" > "$portfile"
+    record_event "$name" "ssh" "started on port $port (unverified)"
+}
+
+ssh_usage() {
+    printf '%bjroot ssh%b - SSH access into a jail\n\n' "$H" "$N"
+    printf '    %bjroot ssh <name> start [port]%b       start sshd (auto port if omitted)\n' "$G" "$N"
+    printf '    %bjroot ssh <name> start --port=N%b     start on a specific port\n' "$G" "$N"
+    printf '    %bjroot ssh <name> stop%b               stop the SSH daemon\n' "$G" "$N"
+    printf '    %bjroot ssh <name> status%b             show if SSH is running\n' "$G" "$N"
+    printf '    %bjroot ssh <name>%b                    same as status\n' "$G" "$N"
+    printf '\n'
+    printf '    The jail runs sshd on port 22 internally. A port redirector on the\n'
+    printf '    host exposes it at 0.0.0.0:<port> (default: auto-assigned 2200x).\n'
+    printf '    The jail stays alive in the background so SSH connections work\n'
+    printf '    even when no interactive shell is open.\n'
+    printf '\n'
+    printf '    Default credentials:  jail/jail  or  root/root\n'
+    printf '    Change password: jroot enter <name> --root passwd jail\n'
+}
+
+cmd_ssh() {
+    ensure_runtime
+    [ -x "$PROOT_BIN" ] || install_proot
+    [ $# -ge 1 ] || { ssh_usage; err "Usage: jroot ssh <name> [start|stop|status] [port]"; }
+
+    local name="$1"; shift
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing."
+
+    local op="status" port=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            start|stop|status) op="$1" ;;
+            --port=*)          port="${1#*=}" ;;
+            -p)                shift; port="$1" ;;
+            --*)               err "Unknown flag: $1 (try '${CMD_HINT}help ssh')" ;;
+            *)
+                # Bare number = port
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    port="$1"
+                else
+                    err "Unknown argument: $1"
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    case "$op" in
+        start)  ssh_start "$name" "$port" ;;
+        stop)   ssh_stop "$name" ;;
+        status) ssh_status "$name" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Snapshots / revert (tar.gz rootfs + config at snapshot time)
 # ---------------------------------------------------------------------------
 snapshot_list() {
@@ -4686,6 +5097,9 @@ cmd_help_cmd() {
             printf '\n    Shows the PID and command for each running jail.\n'
             printf '    Stale PID files are automatically cleaned up.\n'
             ;;
+        ssh)
+            ssh_usage
+            ;;
         help)
             printf '%bjroot help%b - show this help\n\n' "$H" "$N"
             printf '    %bjroot help%b            (all commands)\n' "$G" "$N"
@@ -4718,6 +5132,7 @@ cmd_help() {
     help_row "jroot port" "list|add|rm <name>"    "Control which jailed ports may bind publicly"
     help_row "jroot net" "[set <name> auto|off]"  "Per-jail loopback address (no port collisions)"
     help_row "jroot mnt" "<name> <label> <dir>"   "Bind-mount a host directory at /mnt/<label>"
+    help_row "jroot ssh" "<name> start|stop|status" "SSH access into a jail (persistent daemon)"
     help_row "jroot install" "<name> <pkg...>"     "Install packages inside a jail (apt/apk)"
     help_row "jroot config" "<name>"               "View or change a jail's settings"
     help_row "jroot list" "[--json]"               "List all jails (JSON with --json)"
@@ -4743,6 +5158,7 @@ cmd_help() {
     help_row "jroot rename" "<n> <new>" "Rename a jail (updates hostname/prompt/snapshots)"
     help_row "jroot kill" "<name>"      "Terminate a running jail"
     help_row "jroot ps" ""              "List running jails"
+    help_row "jroot ssh" "<name> start|stop|status" "SSH access into a jail (persistent daemon)"
     help_row "jroot help" "[command]"     "Show help (for one command too)"
     printf '\n'
 
@@ -4808,6 +5224,7 @@ jroot_cmd() {
         rename)        shift; cmd_rename "$@" ;;
         kill|stop)     shift; cmd_kill "$@" ;;
         ps)            shift; cmd_ps "$@" ;;
+        ssh)           shift; cmd_ssh "$@" ;;
         help|--help|-h) shift; cmd_help "$@" ;;
         *)             err "Unknown command: $1 (run '${CMD_HINT}help')" ;;
     esac
