@@ -116,7 +116,7 @@ PORT_SHIM_SRC="$BIN_DIR/libjroot.c"
 PORT_SHIM="$BIN_DIR/libjroot.so"
 # Build marker for the shim. Bump it whenever libjroot.c changes so existing
 # .so files - including ones compiled inside a jail - are replaced.
-SHIM_VERSION="jroot-shim-v4"
+SHIM_VERSION="jroot-shim-v5"
 
 # Landlock filesystem access masks, used to compose the JROOT_LANDLOCK rule
 # list consumed by the seccomp launcher (see write_seccomp_launcher).
@@ -554,13 +554,15 @@ build_port_shim() {
 #include <dlfcn.h>
 #include <stdarg.h>
 #include <dirent.h>
+#include <sys/prctl.h>
+#include <grp.h>
 
-/* jroot-shim-v4 */
+/* jroot-shim-v5 */
 
 /* Greppable build marker: jroot compares this against the version it expects,
  * so an upgraded jroot always replaces an older .so (including one built inside
  * a jail). */
-const char jroot_shim_version[] = "jroot-shim-v4";
+const char jroot_shim_version[] = "jroot-shim-v5";
 
 /* Pin dlsym() to the oldest symbol version the platform has. Since glibc 2.34
  * the dl* functions live in libc.so.6 and a plain reference records
@@ -1211,6 +1213,88 @@ int lchown(const char *path, uid_t uid, gid_t gid) {
     if (path_is_denied(path)) return denied_errno();
     if (path_is_ro(path)) return blocked_errno();
     return real(path, uid, gid);
+}
+
+/* ---- privilege-separation compatibility (opt-in) ----------------------- *
+ * Some daemons harden themselves using operations a rootless jail simply
+ * cannot perform, and they treat failure as fatal. OpenSSH is the clearest
+ * example: its pre-auth child calls
+ *     chroot("/run/sshd")
+ * and dies with
+ *     chroot("/run/sshd"): Operation not permitted [preauth]
+ * closing every connection before the version banner. chroot(2) needs
+ * CAP_SYS_CHROOT, which fake root does not provide, and OpenSSH removed
+ * UsePrivilegeSeparation in 7.5, so there is no way to configure it off.
+ *
+ * When JROOT_FAKE_PRIVSEP is set, this shim reports success for exactly those
+ * self-confinement steps:
+ *     chroot()                 -> 0   (proot already confines the filesystem)
+ *     prctl(PR_SET_SECCOMP)    -> 0   (jroot installed its own filter already)
+ *     setgroups()/initgroups() -> 0   (no supplementary groups to drop)
+ *
+ * This is a deliberate, scoped trade: it removes a layer of the daemon's OWN
+ * defence in depth, not any layer of the jail. The rootfs boundary still comes
+ * from proot, the syscall filter from jroot's seccomp launcher, and the path
+ * allowlist from Landlock - all of which remain in force. `jroot ssh` turns
+ * this on for the sshd it starts; nothing else does.
+ */
+static int fake_privsep(void) {
+    static int e = -1;
+    if (e < 0) e = getenv("JROOT_FAKE_PRIVSEP") ? 1 : 0;
+    return e;
+}
+
+typedef int (*chroot_fn)(const char *);
+
+int chroot(const char *path) {
+    static chroot_fn real = NULL;
+    if (!real) real = (chroot_fn)dlsym(RTLD_NEXT, "chroot");
+    if (fake_privsep()) return 0;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(path);
+}
+
+/* PR_SET_SECCOMP is 22 and PR_SET_NO_NEW_PRIVS is 38; only the former is
+ * faked, because NO_NEW_PRIVS costs nothing and genuinely works. Four vararg
+ * slots are always read: on the SysV ABIs jroot supports the register slots
+ * exist whether or not the caller filled them, and unfilled ones are never
+ * used because the option decides how many matter. */
+typedef int (*prctl_fn)(int, unsigned long, unsigned long, unsigned long, unsigned long);
+
+int prctl(int option, ...) {
+    static prctl_fn real = NULL;
+    unsigned long a1, a2, a3, a4;
+    va_list ap;
+    if (!real) real = (prctl_fn)dlsym(RTLD_NEXT, "prctl");
+    va_start(ap, option);
+    a1 = va_arg(ap, unsigned long);
+    a2 = va_arg(ap, unsigned long);
+    a3 = va_arg(ap, unsigned long);
+    a4 = va_arg(ap, unsigned long);
+    va_end(ap);
+    if (option == PR_SET_SECCOMP && fake_privsep()) return 0;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(option, a1, a2, a3, a4);
+}
+
+typedef int (*setgroups_fn)(size_t, const gid_t *);
+
+int setgroups(size_t size, const gid_t *list) {
+    static setgroups_fn real = NULL;
+    if (!real) real = (setgroups_fn)dlsym(RTLD_NEXT, "setgroups");
+    if (fake_privsep()) return 0;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(size, list);
+}
+
+typedef int (*initgroups_fn)(const char *, gid_t);
+
+int initgroups(const char *user, gid_t group) {
+    static initgroups_fn real = NULL;
+    if (!real) real = (initgroups_fn)dlsym(RTLD_NEXT, "initgroups");
+    if (fake_privsep()) return 0;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(user, group);
 }
 
 /* ---- deny layer (read side): make jroot internals look non-existent ---- */
@@ -2658,14 +2742,16 @@ run_in_jail() {
         #                 processes. The seccomp launcher overwrites it with
         #                 proot's pid, which is tighter; this value (jroot's own
         #                 pid) is the fallback for hosts without python3.
-        # JROOT_PORT_MAP  rewrites the port a listener asks for (see `jroot ssh`:
-        #                 a rootless jail cannot bind 22, so sshd is told 22 and
-        #                 the shim quietly puts it on a high port instead).
+        # JROOT_PORT_MAP  rewrites the port a listener asks for, so a service
+        #                 wanting a privileged port can run in a rootless jail.
+        # JROOT_FAKE_PRIVSEP lets a daemon's own chroot()/seccomp hardening
+        #                 report success instead of dying (see `jroot ssh`).
         set -- /usr/bin/env LD_PRELOAD=/usr/local/lib/libjroot.so \
             JROOT_PORTS="${jail_ports:-}" \
             JROOT_LOOPBACK="${jail_lb:-}" \
             JROOT_PROC_ROOT="${JROOT_PROC_ROOT:-$$}" \
             JROOT_PORT_MAP="${JROOT_PORT_MAP:-}" \
+            JROOT_FAKE_PRIVSEP="${JROOT_FAKE_PRIVSEP:-}" \
             JROOT_RO_MOUNTS="${ro_mounts#:}" "$@"
     fi
 
@@ -4518,13 +4604,25 @@ cmd_which() {
 }
 
 # ---------------------------------------------------------------------------
-# jroot ssh <name> start|stop|status|passwd [flags]
+# jroot ssh <name> start|stop|status|passwd|log [flags]
 #
-# Starts an SSH daemon inside the jail via a PERSISTENT background proot
-# instance (so the jail keeps running even after the user exits their
-# interactive shell). The jail thinks sshd listens on port 22, but the host
-# redirects an external port (default: auto 2200xx) to the jail's loopback
-# address.
+# Starts an SSH daemon inside the jail as a PERSISTENT background proot instance,
+# so the jail keeps running - and stays reachable - after the user exits their
+# interactive shell.
+#
+# PORTS: sshd binds the external port directly, on 0.0.0.0, and the port is added
+# to the jail's public list so the bind() shim leaves it there instead of pinning
+# it to the jail's loopback address. No redirector, nothing to keep in sync. The
+# port must be above 1024: fake root is not CAP_NET_BIND_SERVICE, so a rootless
+# jail cannot bind a privileged port (the shim's JROOT_PORT_MAP can move a
+# privileged port a service demands onto a high one, but that does not make the
+# low port reachable, so it is not used here).
+#
+# PRIVILEGE SEPARATION: OpenSSH's pre-auth child chroots into an empty directory
+# and dies if it cannot - which it cannot under fake root - and the option to
+# disable that was removed in 7.5. jroot starts sshd with JROOT_FAKE_PRIVSEP=1
+# so the shim reports success for chroot() and friends. That relaxes the daemon's
+# own hardening, not the jail's: proot, seccomp and Landlock all still apply.
 #
 # CREDENTIALS - the design rules, because this is a network-facing service:
 #   * No password is ever hardcoded, defaulted, or reused across jails.
@@ -4717,30 +4815,6 @@ ssh_install_key() {
     return 0
 }
 
-# The unprivileged port sshd actually binds inside the jail. Scanned rather than
-# fixed, so several jails can run SSH even when they share 127.0.0.1
-# (`jroot net set <name> off`). $1 is a port to avoid - the external one.
-ssh_free_high_port() {
-    local avoid="$1" port claimed=() f c skip
-    shopt -s nullglob
-    for f in "$JROOT_HOME/pids"/*.sshinner; do
-        claimed+=("$(cat "$f" 2>/dev/null)")
-    done
-    shopt -u nullglob
-    for port in $(seq 22100 22199); do
-        [ "$port" = "$avoid" ] && continue
-        skip=0
-        for c in "${claimed[@]}"; do
-            [ "$c" = "$port" ] && { skip=1; break; }
-        done
-        [ "$skip" = 1 ] && continue
-        ssh_port_in_use "$port" && continue
-        printf '%s' "$port"
-        return 0
-    done
-    return 1
-}
-
 ssh_status() {
     local name="$1"
     local pidfile portfile pid port user auth
@@ -4760,14 +4834,9 @@ ssh_status() {
     user="$(config_field "$CONFIGS_DIR/$name.json" ssh_user)"
     [ -n "$user" ] || user="$(ssh_default_user "$name")"
     auth="$(config_field "$CONFIGS_DIR/$name.json" ssh_auth)"
-    local inner
-    inner="$(cat "$JROOT_HOME/pids/$name.sshinner" 2>/dev/null || true)"
     log "SSH for '$name': running (pid $pid, port $port)"
     printf '  login user:  %s\n' "$user"
     printf '  auth:        %s\n' "${auth:-password}"
-    if [ -n "$inner" ] && [ "$inner" != "$port" ]; then
-        printf '  inside jail: port 22 (real socket on %s)\n' "$inner"
-    fi
     printf '  connect:     ssh -p %s %s@<host-ip>\n' "$port" "$user"
     printf '  locally:     ssh -p %s %s@127.0.0.1\n' "$port" "$user"
     printf '  sshd log:    %s\n' "$JROOT_HOME/pids/$name.sshlog"
@@ -4825,7 +4894,8 @@ ssh_stop() {
             kill -KILL "$pid" 2>/dev/null || true
         fi
     fi
-    # Stop the host-side redirector too, or the port stays bound.
+    # Older jroot versions ran a socat redirector alongside the daemon. Nothing
+    # creates one any more, but clean up after an upgrade so the port is freed.
     local socatfile="$JROOT_HOME/pids/$name.socat" socat_pid
     if [ -f "$socatfile" ]; then
         socat_pid="$(cat "$socatfile" 2>/dev/null | tr -d ' ')"
@@ -5054,7 +5124,6 @@ ssh_start() {
         cat > /etc/ssh/sshd_config << SSHEOF
 Port 22
 ListenAddress 0.0.0.0
-Protocol 2
 PermitRootLogin $permit_root
 PasswordAuthentication $password_auth
 PubkeyAuthentication yes
@@ -5065,7 +5134,6 @@ UsePAM no
 StrictModes no
 UseDNS no
 MaxAuthTries 4
-MaxStartups 10
 LoginGraceTime 60
 AllowUsers $user
 AcceptEnv LANG LC_*
@@ -5081,13 +5149,11 @@ SSHEOF
         elif [ ! -f /usr/lib/openssh/sftp-server ]; then
             sed -i '/^Subsystem sftp/d' /etc/ssh/sshd_config
         fi
-        # 'Protocol 2' was removed in OpenSSH 7.6 and is a fatal unknown keyword
-        # there, so keep it only for the old jails that still need it.
-        if ! sshd -t -f /etc/ssh/sshd_config 2>/dev/null; then
-            sed -i '/^Protocol /d' /etc/ssh/sshd_config
-        fi
-        # Same treatment for anything else this OpenSSH does not recognise:
-        # walk the remaining rejects out rather than failing to start at all.
+        # jroot targets OpenSSH 7.2 (Ubuntu 16.04) through 9.x, and keywords come
+        # and go across that range - ChallengeResponseAuthentication is deprecated
+        # in 8.7, and an unknown keyword is FATAL, not a warning. Rather than
+        # guessing per release, ask sshd which line it hates and comment that line
+        # out until the config parses.
         n=0
         while [ \$n -lt 8 ] && ! sshd -t -f /etc/ssh/sshd_config 2>/dev/null; do
             bad=\$(sshd -t -f /etc/ssh/sshd_config 2>&1 \
@@ -5158,57 +5224,40 @@ SSHEOF
     jail_lb="$(jail_loopback_addr "$name")"
     [ -n "$jail_lb" ] || jail_lb="127.0.0.1"
 
-    local have_socat=0
-    command -v socat >/dev/null 2>&1 && have_socat=1
-
-    # ---- where does sshd ACTUALLY listen? -------------------------------
-    # A rootless jail has fake root, not CAP_NET_BIND_SERVICE, so bind() on
-    # port 22 fails with EACCES however convincing getuid() looks. Three cases:
+    # ---- where does sshd listen? -----------------------------------------
+    # Straight at the external port, on 0.0.0.0. No redirector, no port
+    # rewriting, nothing to keep in sync: the port is in the jail's public list
+    # (added just above), so the bind() shim leaves it on 0.0.0.0 instead of
+    # pinning it to the jail's loopback address, and it is reachable from
+    # outside immediately.
     #
-    #   shim + socat : sshd is configured for 22 and BELIEVES it owns 22; the
-    #                  bind() shim moves the real socket to a high port and
-    #                  socat forwards the external port to it. The illusion is
-    #                  complete from inside the jail.
-    #   socat only   : no shim to rewrite the port, so sshd is configured for a
-    #                  high port and socat forwards to that.
-    #   neither      : sshd binds the external port directly.
-    local shim_active=0 internal_port="$port" config_port="$port" mode_desc=""
-    case "$(shim_status "$name")" in
-        host|local) shim_active=1 ;;
-    esac
-
-    if [ "$have_socat" = 1 ]; then
-        internal_port="$(ssh_free_high_port "$port")" \
-            || err "No free internal port in 22100..22199 for the SSH redirector."
-        if [ "$shim_active" = 1 ]; then
-            config_port=22
-            mode_desc="jail believes port 22; real socket on $jail_lb:$internal_port"
-        else
-            config_port="$internal_port"
-            mode_desc="sshd on $jail_lb:$internal_port (no shim, so no port-22 illusion)"
-            warn "The bind() shim is not active for '$name', so sshd cannot be told it owns port 22. Fix with: jroot install $name gcc"
-        fi
-    else
-        internal_port="$port"
-        config_port="$port"
-        mode_desc="sshd bound directly to port $port (no redirector)"
-        warn "socat not found on the host, so sshd listens on port $port directly and the jail sees the real port instead of 22. Install socat for the port-22 illusion."
+    # It has to be an unprivileged port. A rootless jail has fake root, not
+    # CAP_NET_BIND_SERVICE, so bind() below 1024 fails with EACCES no matter
+    # how convincing getuid() looks - and the host could not bind it either.
+    local internal_port="$port" mode_desc="sshd listening on 0.0.0.0:$port"
+    if [ "$port" -lt 1024 ]; then
+        err "Port $port is privileged (<1024) and a rootless jail cannot bind it. Pick something above 1024, e.g. 'jroot ssh $name start $(( port + 20000 ))'."
     fi
 
     run_in_jail --root "$name" /bin/sh -c "
-        sed -i 's/^Port .*/Port $config_port/' /etc/ssh/sshd_config
+        sed -i 's/^Port .*/Port $port/' /etc/ssh/sshd_config
     " >/dev/null 2>&1 || true
 
-    log "Starting SSH daemon for '$name' on external port $port..."
-    log "  ($mode_desc)"
+    log "Starting SSH daemon for '$name' on port $port..."
 
-    # sshd's own diagnostics are the only way to see why it refused to start,
-    # so keep them instead of discarding them into /dev/null.
+    # sshd's own diagnostics are the only way to see why it refused to start or
+    # dropped a connection, so keep them instead of discarding them.
     local logfile="$JROOT_HOME/pids/$name.sshlog"
     : > "$logfile" 2>/dev/null || true
 
     # Persistent proot + sshd. sshd runs in the foreground (-D) so proot has a
     # live child and the jail stays up after this command returns.
+    #
+    # JROOT_FAKE_PRIVSEP is what makes sshd viable here at all: its pre-auth
+    # child calls chroot("/run/sshd"), which needs CAP_SYS_CHROOT and therefore
+    # fails with EPERM under fake root, killing the connection before the version
+    # banner. OpenSSH removed UsePrivilegeSeparation in 7.5, so the shim reports
+    # success for that step instead. See the shim source for the full rationale.
     #
     # `set -m` matters: without job control this background subshell inherits
     # jroot's OWN process group, and ssh_stop's group kill would then take out
@@ -5218,9 +5267,7 @@ SSHEOF
     case "$-" in *m*) was_monitor=1 ;; esac
     set -m
     (
-        if [ "$shim_active" = 1 ] && [ "$config_port" = "22" ]; then
-            export JROOT_PORT_MAP="22=$internal_port"
-        fi
+        export JROOT_FAKE_PRIVSEP=1
         run_in_jail --root "$name" /usr/sbin/sshd -D -e >>"$logfile" 2>&1
     ) &
     local daemon_pid=$!
@@ -5236,7 +5283,7 @@ SSHEOF
         if ! kill -0 "$daemon_pid" 2>/dev/null; then
             break            # died early - the log will say why
         fi
-        if (exec 3<>"/dev/tcp/$jail_lb/$internal_port") 2>/dev/null; then
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
             listening=1
             break
         fi
@@ -5253,38 +5300,13 @@ SSHEOF
             tail -n 12 "$logfile" 2>/dev/null | sed 's/^/         /' >&2
         else
             warn "No output was captured. Try it in the foreground to see the error:"
-            warn "  jroot exec $name --root /usr/sbin/sshd -D -e -p $internal_port"
+            warn "  jroot exec $name --root /usr/sbin/sshd -D -e -p $port"
         fi
         record_event "$name" "ssh" "FAILED to start on port $port as '$user'"
         return 1
     fi
 
-    # Host-side redirector: external port -> the socket sshd actually holds.
-    if [ "$have_socat" = 1 ]; then
-        local was_monitor2=0
-        case "$-" in *m*) was_monitor2=1 ;; esac
-        set -m
-        (
-            exec socat TCP-LISTEN:"$port",fork,reuseaddr TCP:"$jail_lb":"$internal_port" \
-                >>"$logfile" 2>&1
-        ) &
-        local socat_pid=$!
-        [ "$was_monitor2" = 1 ] || set +m
-        echo "$socat_pid" > "$JROOT_HOME/pids/$name.socat"
-        disown 2>/dev/null || true
-        sleep 0.3
-        if ! kill -0 "$socat_pid" 2>/dev/null; then
-            kill -TERM -"$daemon_pid" 2>/dev/null || true
-            rm -f "$pidfile" "$portfile" "$JROOT_HOME/pids/$name.socat"
-            warn "The redirector could not bind 0.0.0.0:$port (port already in use?)."
-            [ -s "$logfile" ] && tail -n 6 "$logfile" 2>/dev/null | sed 's/^/         /' >&2
-            record_event "$name" "ssh" "FAILED: redirector could not bind $port"
-            return 1
-        fi
-    fi
-
     echo "$port" > "$portfile"
-    printf '%s' "$internal_port" > "$JROOT_HOME/pids/$name.sshinner" 2>/dev/null || true
 
     # ---- prove the daemon actually talks SSH -----------------------------
     # A listening socket is not the same as a working daemon. sshd forks a
@@ -5293,12 +5315,8 @@ SSHEOF
     # reports only "Connection closed by <host> port <port>", which is useless on
     # its own. Reading the banner here catches that at start time, while the log
     # is still in hand.
-    local probe_host="127.0.0.1" probe_port="$port" banner=""
-    if [ "$have_socat" != 1 ]; then
-        probe_host="$jail_lb"
-        probe_port="$internal_port"
-    fi
-    banner="$(ssh_banner_probe "$probe_host" "$probe_port")"
+    local banner=""
+    banner="$(ssh_banner_probe 127.0.0.1 "$port")"
     case "$banner" in
         SSH-*)
             : # healthy
@@ -5310,17 +5328,21 @@ SSHEOF
                 warn "Last lines of $logfile:"
                 tail -n 15 "$logfile" 2>/dev/null | sed 's/^/         /' >&2
             fi
+            case "$(shim_status "$name")" in
+                host|local) ;;
+                *) warn "The LD_PRELOAD shim is NOT active for '$name', and it is what lets sshd's chroot() succeed. Fix that first: jroot install $name gcc" ;;
+            esac
             warn "Things worth trying:"
             warn "  jroot ssh $name log                       # full sshd log"
             warn "  jroot exec $name --root sshd -t           # config check"
             warn "  jroot exec $name --root id sshd           # privsep account must exist"
-            warn "  jroot install $name openssh-server        # reinstall the daemon"
+            warn "  jroot doctor                              # is the shim active for this jail?"
             record_event "$name" "ssh" "started on port $port but no SSH banner (privsep?)"
             ;;
     esac
 
     log "SSH for '$name' is running."
-    log "  External port: $port  ->  $mode_desc"
+    log "  Port:          $port  ($mode_desc)"
     log "  Connect:       ssh -p $port $user@<host-ip>"
     if [ "$SSH_OPT_NO_PASSWORD" = "1" ]; then
         log "  Auth:          public key only (password login disabled)"
@@ -5384,10 +5406,11 @@ ssh_usage() {
     help_row "--no-password" ""           "Key-only login (requires --key)"
     help_row "--permit-root" ""           "Also allow root to log in over SSH"
     printf '\n'
-    printf '    The jail runs sshd on port 22 internally. A redirector on the host\n'
-    printf '    exposes it at 0.0.0.0:<port>, so the jail keeps believing it owns\n'
-    printf '    port 22. The jail stays alive in the background, so SSH works even\n'
-    printf '    when no interactive shell is open.\n'
+    printf '    sshd binds the port directly on 0.0.0.0, so the jail is reachable from\n'
+    printf '    outside with no redirector involved. The port must be above 1024: fake\n'
+    printf '    root is not CAP_NET_BIND_SERVICE, so a rootless jail cannot bind 22.\n'
+    printf '    The jail stays alive in the background, so SSH works even when no\n'
+    printf '    interactive shell is open.\n'
     printf '\n%bPASSWORDS%b\n' "$H" "$N"
     printf '    There is no default and no hardcoded password. With no flags you are\n'
     printf '    prompted (echo off); press Enter at the prompt to have a 24-character\n'
