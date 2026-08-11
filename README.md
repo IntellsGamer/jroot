@@ -470,7 +470,7 @@ This covers the glibc `readdir()` path (`ls`, `ps`, `htop`, Python's `os.listdir
 JRoot can expose a jail over SSH so you can connect from another machine — or from the same machine in a different terminal — without needing an interactive `jroot enter` session open.
 
 ```bash
-# Start SSH (auto-assigns a port in 22001-22099)
+# Start SSH (auto-assigns a port in 22001-22099, prompts for a password)
 jroot ssh dev start
 
 # Start on a specific port
@@ -480,44 +480,108 @@ jroot ssh dev start --port=20022
 # Check status
 jroot ssh dev status
 
+# Rotate the password
+jroot ssh dev passwd
+
 # Stop
 jroot ssh dev stop
 ```
 
-The jail thinks `sshd` is listening on port 22 internally. A redirector on the host (`socat` if available, otherwise sshd is reconfigured to listen directly) exposes it at `0.0.0.0:<port>`, so remote machines can reach it.
+### Why port 22 needs a trick
+
+A rootless jail has *fake* root, not `CAP_NET_BIND_SERVICE`. `getuid()` returns 0, but the kernel still sees your unprivileged host UID, so `bind()` on any port below 1024 fails with `EACCES` — `sshd` on port 22 simply cannot start.
+
+JRoot keeps the illusion intact anyway. `sshd` is configured for port 22, logs port 22, and reports port 22 to anything asking inside the jail; the `bind()` shim silently moves the real socket to a high port, and `socat` on the host forwards the external port to it.
 
 ```text
 Remote client
      │
      │  ssh -p 22001 jail@host
      ▼
-┌──────────────────────────┐
-│  Host: socat             │
-│  0.0.0.0:22001           │
-│         │                │
-│         ▼                │
-│  jail loopback:22        │
-│  (proot + sshd -D)       │
-└──────────────────────────┘
+┌────────────────────────────────────────────┐
+│ HOST                                       │
+│   socat  0.0.0.0:22001                     │
+│              │                             │
+│              ▼                             │
+│   127.2.0.1:22122   ← the real socket      │
+└──────────────┬─────────────────────────────┘
+               │  bind() shim rewrote the port
+               ▼
+┌────────────────────────────────────────────┐
+│ JAIL                                       │
+│   sshd -D   "Port 22"                      │
+│   believes it owns port 22                 │
+└────────────────────────────────────────────┘
 ```
 
-**Key design decisions:**
+The shim's mapping is generic (`JROOT_PORT_MAP="from=to"`), so the same mechanism lets any privileged-port service — 80, 443, 25 — run unmodified inside a rootless jail.
 
-- The jail runs as a **persistent background daemon** (proot + sshd). It stays alive even after you close your terminal or exit your interactive session.
-- Auto-port picks the first free port in 22001-22099, checking both other jails' claims and what's already bound on the host.
-- Default credentials: `jail`/`jail` and `root`/`root`. Change them with `jroot enter dev --root passwd jail`.
-- `jroot ps` shows SSH daemons alongside interactive shells.
-- `jroot rm` automatically stops the SSH daemon before deleting a jail.
-- `jroot ssh dev stop` terminates the daemon and releases the port.
+Degradation is explicit rather than silent:
+
+| Host has | Result |
+| --- | --- |
+| shim + `socat` | `sshd` believes it owns port 22; real socket on a high port |
+| `socat` only | `sshd` is configured for a high port (no port-22 illusion), still reachable at the external port |
+| neither | `sshd` binds the external port directly |
+
+### Passwords
+
+**There is no default password and nothing is hardcoded.** With no flags, `jroot ssh <name> start` prompts with echo off; pressing Enter instead generates a 24-character random password and prints it exactly once.
 
 ```bash
-$ jroot ssh dev start
+jroot ssh dev start                          # prompt (echo off)
+jroot ssh dev start --random-password        # generate, print once
+pass show jail/dev | jroot ssh dev start --password-stdin
+jroot ssh dev start --password=hunter2       # warns: lands in shell history
+jroot ssh dev passwd                         # rotate later
+```
+
+The rules the implementation follows:
+
+- The plaintext never touches the host filesystem, never appears in `argv` (which is world-readable through `/proc` on the host), and never reaches the history log — only `password set for 'jail' (source: prompt)` is recorded.
+- It reaches `chpasswd` through a pipe on stdin. If `chpasswd` is missing, JRoot falls back to `passwd`, then to hashing on the host and rewriting the shadow entry.
+- A generated password is shown once and cannot be recovered, only replaced.
+- Short passwords are questioned rather than quietly accepted.
+
+### Key-based login
+
+```bash
+jroot ssh dev start --key=~/.ssh/id_ed25519.pub                # password or key
+jroot ssh dev start --key=~/.ssh/id_ed25519.pub --no-password   # key only
+```
+
+JRoot refuses a private key by mistake and checks the file actually looks like an OpenSSH public key.
+
+### Hardening applied to the generated `sshd_config`
+
+- `PermitRootLogin no` unless the login account *is* root, or you pass `--permit-root`
+- `AllowUsers <the one account>` — nothing else can log in
+- `PermitEmptyPasswords no`, `MaxAuthTries 4`, `LoginGraceTime 30`
+- `PasswordAuthentication no` when `--no-password` is used
+
+The login account defaults to `jail` for unroot jails and `root` for root jails; `--user=<name>` overrides it and the account is created if it does not exist. Only that account is unlocked — in an unroot jail, root stays locked.
+
+### Lifecycle
+
+- The jail runs as a **persistent background daemon** (proot + `sshd -D`) in its own process group, so it survives closing your terminal, and stopping it cannot take your shell down with it.
+- Startup waits for the socket to actually accept connections instead of sleeping and hoping. If `sshd` dies, JRoot says so and prints the tail of `~/.jroot/pids/<name>.sshlog` rather than reporting success.
+- `jroot ps` lists SSH daemons alongside interactive shells; `jroot rm` stops the daemon first.
+
+```bash
+$ jroot ssh dev start --random-password
 [+] Ensuring openssh-server is installed in 'dev'...
 [+] Starting SSH daemon for 'dev' on external port 22001...
+[+]   (jail believes port 22; real socket on 127.2.0.1:22122)
+
+  Generated SSH password for jail:  7Kq2mXvB9pLdR4tYwZ3nHcFs
+  Write it down now. It is not stored anywhere and cannot be shown again.
+  Replace it any time with: jroot ssh dev passwd
+
 [+] SSH for 'dev' is running.
-[+]   External port: 22001 (0.0.0.0:22001 -> jail:22)
-[+]   Connect: ssh -p 22001 jail@<host-ip>  (password: jail)
-[+]   Or:      ssh -p 22001 root@<host-ip>  (password: root)
+[+]   External port: 22001  ->  jail believes port 22; real socket on 127.2.0.1:22122
+[+]   Connect:       ssh -p 22001 jail@<host-ip>
+[+]   Auth:          password
+[+]   Only 'jail' may log in; root login is no.
 [+]   The jail stays alive in the background for SSH access.
 
 $ jroot ps
@@ -525,7 +589,7 @@ JAIL             PID      TYPE   COMMAND
 dev              54321    sshd   port 22001
 ```
 
-**Requirements:** `openssh-server` is installed inside the jail automatically on first `jroot ssh start`. On the host, `socat` is recommended for port redirection (it separates the internal port 22 from the external port); without it, sshd is configured to listen directly on the external port.
+**Requirements:** `openssh-server` is installed inside the jail automatically on first start. On the host, `socat` gives you the port-22 illusion, and `gcc` is needed once so the shim can be built (`jroot doctor` reports both).
 
 ---
 
@@ -1053,7 +1117,9 @@ Each jail has its own configuration.
   "mount_home": 0,
   "build_essential": 1,
   "loopback": "127.2.0.1",
-  "ports": [3000, 8080],
+  "ports": [3000, 8080, 22001],
+  "ssh_user": "jail",
+  "ssh_auth": "password",
   "mounts": [
     ["project", "/home/user/project", "rw"],
     ["secrets", "/home/user/secrets", "ro"]
@@ -1070,8 +1136,12 @@ mount_host      0 or 1 (host / at /mnt/host)
 mount_home      0 or 1 (host $HOME at /mnt/home)
 loopback        this jail's address in 127/8, or "off" to share 127.0.0.1
 ports           list of public ports (bind to 0.0.0.0)
+ssh_user        account SSH logins use (set by 'jroot ssh')
+ssh_auth        password | password+key | key-only
 mounts          list of [label, hostpath, mode] (mode: rw or ro)
 ```
+
+No SSH password or hash is ever stored here — only which account logs in and how.
 
 Environment overrides, mostly for debugging:
 
@@ -1081,6 +1151,8 @@ JROOT_KERNEL=x.y.z     kernel version reported inside jails (default 6.8.0)
 JROOT_SHIM_OFF=1       do not load the LD_PRELOAD shim
 JROOT_SHOW_ALL_PROCS=1 let jails see every host process in /proc
 JROOT_LANDLOCK_OFF=1   skip the Landlock allowlist
+JROOT_PORT_MAP=22=2212 remap a port a jailed listener asks for (used by 'jroot ssh'
+                       so sshd can believe it owns privileged port 22)
 ```
 
 That means you don't have to rebuild an environment just because you want to change how it behaves.

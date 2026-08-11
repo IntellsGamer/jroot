@@ -4772,6 +4772,17 @@ ssh_status() {
     printf '  locally:     ssh -p %s %s@127.0.0.1\n' "$port" "$user"
     printf '  sshd log:    %s\n' "$JROOT_HOME/pids/$name.sshlog"
     printf '  new password: jroot ssh %s passwd\n' "$name"
+    # A live socket does not prove a working daemon - read the banner.
+    local banner
+    banner="$(ssh_banner_probe 127.0.0.1 "$port")"
+    case "$banner" in
+        SSH-*) printf '  handshake:   %bok%b (%s)\n' "$G" "$N" "${banner%%$'\r'*}" ;;
+        *)
+            printf '  handshake:   %bFAILING%b - closes without an SSH banner\n' "$C_RED" "$C_NC"
+            warn "sshd is listening but not completing a handshake (usually its privilege-separation child failing). See: jroot ssh $name log"
+            return 1
+            ;;
+    esac
     return 0
 }
 
@@ -4981,6 +4992,36 @@ ssh_start() {
         [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q
     ' 2>/dev/null || warn "Could not generate SSH host keys."
 
+    # ---- privilege separation --------------------------------------------
+    # OpenSSH >= 7.5 removed UsePrivilegeSeparation, so privsep is mandatory and
+    # cannot be configured away. Right after accepting a connection sshd forks a
+    # child and drops to the unprivileged 'sshd' account; if that account or the
+    # empty chroot directory is missing, the child dies BEFORE sending its
+    # version banner and the client just reports
+    #   Connection closed by <host> port <port>
+    # with nothing else to go on.
+    #
+    # Under proot this is easy to hit: the openssh-server postinst creates the
+    # 'sshd' system user with adduser --system, which routinely fails in a fake-
+    # root rootfs, leaving a working binary and a broken daemon. Create it here
+    # rather than trusting the package, and give it the HOST's uid so that
+    # setresuid() succeeds even where proot's uid faking does not cover it -
+    # dropping to your own real uid is always permitted by the kernel.
+    local host_uid host_gid
+    host_uid="$(id -u)"; host_gid="$(id -g)"
+    run_in_jail --root "$name" /bin/sh -c "
+        mkdir -p /run/sshd /var/empty
+        chmod 755 /run/sshd /var/empty
+        if ! id sshd >/dev/null 2>&1; then
+            useradd -o -u $host_uid -g $host_gid -M -d /run/sshd -s /usr/sbin/nologin sshd 2>/dev/null \
+                || useradd -o -u $host_uid -M -d /run/sshd -s /usr/sbin/nologin sshd 2>/dev/null \
+                || adduser -D -H -h /run/sshd -s /sbin/nologin -u $host_uid sshd 2>/dev/null \
+                || printf 'sshd:x:%s:%s::/run/sshd:/usr/sbin/nologin\n' '$host_uid' '$host_gid' >> /etc/passwd
+        fi
+        grep -q '^sshd:' /etc/group 2>/dev/null || printf 'sshd:x:%s:\n' '$host_gid' >> /etc/group 2>/dev/null || true
+        exit 0
+    " >/dev/null 2>&1 || warn "Could not prepare the sshd privilege-separation account inside '$name'."
+
     # Make sure the login account exists before we try to give it a password.
     if [ "$user" != "root" ]; then
         run_in_jail --root "$name" /bin/sh -c "
@@ -4999,12 +5040,21 @@ ssh_start() {
     [ "$user" = "root" ] && permit_root="yes"
     [ "$SSH_OPT_NO_PASSWORD" = "1" ] && password_auth="no"
 
+    # StrictModes and UseDNS are both off for proot-specific reasons, not
+    # laziness. StrictModes rejects a login when the home directory or
+    # ~/.ssh permissions look wrong, and ownership inside a fake-root rootfs is
+    # exactly the kind of thing it objects to. UseDNS makes sshd do a reverse
+    # lookup on every connection, which in a jail with no working resolver stalls
+    # until the login grace period expires.
+    # LogLevel VERBOSE so ~/.jroot/pids/<jail>.sshlog is worth reading when
+    # something does go wrong.
     run_in_jail --root "$name" /bin/sh -c "
         mkdir -p /etc/ssh /run/sshd
         chmod 755 /run/sshd
         cat > /etc/ssh/sshd_config << SSHEOF
 Port 22
 ListenAddress 0.0.0.0
+Protocol 2
 PermitRootLogin $permit_root
 PasswordAuthentication $password_auth
 PubkeyAuthentication yes
@@ -5012,17 +5062,52 @@ PermitEmptyPasswords no
 ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
 UsePAM no
+StrictModes no
+UseDNS no
 MaxAuthTries 4
-LoginGraceTime 30
+MaxStartups 10
+LoginGraceTime 60
 AllowUsers $user
+AcceptEnv LANG LC_*
+PrintMotd no
+LogLevel VERBOSE
 Subsystem sftp /usr/lib/openssh/sftp-server
 PidFile /run/sshd/sshd.pid
 SSHEOF
-        # Alpine keeps sftp-server elsewhere.
+        # Alpine keeps sftp-server elsewhere; drop the line if neither exists so
+        # sshd does not refuse to start over a missing subsystem binary.
         if [ -f /usr/lib/ssh/sftp-server ]; then
             sed -i 's|/usr/lib/openssh/sftp-server|/usr/lib/ssh/sftp-server|' /etc/ssh/sshd_config
+        elif [ ! -f /usr/lib/openssh/sftp-server ]; then
+            sed -i '/^Subsystem sftp/d' /etc/ssh/sshd_config
         fi
+        # 'Protocol 2' was removed in OpenSSH 7.6 and is a fatal unknown keyword
+        # there, so keep it only for the old jails that still need it.
+        if ! sshd -t -f /etc/ssh/sshd_config 2>/dev/null; then
+            sed -i '/^Protocol /d' /etc/ssh/sshd_config
+        fi
+        # Same treatment for anything else this OpenSSH does not recognise:
+        # walk the remaining rejects out rather than failing to start at all.
+        n=0
+        while [ \$n -lt 8 ] && ! sshd -t -f /etc/ssh/sshd_config 2>/dev/null; do
+            bad=\$(sshd -t -f /etc/ssh/sshd_config 2>&1 \
+                  | sed -n 's/.*sshd_config line \\([0-9]*\\):.*/\\1/p' | head -n1)
+            [ -n \"\$bad\" ] || break
+            sed -i \"\${bad}s/^/#/\" /etc/ssh/sshd_config
+            n=\$(( n + 1 ))
+        done
+        exit 0
     " 2>/dev/null || warn "Could not configure sshd."
+
+    # Fail early and loudly if the config still will not parse: otherwise the
+    # daemon dies at the first connection and the client only says
+    # "Connection closed", which tells the user nothing.
+    local cfgtest
+    cfgtest="$(run_in_jail --root "$name" /bin/sh -c 'sshd -t 2>&1' 2>/dev/null || true)"
+    if [ -n "$cfgtest" ]; then
+        warn "sshd reported problems with its configuration inside '$name':"
+        printf '%s\n' "$cfgtest" | sed 's/^/         /' >&2
+    fi
 
     # Apply the credential. Errors here abort the start: a jail must never end
     # up listening with an unset or inherited password. stdin is left alone -
@@ -5201,6 +5286,39 @@ SSHEOF
     echo "$port" > "$portfile"
     printf '%s' "$internal_port" > "$JROOT_HOME/pids/$name.sshinner" 2>/dev/null || true
 
+    # ---- prove the daemon actually talks SSH -----------------------------
+    # A listening socket is not the same as a working daemon. sshd forks a
+    # privilege-separated child per connection, and when that child cannot start
+    # it closes the socket before sending its version banner - the client then
+    # reports only "Connection closed by <host> port <port>", which is useless on
+    # its own. Reading the banner here catches that at start time, while the log
+    # is still in hand.
+    local probe_host="127.0.0.1" probe_port="$port" banner=""
+    if [ "$have_socat" != 1 ]; then
+        probe_host="$jail_lb"
+        probe_port="$internal_port"
+    fi
+    banner="$(ssh_banner_probe "$probe_host" "$probe_port")"
+    case "$banner" in
+        SSH-*)
+            : # healthy
+            ;;
+        *)
+            warn "The daemon is listening on port $port but closed the connection without sending an SSH banner."
+            warn "That is almost always sshd's privilege-separation child failing to start inside the jail."
+            if [ -s "$logfile" ]; then
+                warn "Last lines of $logfile:"
+                tail -n 15 "$logfile" 2>/dev/null | sed 's/^/         /' >&2
+            fi
+            warn "Things worth trying:"
+            warn "  jroot ssh $name log                       # full sshd log"
+            warn "  jroot exec $name --root sshd -t           # config check"
+            warn "  jroot exec $name --root id sshd           # privsep account must exist"
+            warn "  jroot install $name openssh-server        # reinstall the daemon"
+            record_event "$name" "ssh" "started on port $port but no SSH banner (privsep?)"
+            ;;
+    esac
+
     log "SSH for '$name' is running."
     log "  External port: $port  ->  $mode_desc"
     log "  Connect:       ssh -p $port $user@<host-ip>"
@@ -5212,9 +5330,40 @@ SSHEOF
         log "  Auth:          password"
     fi
     log "  Only '$user' may log in; root login is $permit_root."
+    case "$banner" in
+        SSH-*) log "  Handshake:     verified (${banner%%$'\r'*})" ;;
+    esac
+    log "  sshd log:      $logfile"
     log "  The jail stays alive in the background for SSH access."
     record_event "$name" "ssh" "started on port $port as '$user' (root login: $permit_root)"
     return 0
+}
+
+# Open a TCP connection and read the peer's first line, which for a healthy sshd
+# is its version banner ("SSH-2.0-OpenSSH_8.9p1 ..."). Empty output means the
+# peer hung up without saying anything.
+ssh_banner_probe() {
+    local host="$1" port="$2" line=""
+    exec 4<>"/dev/tcp/$host/$port" 2>/dev/null || { printf ''; return 1; }
+    IFS= read -r -t 6 line <&4 2>/dev/null || true
+    exec 4<&- 2>/dev/null || true
+    exec 4>&- 2>/dev/null || true
+    printf '%s' "$line"
+}
+
+ssh_log() {
+    # jroot ssh <name> log - show what sshd has been saying.
+    local name="$1" logfile="$JROOT_HOME/pids/$name.sshlog"
+    if [ ! -f "$logfile" ]; then
+        log "No sshd log for '$name' yet. Start it with: jroot ssh $name start"
+        return 1
+    fi
+    if [ ! -s "$logfile" ]; then
+        log "sshd log for '$name' is empty ($logfile)."
+        return 0
+    fi
+    printf '%b%s%b\n' "$H" "$logfile" "$N"
+    cat "$logfile"
 }
 
 ssh_usage() {
@@ -5223,6 +5372,7 @@ ssh_usage() {
     printf '    %bjroot ssh <name> stop%b                stop the SSH daemon\n' "$G" "$N"
     printf '    %bjroot ssh <name> status%b              show if SSH is running\n' "$G" "$N"
     printf '    %bjroot ssh <name> passwd [user]%b       set a new password\n' "$G" "$N"
+    printf '    %bjroot ssh <name> log%b                 show the sshd log\n' "$G" "$N"
     printf '    %bjroot ssh <name>%b                     same as status\n' "$G" "$N"
     printf '\n%bFLAGS%b\n' "$H" "$N"
     help_row "--port=N | -p N" ""        "External port (default: first free 2200x)"
@@ -5276,7 +5426,7 @@ cmd_ssh() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            start|stop|status|passwd) op="$1" ;;
+            start|stop|status|passwd|log) op="$1" ;;
             --port=*)          SSH_OPT_PORT="${1#*=}" ;;
             -p)                shift; SSH_OPT_PORT="$1" ;;
             --user=*)          SSH_OPT_USER="${1#*=}" ;;
@@ -5326,6 +5476,7 @@ cmd_ssh() {
         start)  ssh_start "$name" ;;
         stop)   ssh_stop "$name" ;;
         status) ssh_status "$name" ;;
+        log)    ssh_log "$name" ;;
         passwd)
             [ "$SSH_OPT_NO_PASSWORD" != "1" ] || err "--no-password makes no sense for 'passwd'."
             ssh_passwd "$name" "${pw_user:-$SSH_OPT_USER}" "$SSH_OPT_PW_MODE" "$SSH_OPT_PW_VALUE"
