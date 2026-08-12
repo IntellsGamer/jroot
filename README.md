@@ -66,6 +66,12 @@ jroot help
 If you have the repository, the Makefile wraps the same installer and adds the
 verification targets:
 
+1. Clone the repository
+```bash
+git clone https://github.com/IntellsGamer/jroot.git
+```
+
+2. Install using Makefile:
 ```bash
 make install      # to ~/.local/bin, no root needed
 make check        # lint the script, compile the embedded C shim, self-test it
