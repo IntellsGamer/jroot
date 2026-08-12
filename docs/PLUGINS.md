@@ -6,7 +6,7 @@
 
 ## 1. Architectural Foundation & Execution Model
 
-The JRoot plugin system provides a production-grade extension architecture for rootless userspace containers. Designed around a strict security boundary and a zero-dependency host interface, plugins operate as isolated packages consisting of a declarative manifest (`plugin.json`), an executable entrypoint (Python or Bash), and private data storage.
+The JRoot plugin system provides a robust extension architecture for rootless userspace containers. Designed around a strict security boundary and a zero-dependency host interface, plugins operate as isolated packages consisting of a declarative manifest (`plugin.json`), an executable entrypoint (Python or Bash), and private data storage.
 
 When core JRoot operations occur—such as jail provisioning, resource limit modification, synchronization, or checkpointing—the host runtime dispatches event notifications through its internal hook dispatcher. 
 
@@ -25,7 +25,7 @@ The manifest file governs plugin installation, permissions, and hook registratio
 ```json
 {
   "api_version": 1,
-  "name": "enterprise-compliance",
+  "name": "compliance-audit",
   "version": "1.4.2",
   "description": "Real-time security auditing, resource telemetry, and immutable snapshot logging for JRoot.",
   "author": "Platform Infrastructure Team",
@@ -117,14 +117,14 @@ When JRoot invokes a plugin hook or background service, it injects a comprehensi
 
 ---
 
-## 5. Complete Production-Grade Plugin Example
+## 5. Full-Featured Plugin Example
 
 Below is a complete, production-ready plugin implementation demonstrating state persistence, resource monitoring, command execution, and hook multiplexing.
 
 ```python
 #!/usr/bin/env python3
 """
-Enterprise Telemetry & Resource Watchdog Plugin for JRoot
+System Telemetry & Resource Watchdog Plugin for JRoot
 """
 
 import sys
