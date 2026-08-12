@@ -3206,7 +3206,7 @@ cmd_init() {
     local default_name
     default_name="$(printf '%s' "$image" | tr ':/' '-')"
     name="$(resolve "What do you want to name this jail? [$default_name]: " "$default_name" "$cli_name")"
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid jail name: '$name'"
+    jail_name_valid "$name" || err "Invalid or reserved jail name: '$name'"
     if [ -e "$CONFIGS_DIR/$name.json" ]; then
         err "Jail '$name' already exists"
     fi
@@ -3595,7 +3595,7 @@ cmd_build() {
     if [ -z "$file" ]; then file="$context/JRootfile"; elif [[ "$file" != /* ]]; then file="$(pwd -P)/$file"; fi
     [ -f "$file" ] || err "JRootfile not found: $file"
     if [ -z "$tag" ]; then tag="$(basename "$context" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')"; fi
-    [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid build tag: '$tag'"
+    jail_name_valid "$tag" || err "Invalid or reserved build tag: '$tag'"
     [ ! -e "$CONFIGS_DIR/$tag.json" ] || err "Jail '$tag' already exists. Choose another tag with --tag."
     for arg in "${cli_build_args[@]}"; do
         [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || err "Invalid --build-arg '$arg'; use NAME=VALUE."
@@ -4127,6 +4127,7 @@ cmd_deploy() {
     orig_name="$(basename "$cfg_file" .json)"
     local target_name="${newname:-$orig_name}"
 
+    jail_name_valid "$target_name" || { rm -rf "$tmp"; err "Invalid or reserved deployment name: '$target_name'"; }
     [ -f "$CONFIGS_DIR/$target_name.json" ] && err "Jail '$target_name' already exists."
 
     mkdir -p "$ROOTS_DIR/$target_name" "$CONFIGS_DIR"
@@ -4773,6 +4774,14 @@ is_reserved_command() {
 
 plugin_valid_name() {
     [[ "$1" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] && ! is_reserved_command "$1"
+}
+
+# Jail names share the command namespace: `jroot diff` must always mean the
+# compare alias, never an ambiguous jail. Keep this guard next to the command
+# reservation table so newly reserved command aliases are protected everywhere
+# a jail can be introduced, not just through `jroot init`.
+jail_name_valid() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && ! is_reserved_command "$1"
 }
 
 plugin_root() { printf '%s\n' "$JROOT_HOME/plugins"; }
@@ -5642,7 +5651,7 @@ cmd_rename() {
     [ $# -eq 2 ] || err "Usage: jroot rename <name> <newname>"
     local name="$1" newname="$2"
     [ "$name" != "$newname" ] || err "New name is the same as the current name."
-    [[ "$newname" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid new name: '$newname'"
+    jail_name_valid "$newname" || err "Invalid or reserved new name: '$newname'"
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
     [ -f "$CONFIGS_DIR/$newname.json" ] && err "Jail '$newname' already exists. Run 'jroot list' to see jails."
     [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"

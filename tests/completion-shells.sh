@@ -47,6 +47,9 @@ require_candidate '' sync
 require_candidate 'sync ' dev:
 require_candidate 'limit dev --' --mem=
 require_candidate 'compose ' status
+require_candidate 'checkpoint ' dev
+require_candidate 'checkpoint ' diff
+require_candidate 'checkpoint diff ' dev
 require_candidate 'checkpoint diff dev ' baseline
 require_candidate 'rm-checkpoint dev ' baseline
 require_candidate 'plugin service ' start

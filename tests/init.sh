@@ -64,6 +64,39 @@ cmd_init alpine:3.22 --name=alpine --user=root --build-essential=0 --mount-host=
 [ -f "$ROOTS_DIR/alpine/etc/os-release" ]
 [ -L "$ROOTS_DIR/alpine/bin/sh" ]
 [ -f "$CONFIGS_DIR/alpine.json" ]
+
+# `diff` is the public compare alias. It must remain unavailable as a jail name
+# across every workflow that can create or introduce a jail.
+if (cmd_init ubuntu:22.04 --name=diff --user=root --build-essential=0 --mount-host=0 --mount-home=0) >/dev/null 2>&1; then
+    printf 'reserved init name was accepted\n' >&2
+    exit 1
+fi
+[ ! -e "$CONFIGS_DIR/diff.json" ]
+
+context="$JROOT_HOME/build-context"
+mkdir -p "$context"
+printf 'FROM ubuntu:22.04\n' > "$context/JRootfile"
+if (cmd_build --tag=diff "$context") >/dev/null 2>&1; then
+    printf 'reserved build tag was accepted\n' >&2
+    exit 1
+fi
+[ ! -e "$CONFIGS_DIR/diff.json" ]
+
+if (cmd_rename jammy diff) >/dev/null 2>&1; then
+    printf 'reserved rename target was accepted\n' >&2
+    exit 1
+fi
+[ -f "$CONFIGS_DIR/jammy.json" ]
+
+bundle="$JROOT_HOME/reserved-name-bundle.tar.gz"
+mkdir -p "$JROOT_HOME/bundle/configs" "$JROOT_HOME/bundle/roots/source"
+printf '{"name":"source"}\n' > "$JROOT_HOME/bundle/configs/source.json"
+tar -czf "$bundle" -C "$JROOT_HOME/bundle" configs roots
+if (cmd_deploy "$bundle" diff) >/dev/null 2>&1; then
+    printf 'reserved deployment name was accepted\n' >&2
+    exit 1
+fi
+[ ! -e "$CONFIGS_DIR/diff.json" ]
 BASH
 
 printf 'all init dispatch checks passed\n'
