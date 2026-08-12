@@ -61,6 +61,22 @@ bash install-jroot.sh
 jroot help
 ```
 
+### Termux on Android
+
+JRoot can run without root in Termux. Install the host tools first, then use the normal installer and keep JRoot's data in Termux's private home directory.
+
+```bash
+pkg update
+pkg install bash coreutils curl proot python rsync tar
+
+# Run the normal installation steps above, then create a jail normally.
+jroot init ubuntu:22.04 --name=dev --build-essential=0
+```
+
+Use the default `JROOT_HOME` under `$HOME` rather than `/sdcard`, `/storage/emulated/0`, or another shared-storage mount. Android shared storage often rejects executable files, symbolic links, ownership changes, or hard links required by Linux root filesystems.
+
+When a rootless filesystem rejects archive hard links or checkpoint links, JRoot automatically materializes independent regular-file copies during rootfs extraction, checkpoints, restores, and clones. This fallback uses more disk space but does not require root; install Termux `python` so it is available when needed.
+
 ### From a clone
 
 If you have the repository, the Makefile wraps the same installer and adds the

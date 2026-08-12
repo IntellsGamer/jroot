@@ -1957,6 +1957,177 @@ install_proot() {
 # ---------------------------------------------------------------------------
 # Rootfs download + extract
 # ---------------------------------------------------------------------------
+# Android shared storage and some FUSE-backed Termux locations reject hard links.
+# JRoot must remain usable there: space-efficient checkpoint linking is optional,
+# while a private, independent copy is always correct.
+filesystem_supports_hardlinks() {
+    local dir="$1" probe link
+    [ "${JROOT_FORCE_NO_HARDLINKS:-0}" != "1" ] || return 1
+    mkdir -p "$dir" 2>/dev/null || return 1
+    probe="$dir/.jroot-link-probe-$$-$RANDOM"
+    link="$probe.link"
+    (umask 077; : > "$probe") 2>/dev/null || return 1
+    if ln "$probe" "$link" 2>/dev/null; then
+        rm -f "$probe" "$link"
+        return 0
+    fi
+    rm -f "$probe" "$link"
+    return 1
+}
+
+private_copy_tree() {
+    # $1 is a directory and $2 must not exist. On a normal filesystem cp keeps
+    # metadata efficiently; on link-hostile storage Python copies each file so
+    # it can never attempt to recreate a source hard-link relationship.
+    local source="$1" destination="$2" exclude_relative="${3:-}" parent
+    [ -d "$source" ] || return 1
+    [ ! -e "$destination" ] || return 1
+    parent="$(dirname "$destination")"
+    if [ -z "$exclude_relative" ] && filesystem_supports_hardlinks "$parent"; then
+        if cp -a --reflink=auto "$source" "$destination" 2>/dev/null; then
+            return 0
+        fi
+        rm -rf "$destination"
+        if cp -a "$source" "$destination" 2>/dev/null; then
+            return 0
+        fi
+        rm -rf "$destination"
+    fi
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$source" "$destination" "$exclude_relative" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+source, destination, excluded = sys.argv[1:]
+source, destination = Path(source), Path(destination)
+excluded_path = Path(excluded.lstrip("/")) if excluded else None
+
+def ignore(directory, names):
+    if excluded_path is None:
+        return set()
+    try:
+        relative = Path(directory).relative_to(source)
+    except ValueError:
+        return set()
+    return {name for name in names if relative / name == excluded_path}
+
+# symlinks=True preserves the jail layout but copy2 creates private regular
+# files, intentionally expanding any hard-linked source files.
+shutil.copytree(source, destination, symlinks=True, copy_function=shutil.copy2,
+                ignore=ignore)
+PY
+}
+
+extract_tar_compat() {
+    # Prefer host tar. If it fails (commonly while creating a hard link on
+    # Termux storage), restart in an empty directory with an extractor that
+    # materializes tar hard links as independent regular files.
+    local archive="$1" destination="$2" context="$3" tar_error
+    tar_error="$destination/.jroot-tar-error.$$"
+    if [ "${JROOT_FORCE_LINK_SAFE_EXTRACT:-0}" != "1" ] && tar --no-same-owner -xzf "$archive" -C "$destination" 2>"$tar_error"; then
+        rm -f "$tar_error"
+        return 0
+    fi
+    rm -f "$tar_error"
+    rm -rf "$destination"
+    mkdir -p "$destination" || return 1
+    command -v python3 >/dev/null 2>&1 || {
+        warn "$context needs a hard-link-safe extractor here. Install Python with: pkg install python"
+        return 1
+    }
+    warn "$context: storage rejected archive links; extracting private file copies instead."
+    python3 - "$archive" "$destination" <<'PY'
+import os
+import shutil
+import stat
+import sys
+import tarfile
+from pathlib import Path
+
+archive, destination = map(Path, sys.argv[1:])
+root = destination.resolve()
+force_no_links = os.environ.get("JROOT_FORCE_NO_HARDLINKS") == "1"
+
+def member_path(name: str) -> Path:
+    normalized = os.path.normpath(name).lstrip("/")
+    if normalized in ("", "."):
+        return root
+    if normalized == ".." or normalized.startswith(".." + os.sep):
+        raise ValueError(f"unsafe archive path: {name!r}")
+    path = root / normalized
+    # Existing archive symlinks must never redirect a later member outside root.
+    parent = path.parent.resolve()
+    if os.path.commonpath((str(root), str(parent))) != str(root):
+        raise ValueError(f"archive member escapes destination: {name!r}")
+    return path
+
+def unlink_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+with tarfile.open(archive, "r:*") as tar:
+    members = tar.getmembers()
+    # Directories first, then payloads and links. Final directory metadata is
+    # applied after children have been created.
+    for member in members:
+        if member.isdir():
+            member_path(member.name).mkdir(parents=True, exist_ok=True)
+    directory_metadata = []
+    for member in members:
+        output = member_path(member.name)
+        if member.isdir():
+            directory_metadata.append((output, member))
+            continue
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if member.issym():
+            unlink_path(output)
+            os.symlink(member.linkname, output)
+            continue
+        if member.islnk():
+            # GNU tar records hard-link targets relative to archive root. A
+            # relative fallback covers other tar writers without escaping root.
+            target = member_path(member.linkname)
+            if not target.exists():
+                target = member_path(str(Path(member.name).parent / member.linkname))
+            unlink_path(output)
+            try:
+                if force_no_links:
+                    raise OSError("forced no-hardlink mode")
+                os.link(target, output)
+            except OSError:
+                with open(target, "rb") as src, open(output, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+            continue
+        if member.isfile():
+            source = tar.extractfile(member)
+            if source is None:
+                raise ValueError(f"cannot read archive member: {member.name!r}")
+            unlink_path(output)
+            with source, open(output, "wb") as dst:
+                shutil.copyfileobj(source, dst, length=1024 * 1024)
+            try:
+                os.chmod(output, stat.S_IMODE(member.mode))
+                os.utime(output, (member.mtime, member.mtime), follow_symlinks=False)
+            except OSError:
+                pass
+            continue
+        # Character devices, block devices, and FIFOs cannot be made by a
+        # rootless Termux process. Official rootfs archives normally omit them.
+        if member.ischr() or member.isblk() or member.isfifo():
+            continue
+        raise ValueError(f"unsupported archive member type: {member.name!r}")
+    for directory, member in reversed(directory_metadata):
+        try:
+            os.chmod(directory, stat.S_IMODE(member.mode))
+            os.utime(directory, (member.mtime, member.mtime), follow_symlinks=False)
+        except OSError:
+            pass
+PY
+}
+
 # 22.04 publishes "ubuntu-base-22.04-base-<arch>.tar.gz", but 24.04+ uses the
 # point release in the name ("ubuntu-base-24.04.4-base-<arch>.tar.gz"). Try
 # the exact version first, then parse the release directory listing.
@@ -2002,7 +2173,7 @@ get_ubuntu() {
             || err "Failed to download Ubuntu ${version} rootfs"
     fi
     log "Extracting rootfs..."
-    tar -xzf "$tarball" -C "$rootfs" || { rm -rf "$rootfs"; err "Rootfs extraction failed; the incomplete rootfs was removed."; }
+    extract_tar_compat "$tarball" "$rootfs" "Ubuntu rootfs extraction" || { rm -rf "$rootfs"; err "Rootfs extraction failed; the incomplete rootfs was removed."; }
     [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ] || { rm -rf "$rootfs"; err "Rootfs extraction failed - /bin/sh not found; the incomplete rootfs was removed."; }
     log "Rootfs extracted to $rootfs"
 }
@@ -2037,7 +2208,7 @@ get_alpine() {
                 || err "Failed to download Alpine edge rootfs"
         fi
         log "Extracting rootfs..."
-        tar -xzf "$tarball" -C "$rootfs" || { rm -rf "$rootfs"; err "Alpine rootfs extraction failed; the incomplete rootfs was removed."; }
+        extract_tar_compat "$tarball" "$rootfs" "Alpine rootfs extraction" || { rm -rf "$rootfs"; err "Alpine rootfs extraction failed; the incomplete rootfs was removed."; }
     else
         # Alpine tarballs include patch version (e.g., 3.20.3, 3.20.8, 3.20.9)
         # Try to discover the latest patch version by listing the directory
@@ -2067,7 +2238,7 @@ get_alpine() {
                 || err "Failed to download Alpine ${version} rootfs"
         fi
         log "Extracting rootfs..."
-        tar -xzf "$tarball" -C "$rootfs" || { rm -rf "$rootfs"; err "Alpine rootfs extraction failed; the incomplete rootfs was removed."; }
+        extract_tar_compat "$tarball" "$rootfs" "Alpine rootfs extraction" || { rm -rf "$rootfs"; err "Alpine rootfs extraction failed; the incomplete rootfs was removed."; }
     fi
     [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ] || { rm -rf "$rootfs"; err "Rootfs extraction failed - /bin/sh not found; the incomplete rootfs was removed."; }
     log "Rootfs extracted to $rootfs"
@@ -4116,7 +4287,7 @@ cmd_deploy() {
     log "Deploying jail from '$archive'..."
     local tmp
     tmp="$(mktemp -d "$JROOT_HOME/.deploy.XXXXXX")"
-    tar -xzf "$archive" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; err "Failed to extract archive."; }
+    extract_tar_compat "$archive" "$tmp" "Bundle deployment extraction" || { rm -rf "$tmp"; err "Failed to extract archive."; }
 
     # Find config file in tmp/configs/
     local cfg_file
@@ -7629,11 +7800,11 @@ cmd_clone() {
     if [ "$kind" = "checkpoint" ]; then
         # A clone must never hard-link to its checkpoint. A normal write in the
         # clone would otherwise corrupt the immutable saved state.
-        cp -a --reflink=auto "$saved_root" "$stage_root" || { cleanup_clone_stage; err "Could not copy checkpoint rootfs."; }
+        private_copy_tree "$saved_root" "$stage_root" || { cleanup_clone_stage; err "Could not copy checkpoint rootfs."; }
     else
         extract_dir="$stage/extract"
         mkdir -p "$extract_dir"
-        if ! tar -xzf "$saved_root" -C "$extract_dir" 2>/dev/null || [ ! -d "$extract_dir/$source" ]; then
+        if ! extract_tar_compat "$saved_root" "$extract_dir" "Snapshot clone extraction" || [ ! -d "$extract_dir/$source" ]; then
             cleanup_clone_stage
             err "Could not extract snapshot '$label'; it is incomplete or corrupt."
         fi
@@ -7842,7 +8013,7 @@ cmd_checkpoint() {
         shim_rel="/usr/local/lib/libjroot.so"
         checkpoint_excludes+=("--exclude=$shim_rel")
     fi
-    if command -v rsync >/dev/null 2>&1; then
+    if command -v rsync >/dev/null 2>&1 && filesystem_supports_hardlinks "$dir"; then
         mkdir -p "$target" || err "Checkpoint directory creation failed."
         local rsync_args=(-a --delete)
         [ -n "$previous" ] && rsync_args+=("--link-dest=$previous")
@@ -7851,16 +8022,14 @@ cmd_checkpoint() {
             rm -rf "$target"
             err "Checkpoint update failed."
         fi
-    elif [ -n "$shim_rel" ]; then
-        # cp has no exclusion switch. The tar fallback still keeps the saved
-        # rootfs private, while omitting only the launcher-owned placeholder.
-        mkdir -p "$target" || err "Checkpoint directory creation failed."
-        if ! tar --exclude=".${shim_rel}" -C "$ROOTS_DIR/$name" -cf - . 2>/dev/null | tar -C "$target" -xf - 2>/dev/null; then
-            rm -rf "$target"
-            err "Checkpoint failed while excluding the transient port shim."
-        fi
     else
-        cp -a --reflink=auto "$ROOTS_DIR/$name" "$target" || err "Checkpoint failed."
+        # Termux shared storage and other FUSE filesystems cannot link to a
+        # previous checkpoint. A private copy costs more disk space but remains
+        # immutable and lets normal init/checkpoint/clone workflows work.
+        private_copy_tree "$ROOTS_DIR/$name" "$target" "$shim_rel" || {
+            rm -rf "$target"
+            err "Checkpoint failed. On Termux, install Python with: pkg install python"
+        }
     fi
     cp "$CONFIGS_DIR/$name.json" "$target.json"
     log "Checkpoint saved: $target"
@@ -7875,15 +8044,18 @@ cmd_checkpoints() {
 }
 
 restore_checkpoint_now() {
-    local name="$1" label="$2" dir="$SNAPSHOTS_DIR/$name/checkpoints"
-    local rootfs="$ROOTS_DIR/$name" old_rootfs
+    local name label dir rootfs old_rootfs
+    name="$1"
+    label="$2"
+    dir="$SNAPSHOTS_DIR/$name/checkpoints"
+    rootfs="$ROOTS_DIR/$name"
     [ -d "$dir/$label" ] || return 1
     [ -f "$dir/$label.json" ] || return 1
     old_rootfs="${rootfs}.old.$(date +%s).$$"
     mv "$rootfs" "$old_rootfs" || return 1
     # Do not hard-link the restored live rootfs to a checkpoint. A subsequent
     # package install or ordinary write must never mutate the retained restore point.
-    if ! cp -a --reflink=auto "$dir/$label" "$rootfs"; then
+    if ! private_copy_tree "$dir/$label" "$rootfs"; then
         mv "$old_rootfs" "$rootfs" 2>/dev/null || true
         return 1
     fi
@@ -7940,7 +8112,7 @@ cmd_revert() {
     if [ "$type" = "snapshot" ]; then
         tmp="$(mktemp -d "$SNAPSHOTS_DIR/.restore.XXXXXX")"
         log "Restoring '$name' from snapshot '$label'..."
-        if ! tar -xzf "$dir/$label.tar.gz" -C "$tmp" 2>/dev/null; then
+        if ! extract_tar_compat "$dir/$label.tar.gz" "$tmp" "Snapshot restore extraction"; then
             rm -rf "$tmp"
             err "Restore failed: corrupt snapshot archive."
         fi
