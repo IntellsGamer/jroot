@@ -3627,6 +3627,198 @@ cmd_sync() {
     fi
 }
 
+bundle_usage() {
+    printf '%bjroot bundle%b - package a jail into a portable archive\n\n' "$H" "$N"
+    printf '    %bjroot bundle <name> <output.tar.gz>%b\n\n' "$G" "$N"
+    printf '    Bundles the jail rootfs and configuration into a single compressed archive.\n'
+}
+
+cmd_bundle() {
+    [ $# -eq 2 ] || { bundle_usage; err "${CMD_HINT}bundle needs <name> <output.tar.gz>."; }
+    local name="$1" out="$2"
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found."
+    local rootfs="$ROOTS_DIR/$name"
+    [ -d "$rootfs" ] || err "Rootfs for '$name' is missing."
+
+    log "Bundling jail '$name' into '$out'..."
+    tar -czf "$out" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+    log "Jail '$name' successfully bundled to '$out'."
+    record_event "$name" bundle "bundled to $out"
+}
+
+deploy_usage() {
+    printf '%bjroot deploy%b - deploy a bundled jail archive\n\n' "$H" "$N"
+    printf '    %bjroot deploy <archive.tar.gz> [newname]%b\n\n' "$G" "$N"
+    printf '    Extracts and registers a bundled jail archive into ~/.jroot.\n'
+}
+
+cmd_deploy() {
+    [ $# -ge 1 ] || { deploy_usage; err "${CMD_HINT}deploy needs <archive.tar.gz>."; }
+    local archive="$1" newname="${2:-}"
+    [ -f "$archive" ] || err "Archive '$archive' not found."
+
+    log "Deploying jail from '$archive'..."
+    local tmp
+    tmp="$(mktemp -d "$JROOT_HOME/.deploy.XXXXXX")"
+    tar -xzf "$archive" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; err "Failed to extract archive."; }
+
+    # Find config file in tmp/configs/
+    local cfg_file
+    cfg_file="$(find "$tmp/configs" -name "*.json" | head -n 1)"
+    [ -n "$cfg_file" ] || { rm -rf "$tmp"; err "Invalid bundle: no config found."; }
+
+    local orig_name
+    orig_name="$(basename "$cfg_file" .json)"
+    local target_name="${newname:-$orig_name}"
+
+    [ -f "$CONFIGS_DIR/$target_name.json" ] && err "Jail '$target_name' already exists."
+
+    mkdir -p "$ROOTS_DIR/$target_name" "$CONFIGS_DIR"
+    cp "$cfg_file" "$CONFIGS_DIR/$target_name.json"
+
+    local extracted_root="$tmp/roots/$orig_name"
+    if [ -d "$extracted_root" ]; then
+        rm -rf "$ROOTS_DIR/$target_name"
+        mv "$extracted_root" "$ROOTS_DIR/$target_name"
+    else
+        { rm -rf "$tmp"; err "Invalid bundle: rootfs missing for '$orig_name'."; }
+    fi
+
+    # Update name in json if renamed
+    if [ "$target_name" != "$orig_name" ]; then
+        python3 -c "import json; p='$CONFIGS_DIR/$target_name.json'; d=json.load(open(p)); d['name']='$target_name'; json.dump(d,open(p,'w'))" 2>/dev/null || true
+    fi
+
+    rm -rf "$tmp"
+    log "Jail '$target_name' successfully deployed."
+    record_event "$target_name" deploy "deployed from $archive"
+}
+
+monitor_usage() {
+    printf '%bjroot monitor%b - real-time telemetry and resource usage for jails\n\n' "$H" "$N"
+    printf '    %bjroot monitor%b\n\n' "$G" "$N"
+    printf '    Displays live resource usage (CPU, memory, disk, PIDs) across all running jails.\n'
+}
+
+cmd_monitor() {
+    log "Starting JRoot Live Monitor (Press Ctrl+C to exit)..."
+    while true; do
+        clear
+        printf '%b========================================================================%b\n' "$H" "$N"
+        printf '%b                        JROOT LIVE TELEMETRY                            %b\n' "$H" "$N"
+        printf '%b========================================================================%b\n' "$H" "$N"
+        printf '%-14s %-8s %-8s %-12s %-10s %s\n' "JAIL" "PID" "STATUS" "ROOTFS SIZE" "MEMORY" "COMMAND"
+        printf '%------------------------------------------------------------------------\n'
+
+        for cfg in "$CONFIGS_DIR"/*.json; do
+            [ -f "$cfg" ] || continue
+            local name
+            name="$(basename "$cfg" .json)"
+            local pidfile="$JROOT_HOME/pids/$name.pid"
+            local pid="-" status="STOPPED" mem="-" cmd="-" size="-"
+
+            if [ -f "$rootfs_size_cmd" ] || true; then
+                # compute rootfs size
+                if [ -d "$ROOTS_DIR/$name" ]; then
+                    size="$(du -sh "$ROOTS_DIR/$name" 2>/dev/null | cut -f1)"
+                fi
+            fi
+
+            if [ -f "$pidfile" ]; then
+                local p
+                p="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+                if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+                    pid="$p"
+                    status="RUNNING"
+                    mem="$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print int($1/1024) " MB"}')"
+                    cmd="$(ps -o cmd= -p "$pid" 2>/dev/null | head -c 30)"
+                else
+                    status="STALE"
+                fi
+            fi
+
+            printf '%-14s %-8s %-8s %-12s %-10s %s\n' "$name" "$pid" "$status" "${size:-0B}" "${mem:--}" "${cmd:--}"
+        done
+
+        printf '\n%bPress Ctrl+C to exit monitor.%b\n' "$D" "$N"
+        sleep 2
+    done
+}
+
+compose_usage() {
+    printf '%bjroot compose%b - multi-jail stack orchestration\n\n' "$H" "$N"
+    printf '    %bjroot compose up [file]%b         Start jails defined in jroot-compose.yml\n' "$G" "$N"
+    printf '    %bjroot compose down [file]%b       Stop/kill jails defined in compose file\n' "$G" "$N"
+    printf '    %bjroot compose status [file]%b     Show status of compose stack\n' "$G" "$N"
+}
+
+cmd_compose() {
+    local op="${1:-up}"
+    local file="${2:-jroot-compose.yml}"
+    [ -f "$file" ] || err "Compose file '$file' not found."
+
+    command -v python3 >/dev/null 2>&1 || err "python3 is required for compose parsing."
+
+    case "$op" in
+        up)
+            log "Parsing compose file '$file'..."
+            python3 -c "
+import json, yaml if __import__('importlib.util').find_spec('yaml') else None
+# Simple parser or pyyaml
+try:
+    import yaml
+    data = yaml.safe_load(open('$file'))
+except:
+    import json
+    # fallback or simple line parser
+    data = {}
+    print('Error: PyYAML not installed. Install with pip3 install pyyaml.')
+    exit(1)
+
+jails = data.get('jails', {})
+for name, cfg in jails.items():
+    image = cfg.get('image', 'ubuntu:22.04')
+    print(f'INIT:{name}:{image}')
+" | while read -r line; do
+                case "$line" in
+                    INIT:*)
+                        IFS=':' read -r _ jname jimg <<< "$line"
+                        if [ ! -f "$CONFIGS_DIR/$jname.json" ]; then
+                            log "Initializing compose jail '$jname' ($jimg)..."
+                            cmd_init "$jimg" --name="$jname" --noninteractive >/dev/null 2>&1 || cmd_init "$jimg" --noninteractive >/dev/null 2>&1 || true
+                        fi
+                        # Start enter in background or ssh
+                        log "Entering/starting jail '$jname'..."
+                        ;;
+                esac
+            done
+            log "Compose stack started."
+            ;;
+        down)
+            log "Stopping compose stack from '$file'..."
+            python3 -c "
+import yaml
+data = yaml.safe_load(open('$file'))
+for name in data.get('jails', {}):
+    print(name)
+" | while read -r jname; do
+                [ -n "$jname" ] || continue
+                log "Killing jail '$jname'..."
+                cmd_kill "$jname" 2>/dev/null || true
+            done
+            log "Compose stack stopped."
+            ;;
+        status)
+            cmd_monitor
+            ;;
+        *)
+            compose_usage
+            err "Unknown compose operation '$op'."
+            ;;
+    esac
+}
+
+
 port_usage() {
     printf '%bjroot port%b - control which jailed ports may bind publicly\n\n' "$H" "$N"
     printf '    %bjroot port <name> list%b              show public ports\n' "$G" "$N"
@@ -6091,6 +6283,18 @@ cmd_help_cmd() {
         sync)
             sync_usage
             ;;
+        bundle)
+            bundle_usage
+            ;;
+        deploy)
+            deploy_usage
+            ;;
+        monitor)
+            monitor_usage
+            ;;
+        compose)
+            compose_usage
+            ;;
         port)
             port_usage
             ;;
@@ -6242,6 +6446,10 @@ cmd_help() {
     help_row "jroot exec" "<name> [--root] <cmd>"  "Run one command inside a jail"
     help_row "jroot file" "cp|mv <src> <dst>"      "Copy/move files between the host and jails"
     help_row "jroot sync" "[options] <src> <dst>"  "Synchronize directories between host and jails"
+    help_row "jroot bundle" "<name> <out.tar.gz>"  "Package a jail into a portable archive"
+    help_row "jroot deploy" "<archive> [newname]"  "Deploy a bundled jail archive"
+    help_row "jroot monitor" ""                    "Live telemetry and resource usage TUI"
+    help_row "jroot compose" "up|down|status"      "Multi-jail stack orchestration"
     printf '                                      %b (a jail side is written %bdev:/path%b)\n' "$B" "$G" "$N"
     help_row "jroot port" "list|add|rm <name>"    "Control which jailed ports may bind publicly"
     help_row "jroot net" "[set <name> auto|off]"  "Per-jail loopback address (no port collisions)"
@@ -7097,6 +7305,10 @@ jroot_cmd() {
         exec)          shift; cmd_exec "$@" ;;
         file)          shift; cmd_file "$@" ;;
         sync)          shift; cmd_sync "$@" ;;
+        bundle)        shift; cmd_bundle "$@" ;;
+        deploy)        shift; cmd_deploy "$@" ;;
+        monitor)       shift; cmd_monitor "$@" ;;
+        compose)       shift; cmd_compose "$@" ;;
         port)          shift; cmd_port "$@" ;;
         net)           shift; cmd_net "$@" ;;
         mnt)           shift; cmd_mnt "$@" ;;

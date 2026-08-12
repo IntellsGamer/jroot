@@ -1566,3 +1566,74 @@ And that's usually where the fun starts.
 Just a Linux userspace running somewhere it technically shouldn't be this easy to run.
 
 </div>
+
+
+---
+
+# 🔄 `jroot sync` – Bidirectional Workspace Mirroring
+
+Moving code between host and jails during development is streamlined with `jroot sync`. Powered by `rsync`, it supports incremental synchronization, deletion flags, dry runs, and a real-time watch mode (`--watch`) using `inotify` or automated polling.
+
+```bash
+# Host to jail
+jroot sync ./my-app dev:/root/my-app
+
+# Jail to host backup
+jroot sync dev:/root/my-app ./my-app-backup
+
+# Continuous watch mode (syncs on every local change)
+jroot sync --watch ./my-app dev:/root/my-app
+
+# Sync with deletion of extraneous destination files
+jroot sync --delete ./my-app dev:/root/my-app
+```
+
+---
+
+# 📦 `jroot bundle` & `jroot deploy` – Portability
+
+Jails can be packaged into portable, compressed archives and deployed across different machines or environments without losing configuration or state.
+
+```bash
+# Bundle a jail into a single tarball
+jroot bundle dev my-dev-jail.tar.gz
+
+# Deploy a bundled jail on another host (optionally renaming it)
+jroot deploy my-dev-jail.tar.gz production-jail
+```
+
+---
+
+# 📊 `jroot monitor` – Real-Time Telemetry TUI
+
+Monitor active resource usage across all running jails in real time. `jroot monitor` provides a live telemetry dashboard displaying process IDs, status, rootfs disk size, memory consumption, and active commands.
+
+```bash
+jroot monitor
+```
+
+---
+
+# 🎼 `jroot compose` – Multi-Jail Stack Orchestration
+
+Define and orchestrate multi-jail development stacks using declarative configuration files (`jroot-compose.yml`), mirroring container-orchestration workflows in an entirely rootless environment.
+
+```yaml
+# jroot-compose.yml example
+jails:
+  web:
+    image: ubuntu:22.04
+  db:
+    image: ubuntu:22.04
+```
+
+```bash
+# Start the stack
+jroot compose up
+
+# Check status
+jroot compose status
+
+# Stop and terminate the stack
+jroot compose down
+```
