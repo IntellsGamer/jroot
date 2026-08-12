@@ -6020,10 +6020,10 @@ if [ -f "\$JROOT_SHIM" ]; then
     JROOT_PORTS='$jail_ports'
     JROOT_LOOPBACK='$jail_lb'
     JROOT_RO_MOUNTS='$ro_mounts'
-    JROOT_PORTS JROOT_LOOPBACK JROOT_RO_MOUNTS
-    [ -n "\$JROOT_TRACER" ] && { JROOT_PROC_ROOT="\$JROOT_TRACER"; JROOT_PROC_ROOT; }
+    export JROOT_PORTS JROOT_LOOPBACK JROOT_RO_MOUNTS
+    [ -n "\$JROOT_TRACER" ] && { JROOT_PROC_ROOT="\$JROOT_TRACER"; export JROOT_PROC_ROOT; }
     LD_PRELOAD="\$JROOT_SHIM"
-    LD_PRELOAD
+    export LD_PRELOAD
 fi
 
 [ -n "\$SHELL" ] && [ -x "\$SHELL" ] || SHELL=/bin/sh
