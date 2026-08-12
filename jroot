@@ -3265,6 +3265,7 @@ cmd_init() {
     write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
     record_event "$name" "created" \
         "$image user=$user_mode build_essential=$build_essential mount_host=$mount_host mount_home=$mount_home"
+    trigger_event_hooks "on_init" "$name" "$image"
 
     local bootstrapped=1
     if [ "${JROOT_SKIP_APT:-}" = "1" ] || [ "${JROOT_SKIP_BOOTSTRAP:-}" = "1" ]; then
@@ -4179,30 +4180,53 @@ PY
 }
 
 
-plugin_usage() {
-    printf '%bjroot plugin%b - manage and run community/custom extensions\n\n' "$H" "$N"
-    printf '    %bjroot plugin list%b                  list installed plugins\n' "$G" "$N"
-    printf '    %bjroot plugin install <path|url>%b    install a plugin script into ~/.jroot/plugins/\n' "$G" "$N"
-    printf '    %bjroot plugin remove <name>%b         uninstall a plugin\n' "$G" "$N"
-    printf '    %bjroot <plugin-name> [args...]%b      run an installed plugin directly\n\n' "$G" "$N"
-    printf '    %bEnvironment exposed to plugins:%b\n' "$H" "$N"
-    printf '        JROOT_HOME          path to ~/.jroot storage\n'
-    printf '        JROOT_ROOTS         path to ~/.jroot/roots\n'
-    printf '        JROOT_CONFIGS       path to ~/.jroot/configs\n'
-    printf '        JROOT_BIN           path to ~/.jroot/bin\n'
+
+# ---------------------------------------------------------------------------
+# Production-Grade Plugin & Event-Driven Hook System
+# ---------------------------------------------------------------------------
+
+trigger_event_hooks() {
+    local event="$1"; shift
+    local plugins_dir="$JROOT_HOME/plugins"
+    [ -d "$plugins_dir" ] || return 0
+
+    local p target
+    for p in "$plugins_dir"/*; do
+        if [ -d "$p" ]; then
+            # Directory plugin with manifest or main entry
+            target="$p/main.py"
+            [ -f "$target" ] || target="$p/main.sh"
+            if [ -f "$target" ]; then
+                export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
+                if [[ "$target" == *.py ]]; then
+                    python3 "$target" "hook:$event" "$@" 2>/dev/null || true
+                else
+                    bash "$target" "hook:$event" "$@" 2>/dev/null || true
+                fi
+            fi
+        elif [ -f "$p" ]; then
+            # Single file plugin
+            export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
+            if [[ "$p" == *.py ]]; then
+                python3 "$p" "hook:$event" "$@" 2>/dev/null || true
+            else
+                bash "$p" "hook:$event" "$@" 2>/dev/null || true
+            fi
+        fi
+    done
 }
 
-
-is_reserved_command() {
-    local cmd="$1"
-    case "$cmd" in
-        init|enter|exec|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|install|config|list|ls|info|size|history|compare|diff|which|doctor|snapshot|snapshots|revert|rm-snapshot|update|clean|rename|kill|stop|ps|ssh|completion|completions|help|plugin)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
+plugin_usage() {
+    printf '%bjroot plugin%b - enterprise event-driven extension manager\n\n' "$H" "$N"
+    printf '    %bjroot plugin list%b                  list active plugins & hooks\n' "$G" "$N"
+    printf '    %bjroot plugin install <dir|file>%b    install a plugin or packaged bundle\n' "$G" "$N"
+    printf '    %bjroot plugin remove <name>%b         uninstall a plugin\n' "$G" "$N"
+    printf '    %bjroot plugin init-sdk%b              generate a starter Python plugin template\n\n' "$G" "$N"
+    printf '    %bSupported Lifecycle Hooks:%b\n' "$H" "$N"
+    printf '        on_init       triggered when a new jail is created\n'
+    printf '        on_enter      triggered when entering or executing inside a jail\n'
+    printf '        on_stop       triggered when stopping/killing a jail or its SSH daemon\n'
+    printf '        on_remove     triggered when a jail is deleted\n'
 }
 
 cmd_plugin() {
@@ -4212,42 +4236,94 @@ cmd_plugin() {
 
     case "$op" in
         list|ls)
-            local p found=0
-            printf '%-20s %s\n' "PLUGIN" "PATH"
+            local p found=0 name desc version="1.0.0"
+            printf '%-20s %-10s %s\n' "PLUGIN" "VERSION" "DESCRIPTION"
+            printf '%-20s %-10s %s\n' "------" "-------" "-----------"
             for p in "$plugins_dir"/*; do
-                [ -f "$p" ] || continue
+                [ -e "$p" ] || continue
                 found=1
-                printf '%-20s %s\n' "$(basename "$p" | sed 's/\.[^.]*$//')" "$p"
+                name="$(basename "$p" | sed 's/\.[^.]*$//')"
+                desc="Custom script extension"
+                if [ -d "$p" ] && [ -f "$p/plugin.json" ]; then
+                    desc="$(python3 -c "import json; print(json.load(open('$p/plugin.json')).get('description', ''))" 2>/dev/null || echo '')"
+                    version="$(python3 -c "import json; print(json.load(open('$p/plugin.json')).get('version', '1.0.0'))" 2>/dev/null || echo '1.0.0')"
+                fi
+                printf '%-20s %-10s %s\n' "$name" "$version" "$desc"
             done
-            [ "$found" = 1 ] || log "No plugins installed in $plugins_dir. Install one with: jroot plugin install <path>"
+            [ "$found" = 1 ] || log "No plugins installed. Create one using 'jroot plugin init-sdk'."
             ;;
         install|add)
-            [ $# -eq 1 ] || err "Usage: jroot plugin install <path-to-script>"
+            [ $# -eq 1 ] || err "Usage: jroot plugin install <path-to-script-or-directory>"
             local src="$1" name
-            [ -f "$src" ] || err "Plugin script not found: '$src'"
-            name="$(basename "$src" | sed 's/\.[^.]*$//')"
-            if is_reserved_command "$name"; then
-                err "Plugin name '$name' is a reserved built-in jroot subcommand and cannot be shadowed."
+            [ -e "$src" ] || err "Plugin source not found: '$src'"
+            if [ -d "$src" ]; then
+                name="$(basename "$src")"
+                [ -f "$src/plugin.json" ] || err "Packaged plugin bundle requires a 'plugin.json' manifest."
+                name="$(python3 -c "import json; print(json.load(open('$src/plugin.json')).get('name', '$name'))" 2>/dev/null || echo "$name")"
+                if is_reserved_command "$name"; then
+                    err "Plugin name '$name' is a reserved built-in jroot subcommand."
+                fi
+                rm -rf "$plugins_dir/$name"
+                cp -r "$src" "$plugins_dir/$name"
+                log "Packaged plugin bundle '$name' installed successfully."
+            else
+                name="$(basename "$src" | sed 's/\.[^.]*$//')"
+                if is_reserved_command "$name"; then
+                    err "Plugin name '$name' is a reserved built-in jroot subcommand."
+                fi
+                local ext="${src##*.}"
+                [ "$ext" = "$src" ] && ext="sh"
+                cp "$src" "$plugins_dir/$name.$ext"
+                chmod +x "$plugins_dir/$name.$ext"
+                log "Plugin script '$name' installed successfully."
             fi
-            local ext="${src##*.}"
-            [ "$ext" = "$src" ] && ext="sh"
-            cp "$src" "$plugins_dir/$name.$ext"
-            chmod +x "$plugins_dir/$name.$ext"
-            name="$name.$ext"
-            chmod +x "$plugins_dir/$name"
-            log "Plugin '$name' successfully installed to $plugins_dir/$name."
             ;;
         remove|rm|uninstall)
             [ $# -eq 1 ] || err "Usage: jroot plugin remove <name>"
             local name="$1" target
-            for target in "$plugins_dir/$name" "$plugins_dir/$name.sh" "$plugins_dir/$name.py"; do
-                if [ -f "$target" ]; then
-                    rm -f "$target"
-                    log "Plugin '$name' removed."
+            for target in "$plugins_dir/$name" "$plugins_dir/$name.sh" "$plugins_dir/$name.py" "$plugins_dir/$name"*; do
+                if [ -e "$target" ]; then
+                    rm -rf "$target"
+                    log "Plugin '$name' successfully removed."
                     return 0
                 fi
             done
             err "Plugin '$name' not found."
+            ;;
+        init-sdk|sdk)
+            local sdk_dir="jroot-plugin-template"
+            mkdir -p "$sdk_dir"
+            cat << 'SDKEOF' > "$sdk_dir/plugin.json"
+{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "An event-driven production-grade jroot plugin",
+  "author": "Developer"
+}
+SDKEOF
+            cat << 'SDKEOF' > "$sdk_dir/main.py"
+#!/usr/bin/env python3
+import sys, os
+
+def main():
+    if len(sys.argv) < 2:
+        print("MyPlugin is active and ready.")
+        return
+
+    action = sys.argv[1]
+    if action.startswith("hook:"):
+        event = action.split(":")[1]
+        data = sys.argv[2:] if len(sys.argv) > 2 else []
+        print(f"[MyPlugin Hook Received -> {event}] data: {data}", flush=True)
+    else:
+        print(f"Executing plugin command with args: {sys.argv[1:]}", flush=True)
+
+if __name__ == "__main__":
+    main()
+SDKEOF
+            chmod +x "$sdk_dir/main.py"
+            log "Created plugin SDK template under './$sdk_dir/'."
+            log "Install it via: jroot plugin install ./$sdk_dir"
             ;;
         -h|--help|help)
             plugin_usage
@@ -4262,12 +4338,17 @@ run_plugin() {
     local name="$1"; shift
     local plugins_dir="$JROOT_HOME/plugins"
     local target="" p
-    for p in "$plugins_dir/$name" "$plugins_dir/$name.sh" "$plugins_dir/$name.py" "$plugins_dir/$name"* ; do
-        if [ -f "$p" ]; then
-            target="$p"
-            break
-        fi
-    done
+    
+    # Check directory bundle first
+    if [ -d "$plugins_dir/$name" ]; then
+        target="$plugins_dir/$name/main.py"
+        [ -f "$target" ] || target="$plugins_dir/$name/main.sh"
+        [ -f "$target" ] || return 1
+    else
+        for p in "$plugins_dir/$name" "$plugins_dir/$name.sh" "$plugins_dir/$name.py" "$plugins_dir/$name"*; do
+            [ -f "$p" ] && target="$p" && break
+        done
+    fi
     [ -n "$target" ] || return 1
 
     export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"

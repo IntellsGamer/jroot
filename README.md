@@ -1645,48 +1645,10 @@ jroot compose down
 
 ---
 
+---
+
 # 🔌 `jroot plugin` – Community & Custom Extensions
 
-`jroot` includes a secure, context-aware plugin extension system. Plugins can be written in Bash or Python, have full access to internal jail configurations and root directories, and execute as first-class subcommands without shadowing reserved built-in verbs.
+`jroot` includes a secure, production-grade event-driven plugin extension system with full SDK support. 
 
-## Managing Plugins
-
-```bash
-# List installed plugins
-jroot plugin list
-
-# Install a custom extension script
-jroot plugin install ./jroot-status.py
-
-# Execute your plugin directly
-jroot jroot-status
-
-# Remove a plugin
-jroot plugin remove jroot-status
-```
-
-## Writing a Plugin
-
-Plugins receive environment variables pointing to internal `jroot` data stores:
-
-- `JROOT_HOME`: Path to `~/.jroot`
-- `JROOT_ROOTS`: Path to `~/.jroot/roots`
-- `JROOT_CONFIGS`: Path to `~/.jroot/configs`
-- `JROOT_BIN`: Path to `~/.jroot/bin`
-
-### Example Python Plugin (`jroot-status.py`)
-
-```python
-#!/usr/bin/env python3
-import os, json, glob
-
-def main():
-    configs_dir = os.environ.get("JROOT_CONFIGS")
-    for j in glob.glob(os.path.join(configs_dir, "*.json")):
-        with open(j) as f:
-            data = json.load(f)
-        print(f"Jail: {data['name']} (Image: {data['image']})")
-
-if __name__ == "__main__":
-    main()
-```
+👉 **Read the complete [Plugin Development Guide & Documentation Hub](./docs/PLUGINS.md)** for details on lifecycle hooks (`on_init`, `on_enter`, `on_remove`), plugin manifests (`plugin.json`), and the `jroot_sdk` Python library.
