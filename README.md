@@ -41,12 +41,14 @@ Just userspace.
 ```bash
 curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/install-jroot.sh
 curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
+curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot_sdk.py
 ```
 
 Or if you prefer using wget:
 ```bash
 wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/install-jroot.sh
 wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
+wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot_sdk.py
 ```
 
 2. Run the installer:
@@ -1647,28 +1649,24 @@ jroot compose down
 
 ---
 
-# 🔌 `jroot plugin` – Community & Custom Extensions
+# Plugin development
 
-`jroot` includes a secure, production-grade event-driven plugin extension system with full SDK support. 
+JRoot supports packaged, event-driven host-side plugins with manifest validation, private state, captured logs, service lifecycle controls, and an importable Python SDK. Packaged plugins declare the API version, entry point, lifecycle hooks, optional host dependencies, and human-readable access expectations before installation.
 
-👉 **Read the complete [Plugin Development Guide & Documentation Hub](./docs/PLUGINS.md)** for details on lifecycle hooks (`on_init`, `on_enter`, `on_remove`), plugin manifests (`plugin.json`), and the `jroot_sdk` Python library.
+> Plugins run with the permissions of the host user running `jroot`; they are not sandboxed. Install only reviewed code.
 
+Read the [Plugin Development Guide](./docs/PLUGINS.md) for the stable manifest contract, hook payloads, SDK, services, and validation workflow.
 
 ---
 
-# 🪟 Windows Plugin Development (`jroot-dev.py`)
+# Windows plugin development
 
-Because `jroot` runs on Linux userspace via PRoot, Windows hosts cannot execute `jroot` directly. However, developers on Windows can bootstrap, validate, and simulate `jroot` plugins locally using the cross-platform development helper:
+Windows cannot run JRoot’s PRoot runtime, but contributors can create, strictly validate, simulate, and fixture-test plugins before transferring them to a Linux host:
 
-```bash
-# Initialize a new plugin template
-python jroot-dev.py init my-plugin
-
-# Validate plugin manifest and entry point syntax
-python jroot-dev.py validate my-plugin
-
-# Simulate lifecycle hook execution locally
-python jroot-dev.py simulate on_init myjail ubuntu:22.04 --path my-plugin
+```powershell
+python .\jroot-dev.py init my-plugin
+python .\jroot-dev.py validate --strict .\my-plugin
+python .\jroot-dev.py test .\my-plugin
 ```
 
-For full details, see [docs/WINDOWS_DEV.md](docs/WINDOWS_DEV.md).
+See [Windows Plugin Development](docs/WINDOWS_DEV.md) for the complete cross-platform workflow.

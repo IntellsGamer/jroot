@@ -1,54 +1,79 @@
-# JRoot Plugin Development on Windows (`jroot-dev.py`)
+# JRoot Plugin Development on Windows
 
-Because `jroot` runs on Linux userspace via PRoot, Windows developers cannot execute `jroot` directly on Windows hosts. However, you can develop, validate, and simulate `jroot` plugins locally on Windows using the cross-platform development helper (`jroot-dev.py`).
+`jroot` itself runs on Linux through PRoot and therefore is not a Windows runtime. Plugin development does not require a Linux jail, however: the repository includes `jroot-dev.py`, a standard-library Python helper that validates and exercises packaged plugins on Windows, macOS, and Linux.
 
----
+The helper creates a temporary mock JRoot home, a sample jail configuration, and an isolated plugin data directory. It does not install or execute PRoot.
 
 ## Prerequisites
 
-- Python 3.8 or higher installed on Windows.
+Install Python **3.8 or newer** and clone or download the repository so that these files are in the same directory:
 
----
-
-## Quickstart: Bootstrapping a Plugin
-
-To initialize a new plugin project structure in your current Windows workspace:
-
-```bash
-python jroot-dev.py init my-new-plugin
+```text
+jroot-dev.py
+jroot_sdk.py
+docs/
 ```
 
-This generates a local directory containing:
-1. **`plugin.json`**: The plugin manifest defining metadata and hooks.
-2. **`main.py`**: The entry-point script handling hook dispatches and storage.
+No external Python packages are required.
 
----
+## Create a plugin
 
-## Manifest Validation
+Use the helper to generate a manifest and a Python handler:
 
-Before deploying your plugin to a Linux environment running `jroot`, validate your plugin configuration and syntax locally:
-
-```bash
-python jroot-dev.py validate my-new-plugin
+```powershell
+python .\jroot-dev.py init my-plugin
 ```
 
-The validator checks for:
-- Presence and formatting of `plugin.json`.
-- Required manifest fields (`name`, `version`, `hooks`).
-- Python syntax correctness in `main.py`.
+The created `plugin.json` targets plugin API version 1 and declares an `on_init` hook. Edit its `name`, `description`, dependencies, requested permissions, and hook list before using it.
 
----
+## Validate before transfer
 
-## Local Hook Simulation
+Run strict validation before copying the plugin to a Linux host:
 
-You can simulate how `jroot` dispatches lifecycle hooks to your plugin, verifying argument parsing and state persistence before pushing to production:
-
-```bash
-# Simulate the 'on_init' hook with mock jail arguments
-python jroot-dev.py simulate on_init test-jail ubuntu:22.04 --path my-new-plugin
-
-# Simulate the 'on_enter' hook
-python jroot-dev.py simulate on_enter test-jail --path my-new-plugin
+```powershell
+python .\jroot-dev.py validate --strict .\my-plugin
 ```
 
-The simulation securely mocks isolated plugin data directories (`$JROOT_PLUGIN_DATA`), allowing you to test state read/write operations locally on Windows.
+Strict validation checks the manifest version, safe plugin identifier, Semantic Versioning version, entry-point path, declared hooks, optional command dependency format, and Python syntax. A packaged plugin must pass this command before the Linux runtime will install it.
+
+## Simulate a hook
+
+Run a single declared hook with the standard fixture arguments:
+
+```powershell
+python .\jroot-dev.py simulate on_init --path .\my-plugin
+```
+
+You may override the fixture payload when testing parsing behavior:
+
+```powershell
+python .\jroot-dev.py simulate on_limit sample-jail mem=256M,cpu=60,nofile=512 --path .\my-plugin
+```
+
+During simulation, `JROOT_PLUGIN_DATA` points to a temporary private directory. The helper also sets `JROOT_HOME`, `JROOT_CONFIGS`, and `JROOT_ROOTS` to a mock JRoot layout containing a `sample-jail` configuration.
+
+## Test every declared hook
+
+Run the complete contract fixture set before deployment:
+
+```powershell
+python .\jroot-dev.py test .\my-plugin
+```
+
+This runs every event listed in `plugin.json` and returns non-zero if a handler crashes, exits non-zero, or exceeds the configured timeout. Change the timeout when deliberately testing a slower handler:
+
+```powershell
+python .\jroot-dev.py test .\my-plugin --timeout 30
+```
+
+## Linux deployment
+
+Copy the validated directory to the Linux machine that runs JRoot, then install and verify it there:
+
+```bash
+jroot plugin install ./my-plugin
+jroot plugin verify my-plugin
+jroot plugin inspect my-plugin
+```
+
+The local simulation verifies the plugin contract and ordinary Python behavior. It cannot reproduce Linux-only commands, a live jail process tree, host dependencies, or the privileges of the final host. Keep final deployment verification on the intended Linux system.

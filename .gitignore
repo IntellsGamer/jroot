@@ -1,3 +1,8 @@
 jroot-old
 test.py
 .*
+
+# Keep repository automation tracked despite the broad hidden-file rule above.
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml

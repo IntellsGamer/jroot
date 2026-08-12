@@ -1,0 +1,32 @@
+name: Verify JRoot
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  make-test:
+    name: Makefile verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install verification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential rsync shellcheck
+
+      - name: Run complete Makefile test suite
+        run: make test

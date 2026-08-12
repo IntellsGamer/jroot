@@ -18,6 +18,7 @@ err()  { echo -e "${C_RED}[!]${C_NC} $1" >&2; exit 1; }
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JROOT_SRC="$SRC_DIR/jroot"
+PLUGIN_SDK_SRC="$SRC_DIR/jroot_sdk.py"
 INSTALL_DIR="$HOME/.local/bin"
 JROOT_HOME="$HOME/.jroot"
 BASHRC="$HOME/.bashrc"
@@ -66,7 +67,14 @@ else
     cp "$JROOT_SRC" "$INSTALL_DIR/jroot"
 fi
 chmod +x "$INSTALL_DIR/jroot"
-mkdir -p "$JROOT_HOME/roots" "$JROOT_HOME/configs" "$JROOT_HOME/bin"
+mkdir -p "$JROOT_HOME/roots" "$JROOT_HOME/configs" "$JROOT_HOME/bin" "$JROOT_HOME/sdk"
+if [ -f "$PLUGIN_SDK_SRC" ]; then
+    cp "$PLUGIN_SDK_SRC" "$JROOT_HOME/sdk/jroot_sdk.py"
+    chmod 644 "$JROOT_HOME/sdk/jroot_sdk.py"
+    log "Installed plugin SDK to $JROOT_HOME/sdk/jroot_sdk.py"
+else
+    warn "Plugin SDK source is missing next to the installer; packaged Python plugins cannot import jroot_sdk until it is installed."
+fi
 log "Installed jroot to $INSTALL_DIR/jroot"
 
 # --- bashrc aliases + PATH (idempotent) --------------------------------------

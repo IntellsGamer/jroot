@@ -3364,6 +3364,9 @@ cmd_enter() {
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
     [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
 
+    local enter_mode="shell"
+    [ "${#cmd[@]}" -gt 0 ] && enter_mode="command"
+    trigger_event_hooks "on_enter" "$name" "$enter_mode"
     if [ "$force_root" = 1 ]; then
         run_in_jail --root "$name" "${cmd[@]}"
     else
@@ -3384,6 +3387,7 @@ cmd_exec() {
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
     [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
 
+    trigger_event_hooks "on_enter" "$name" "command"
     if [ "$force_root" = 1 ]; then
         run_in_jail --root "$name" "$@"
     else
@@ -3621,6 +3625,7 @@ cmd_sync() {
     log "Synchronizing '$src' -> '$dest'..."
     rsync "${rsync_opts[@]}" "$real_src/" "$real_dest/" || err "Sync failed: '$src' -> '$dest'"
     log "Sync completed successfully."
+    trigger_event_hooks "on_sync" "$src" "$dest"
 
     if [ -n "$dest_jail" ]; then
         record_event "$dest_jail" sync "sync $src -> $dest"
@@ -4177,237 +4182,541 @@ with open(path, "w") as f:
 PY
     log "Resource limits updated for '$name'. New regular and SSH processes inherit them."
     record_event "$name" limit "updated resource limits"
+    trigger_event_hooks "on_limit" "$name" "mem=${mem:-unchanged},cpu=${cpu:-unchanged},nofile=${nofile:-unchanged}"
 }
 
 
 
 # ---------------------------------------------------------------------------
-# Production-Grade Plugin & Event-Driven Hook System
+# Plugin runtime: manifest contract, lifecycle hooks, and service management
 # ---------------------------------------------------------------------------
+# A plugin is host-side code. Installing one grants it the same host-user access
+# as jroot itself, so manifests document requirements and compatibility but do
+# not pretend to sandbox untrusted code. Review a plugin before installation.
+PLUGIN_API_VERSION=1
+
+is_reserved_command() {
+    case "$1" in
+        init|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|revert|rm-snapshot|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+plugin_valid_name() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] && ! is_reserved_command "$1"
+}
+
+plugin_root() { printf '%s\n' "$JROOT_HOME/plugins"; }
+plugin_log_dir() { printf '%s\n' "$JROOT_HOME/plugins/logs"; }
+plugin_data_dir() { printf '%s\n' "$JROOT_HOME/plugins/data"; }
+plugin_status_dir() { printf '%s\n' "$JROOT_HOME/plugins/status"; }
+plugin_sdk_dir() { printf '%s\n' "$JROOT_HOME/sdk"; }
+
+plugin_ensure_dirs() {
+    mkdir -p "$(plugin_root)" "$(plugin_log_dir)" "$(plugin_data_dir)" \
+             "$(plugin_status_dir)" "$JROOT_HOME/pids" 2>/dev/null || true
+}
+
+plugin_validate_bundle() {
+    local bundle="$1"
+    [ -f "$bundle/plugin.json" ] || { printf '%s\n' "Missing plugin.json manifest file." >&2; return 1; }
+    command -v python3 >/dev/null 2>&1 || { printf '%s\n' "python3 is required to validate packaged plugins." >&2; return 1; }
+    python3 - "$bundle" "$PLUGIN_API_VERSION" <<'PY'
+import json, os, re, sys
+from pathlib import Path
+bundle = Path(sys.argv[1])
+api = int(sys.argv[2])
+try:
+    manifest = json.loads((bundle / "plugin.json").read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"Invalid plugin.json: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+errors = []
+reserved = {"init","enter","exec","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","revert","rm-snapshot","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
+name = manifest.get("name")
+if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
+    errors.append("name must be a lowercase identifier of 1-64 characters.")
+elif name in reserved:
+    errors.append(f"name '{name}' is reserved by jroot.")
+version = manifest.get("version")
+if not isinstance(version, str) or not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?", version):
+    errors.append("version must use Semantic Versioning (for example: 1.0.0).")
+if manifest.get("api_version") != api:
+    errors.append(f"api_version must be {api}.")
+entrypoint = manifest.get("entrypoint")
+if not isinstance(entrypoint, str) or Path(entrypoint).is_absolute() or ".." in Path(entrypoint).parts:
+    errors.append("entrypoint must be a relative file inside the plugin bundle.")
+elif Path(entrypoint).suffix not in {".py", ".sh"}:
+    errors.append("entrypoint must end in .py or .sh.")
+elif not (bundle / entrypoint).is_file():
+    errors.append(f"entrypoint '{entrypoint}' does not exist.")
+hooks = manifest.get("hooks")
+if not isinstance(hooks, list) or not all(isinstance(h, str) and re.fullmatch(r"on_[a-z][a-z0-9_]*", h) for h in hooks):
+    errors.append("hooks must be an array of event names beginning with on_.")
+elif len(set(hooks)) != len(hooks):
+    errors.append("hooks must not contain duplicate event names.")
+permissions = manifest.get("permissions", [])
+if not isinstance(permissions, list) or not all(isinstance(p, str) for p in permissions):
+    errors.append("permissions must be an array of strings.")
+requires = manifest.get("requires", {})
+if not isinstance(requires, dict):
+    errors.append("requires must be an object.")
+else:
+    commands = requires.get("commands", [])
+    if not isinstance(commands, list) or not all(isinstance(command, str) and re.fullmatch(r"[A-Za-z0-9._+-]+", command) for command in commands):
+        errors.append("requires.commands must be an array of command names.")
+    if "python" in requires and not isinstance(requires["python"], str):
+        errors.append("requires.python must be a string when present.")
+if errors:
+    for error in errors:
+        print(f"plugin manifest error: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+plugin_manifest_value() {
+    local bundle="$1" key="$2" default="${3:-}"
+    python3 - "$bundle/plugin.json" "$key" "$default" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f).get(sys.argv[2], sys.argv[3])
+print(value if isinstance(value, str) else "")
+PY
+}
+
+plugin_manifest_declares_hook() {
+    local bundle="$1" event="$2"
+    python3 - "$bundle/plugin.json" "$event" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        hooks = json.load(f).get("hooks", [])
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if sys.argv[2] in hooks else 1)
+PY
+}
+
+plugin_check_dependencies() {
+    local bundle="$1" missing=0 command
+    while IFS= read -r command; do
+        [ -z "$command" ] && continue
+        if ! command -v "$command" >/dev/null 2>&1; then
+            warn "Plugin dependency missing: '$command'."
+            missing=1
+        fi
+    done < <(python3 - "$bundle/plugin.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    for command in json.load(f).get("requires", {}).get("commands", []):
+        print(command)
+PY
+)
+    if ! python3 - "$bundle/plugin.json" <<'PY'
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    requirement = json.load(f).get("requires", {}).get("python")
+if not requirement:
+    raise SystemExit(0)
+match = re.fullmatch(r">=([0-9]+)\.([0-9]+)", requirement)
+if not match:
+    print("Plugin requires.python must use the supported format '>=MAJOR.MINOR'.", file=sys.stderr)
+    raise SystemExit(1)
+required = (int(match.group(1)), int(match.group(2)))
+current = sys.version_info[:2]
+if current < required:
+    print(f"Plugin requires Python >= {required[0]}.{required[1]}, but host has {current[0]}.{current[1]}.", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+        missing=1
+    fi
+    [ "$missing" -eq 0 ]
+}
+
+plugin_find_target() {
+    local name="$1" root target
+    root="$(plugin_root)"
+    PLUGIN_BUNDLE=""
+    PLUGIN_TARGET=""
+    if [ -d "$root/$name" ]; then
+        PLUGIN_BUNDLE="$root/$name"
+        PLUGIN_TARGET="$(plugin_manifest_value "$PLUGIN_BUNDLE" entrypoint)"
+        PLUGIN_TARGET="$PLUGIN_BUNDLE/$PLUGIN_TARGET"
+    elif [ -f "$root/$name.py" ]; then
+        PLUGIN_TARGET="$root/$name.py"
+    elif [ -f "$root/$name.sh" ]; then
+        PLUGIN_TARGET="$root/$name.sh"
+    fi
+    [ -n "$PLUGIN_TARGET" ] && [ -f "$PLUGIN_TARGET" ]
+}
+
+plugin_prepare_environment() {
+    local name="$1"
+    plugin_ensure_dirs
+    export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
+    export JROOT_PLUGIN_API="$PLUGIN_API_VERSION" JROOT_PLUGIN_NAME="$name"
+    export JROOT_PLUGIN_DATA="$(plugin_data_dir)/$name"
+    export JROOT_PLUGIN_LOG="$(plugin_log_dir)/$name.log"
+    export PYTHONPATH="$(plugin_sdk_dir)${PYTHONPATH:+:$PYTHONPATH}"
+    mkdir -p "$JROOT_PLUGIN_DATA" 2>/dev/null || true
+}
+
+plugin_write_status() {
+    local name="$1" event="$2" result="$3" code="$4" log_file="$5"
+    plugin_ensure_dirs
+    python3 - "$(plugin_status_dir)/$name.json" "$name" "$event" "$result" "$code" "$log_file" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+path, name, event, result, code, log_file = sys.argv[1:]
+payload = {
+    "name": name,
+    "event": event,
+    "result": result,
+    "exit_code": int(code),
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "log_file": log_file,
+}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+    f.write("\n")
+PY
+}
+
+plugin_dispatch() {
+    local name="$1" event="$2"; shift 2
+    plugin_find_target "$name" || return 1
+    if [ -n "$PLUGIN_BUNDLE" ] && ! plugin_manifest_declares_hook "$PLUGIN_BUNDLE" "$event"; then
+        return 0
+    fi
+    local log_file="$(plugin_log_dir)/$name.log" rc=0
+    plugin_prepare_environment "$name"
+    export JROOT_PLUGIN_EVENT="$event"
+    {
+        printf '\n[%s] event=%s plugin=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$name"
+        if [[ "$PLUGIN_TARGET" == *.py ]]; then
+            python3 "$PLUGIN_TARGET" "hook:$event" "$@"
+        else
+            bash "$PLUGIN_TARGET" "hook:$event" "$@"
+        fi
+    } >> "$log_file" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        plugin_write_status "$name" "$event" "ok" 0 "$log_file"
+    else
+        plugin_write_status "$name" "$event" "failed" "$rc" "$log_file"
+        warn "Plugin '$name' failed while handling '$event' (exit $rc). Run 'jroot plugin logs $name'."
+    fi
+    return "$rc"
+}
 
 trigger_event_hooks() {
     local event="$1"; shift
-    local plugins_dir="$JROOT_HOME/plugins"
-    local logs_dir="$JROOT_HOME/plugins/logs"
-    mkdir -p "$logs_dir" 2>/dev/null || true
-    [ -d "$plugins_dir" ] || return 0
-
-    local p target name
-    for p in "$plugins_dir"/*; do
+    local root p name
+    root="$(plugin_root)"
+    [ -d "$root" ] || return 0
+    plugin_ensure_dirs
+    for p in "$root"/*; do
         [ -e "$p" ] || continue
         name="$(basename "$p" | sed 's/\.[^.]*$//')"
+        case "$name" in data|logs|status|registry) continue ;; esac
         if [ -d "$p" ]; then
-            target="$p/main.py"
-            [ -f "$target" ] || target="$p/main.sh"
-            if [ -f "$target" ]; then
-                export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
-                export JROOT_PLUGIN_DATA="$JROOT_HOME/plugins/data/$name"
-                mkdir -p "$JROOT_PLUGIN_DATA" 2>/dev/null || true
-                if [[ "$target" == *.py ]]; then
-                    python3 "$target" "hook:$event" "$@" >> "$logs_dir/$name.log" 2>&1 || true
-                else
-                    bash "$target" "hook:$event" "$@" >> "$logs_dir/$name.log" 2>&1 || true
-                fi
-            fi
-        elif [ -f "$p" ]; then
-            export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
-            if [[ "$p" == *.py ]]; then
-                python3 "$p" "hook:$event" "$@" >> "$logs_dir/$name.log" 2>&1 || true
-            else
-                bash "$p" "hook:$event" "$@" >> "$logs_dir/$name.log" 2>&1 || true
-            fi
+            plugin_manifest_declares_hook "$p" "$event" || continue
         fi
+        plugin_dispatch "$name" "$event" "$@" || true
     done
 }
 
+plugin_service_pid_file() {
+    printf '%s\n' "$JROOT_HOME/pids/plugin-$1-$2.service.pid"
+}
+
+plugin_service_start() {
+    local name="$1" hook="$2"; shift 2
+    [[ "$hook" =~ ^on_[a-z][a-z0-9_]*$ ]] || err "Service hook must use an on_<event> name."
+    plugin_find_target "$name" || err "Plugin '$name' not found."
+    if [ -n "$PLUGIN_BUNDLE" ] && ! plugin_manifest_declares_hook "$PLUGIN_BUNDLE" "$hook"; then
+        err "Plugin '$name' does not declare hook '$hook'."
+    fi
+    local pid_file log_file pid
+    pid_file="$(plugin_service_pid_file "$name" "$hook")"
+    log_file="$(plugin_log_dir)/$name.log"
+    if [ -f "$pid_file" ]; then
+        pid="$(tr -d '[:space:]' < "$pid_file")"
+        if kill -0 "$pid" 2>/dev/null; then
+            err "Plugin service '$name/$hook' is already running (PID $pid)."
+        fi
+        rm -f "$pid_file"
+    fi
+    plugin_prepare_environment "$name"
+    export JROOT_PLUGIN_EVENT="$hook"
+    {
+        printf '\n[%s] service-start event=%s plugin=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$hook" "$name"
+        if [[ "$PLUGIN_TARGET" == *.py ]]; then
+            exec python3 "$PLUGIN_TARGET" "hook:$hook" "$@"
+        else
+            exec bash "$PLUGIN_TARGET" "hook:$hook" "$@"
+        fi
+    } >> "$log_file" 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" > "$pid_file"
+    sleep 0.05
+    if kill -0 "$pid" 2>/dev/null; then
+        plugin_write_status "$name" "service:$hook" "running" 0 "$log_file"
+        log "Plugin service '$name/$hook' started (PID $pid)."
+    else
+        rm -f "$pid_file"
+        plugin_write_status "$name" "service:$hook" "failed" 1 "$log_file"
+        err "Plugin service '$name/$hook' exited during startup. Run 'jroot plugin logs $name'."
+    fi
+}
+
+plugin_service_stop() {
+    local name="$1" hook="${2:-}" file pid stopped=0
+    if [ -n "$hook" ]; then
+        file="$(plugin_service_pid_file "$name" "$hook")"
+        set -- "$file"
+    else
+        shopt -s nullglob
+        set -- "$JROOT_HOME/pids/plugin-$name-"*.service.pid
+        shopt -u nullglob
+    fi
+    for file in "$@"; do
+        [ -f "$file" ] || continue
+        pid="$(tr -d '[:space:]' < "$file")"
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 0.1
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+        fi
+        rm -f "$file"
+        local stopped_hook="$(basename "$file" .service.pid)"
+        stopped_hook="${stopped_hook#plugin-$name-}"
+        plugin_write_status "$name" "service:$stopped_hook" "stopped" 0 "$(plugin_log_dir)/$name.log"
+        stopped=1
+    done
+    [ "$stopped" -eq 1 ] && log "Stopped plugin service(s) for '$name'." || warn "No running plugin service found for '$name'."
+}
+
+plugin_service_status() {
+    local name="$1" file pid found=0
+    shopt -s nullglob
+    for file in "$JROOT_HOME/pids/plugin-$name-"*.service.pid; do
+        [ -f "$file" ] || continue
+        found=1
+        pid="$(tr -d '[:space:]' < "$file")"
+        local hook="$(basename "$file" .service.pid)"
+        hook="${hook#plugin-$name-}"
+        if kill -0 "$pid" 2>/dev/null; then
+            printf '%-24s %-8s %s\n' "$hook" "$pid" "running"
+        else
+            rm -f "$file"
+            printf '%-24s %-8s %s\n' "$hook" "$pid" "stale"
+        fi
+    done
+    shopt -u nullglob
+    [ "$found" -eq 1 ] || log "No plugin services found for '$name'."
+}
+
 plugin_usage() {
-    printf '%bjroot plugin%b - enterprise event-driven extension manager\n\n' "$H" "$N"
-    printf '    %bjroot plugin list%b                  list active plugins & hooks\n' "$G" "$N"
-    printf '    %bjroot plugin install <dir|file>%b    install a plugin or packaged bundle\n' "$G" "$N"
-    printf '    %bjroot plugin remove <name>%b         uninstall a plugin\n' "$G" "$N"
-    printf '    %bjroot plugin init-sdk%b              generate a starter Python plugin template\n\n' "$G" "$N"
-    printf '    %bjroot plugin logs <name>%b            view recent plugin execution logs\n' "$G" "$N"
-    printf '    %bjroot plugin service <name> <hook>%b  run a plugin hook as a background service\n' "$G" "$N"
-    printf '    %bSupported Lifecycle Hooks (Event-Driven):%b
-' "$H" "$N"
-    printf '        on_init       triggered when a new jail is created
-'
-    printf '        on_enter      triggered when entering or executing inside a jail
-'
-    printf '        on_stop       triggered when stopping/killing a jail
-'
-    printf '        on_remove     triggered when a jail is deleted
-'
-    printf '        on_sync       triggered when synchronizing files via jroot sync
-'
-    printf '        on_snapshot   triggered when a snapshot is created or restored
-'
-    printf '        on_limit      triggered when resource limits are updated
-'
+    printf '%bjroot plugin%b - manage trusted host-side extensions\n\n' "$H" "$N"
+    printf '    %bjroot plugin list%b                            list installed plugins\n' "$G" "$N"
+    printf '    %bjroot plugin inspect <name>%b                  show manifest and latest hook result\n' "$G" "$N"
+    printf '    %bjroot plugin verify <name|all>%b               validate installed manifests and dependencies\n' "$G" "$N"
+    printf '    %bjroot plugin install <directory|script>%b      install a reviewed local plugin\n' "$G" "$N"
+    printf '    %bjroot plugin remove <name>%b                   stop services and uninstall a plugin\n' "$G" "$N"
+    printf '    %bjroot plugin logs <name> [--follow]%b          read plugin output\n' "$G" "$N"
+    printf '    %bjroot plugin service start <name> <hook> [args...]%b\n' "$G" "$N"
+    printf '    %bjroot plugin service stop <name> [hook]%b\n' "$G" "$N"
+    printf '    %bjroot plugin service status <name>%b\n' "$G" "$N"
+    printf '    %bjroot plugin init-sdk%b                        create a standards-compliant Python template\n\n' "$G" "$N"
+    printf '    Packaged plugins require plugin.json with api_version=%s, a semantic version,\n' "$PLUGIN_API_VERSION"
+    printf '    a safe relative entrypoint, declared hooks, and optional dependency metadata.\n'
+    printf '    Plugins execute as the host user: install only code you trust.\n'
 }
 
 cmd_plugin() {
     local op="${1:-list}"; shift || true
-    local plugins_dir="$JROOT_HOME/plugins"
-    mkdir -p "$plugins_dir" 2>/dev/null || true
-
+    local root
+    root="$(plugin_root)"
+    plugin_ensure_dirs
     case "$op" in
         list|ls)
-            local p found=0 name desc version="1.0.0"
-            printf '%-20s %-10s %s\n' "PLUGIN" "VERSION" "DESCRIPTION"
-            printf '%-20s %-10s %s\n' "------" "-------" "-----------"
-            for p in "$plugins_dir"/*; do
+            local p name desc version found=0
+            printf '%-24s %-12s %s\n' "PLUGIN" "VERSION" "DESCRIPTION"
+            printf '%-24s %-12s %s\n' "------" "-------" "-----------"
+            for p in "$root"/*; do
                 [ -e "$p" ] || continue
-                found=1
                 name="$(basename "$p" | sed 's/\.[^.]*$//')"
-                desc="Custom script extension"
+                case "$name" in data|logs|status|registry) continue ;; esac
+                found=1; desc="Legacy script extension"; version="legacy"
                 if [ -d "$p" ] && [ -f "$p/plugin.json" ]; then
-                    desc="$(python3 -c "import json; print(json.load(open('$p/plugin.json')).get('description', ''))" 2>/dev/null || echo '')"
-                    version="$(python3 -c "import json; print(json.load(open('$p/plugin.json')).get('version', '1.0.0'))" 2>/dev/null || echo '1.0.0')"
+                    desc="$(plugin_manifest_value "$p" description "")"
+                    version="$(plugin_manifest_value "$p" version "unknown")"
                 fi
-                printf '%-20s %-10s %s\n' "$name" "$version" "$desc"
+                printf '%-24s %-12s %s\n' "$name" "$version" "$desc"
             done
-            [ "$found" = 1 ] || log "No plugins installed. Create one using 'jroot plugin init-sdk'."
+            [ "$found" -eq 1 ] || log "No plugins installed. Create one with 'jroot plugin init-sdk'."
             ;;
-        logs)
-            [ $# -eq 1 ] || err "Usage: jroot plugin logs <name>"
-            local name="$1" log_file="$JROOT_HOME/plugins/logs/$name.log"
-            [ -f "$log_file" ] || err "No logs found for plugin '$name'."
-            tail -n 50 "$log_file"
-            ;;
-        service)
-            [ $# -ge 2 ] || err "Usage: jroot plugin service <name> <hook> [args...]"
-            local name="$1" hook="$2"; shift 2
-            local target="" p=""
-            for p in "$plugins_dir/$name" "$plugins_dir/$name.py" "$plugins_dir/$name.sh"; do
-                if [ -d "$p" ]; then
-                    target="$p/main.py"; [ -f "$target" ] || target="$p/main.sh"
-                elif [ -f "$p" ]; then
-                    target="$p"
-                fi
-                [ -n "$target" ] && break
-            done
-            [ -n "$target" ] || err "Plugin '$name' not found."
-            local logs_dir="$JROOT_HOME/plugins/logs"
-            mkdir -p "$logs_dir" 2>/dev/null || true
-            export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
-            export JROOT_PLUGIN_DATA="$JROOT_HOME/plugins/data/$name"
-            mkdir -p "$JROOT_PLUGIN_DATA" 2>/dev/null || true
-            log "Starting plugin service '$name' for hook '$hook' in background..."
-            if [[ "$target" == *.py ]]; then
-                nohup python3 "$target" "hook:$hook" "$@" >> "$logs_dir/$name.log" 2>&1 &
+        inspect)
+            [ $# -eq 1 ] || err "Usage: jroot plugin inspect <name>"
+            local name="$1"
+            plugin_find_target "$name" || err "Plugin '$name' not found."
+            if [ -n "$PLUGIN_BUNDLE" ]; then
+                python3 - "$PLUGIN_BUNDLE/plugin.json" "$(plugin_status_dir)/$name.json" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as f: manifest = json.load(f)
+for key in ("name", "version", "api_version", "description", "author", "entrypoint"):
+    if key in manifest: print(f"{key}: {manifest[key]}")
+print("hooks: " + ", ".join(manifest.get("hooks", [])))
+print("permissions: " + ", ".join(manifest.get("permissions", [])))
+if os.path.exists(sys.argv[2]):
+    with open(sys.argv[2], encoding="utf-8") as f: status = json.load(f)
+    print("last_result: {result} ({event}, exit {exit_code}, {timestamp})".format(**status))
+PY
             else
-                nohup bash "$target" "hook:$hook" "$@" >> "$logs_dir/$name.log" 2>&1 &
+                printf 'name: %s\nversion: legacy\nentrypoint: %s\n' "$name" "$PLUGIN_TARGET"
             fi
-            echo $! > "$JROOT_HOME/pids/plugin_$name.pid"
+            ;;
+        verify)
+            [ $# -eq 1 ] || err "Usage: jroot plugin verify <name|all>"
+            local requested="$1" p name failures=0 found=0
+            for p in "$root"/*; do
+                [ -e "$p" ] || continue
+                name="$(basename "$p" | sed 's/\.[^.]*$//')"
+                case "$name" in data|logs|status|registry) continue ;; esac
+                [ "$requested" = "all" ] || [ "$requested" = "$name" ] || continue
+                found=1
+                if [ -d "$p" ]; then
+                    if plugin_validate_bundle "$p" && plugin_check_dependencies "$p"; then
+                        log "Plugin '$name' passed verification."
+                    else
+                        warn "Plugin '$name' failed verification."
+                        failures=$((failures + 1))
+                    fi
+                else
+                    warn "Plugin '$name' is a legacy single-file extension and has no manifest to verify."
+                fi
+            done
+            [ "$found" -eq 1 ] || err "Plugin '$requested' not found."
+            [ "$failures" -eq 0 ] || return 1
             ;;
         install|add)
             [ $# -eq 1 ] || err "Usage: jroot plugin install <path-to-script-or-directory>"
-            local src="$1" name
+            local src="$1" name ext
             [ -e "$src" ] || err "Plugin source not found: '$src'"
             if [ -d "$src" ]; then
-                name="$(basename "$src")"
-                [ -f "$src/plugin.json" ] || err "Packaged plugin bundle requires a 'plugin.json' manifest."
-                name="$(python3 -c "import json; print(json.load(open('$src/plugin.json')).get('name', '$name'))" 2>/dev/null || echo "$name")"
-                if is_reserved_command "$name"; then
-                    err "Plugin name '$name' is a reserved built-in jroot subcommand."
-                fi
-                rm -rf "$plugins_dir/$name"
-                cp -r "$src" "$plugins_dir/$name"
-                log "Packaged plugin bundle '$name' installed successfully."
+                plugin_validate_bundle "$src" || err "Refusing to install an invalid plugin bundle. Validate it with jroot-dev.py first."
+                plugin_check_dependencies "$src" || err "Refusing to install a plugin with missing host dependencies."
+                name="$(plugin_manifest_value "$src" name)"
+                plugin_valid_name "$name" || err "Plugin name '$name' is reserved or invalid."
+                plugin_service_stop "$name" >/dev/null 2>&1 || true
+                rm -rf "$root/$name"
+                cp -R "$src" "$root/$name"
+                log "Plugin bundle '$name' installed. Run 'jroot plugin verify $name' after host changes."
             else
                 name="$(basename "$src" | sed 's/\.[^.]*$//')"
-                if is_reserved_command "$name"; then
-                    err "Plugin name '$name' is a reserved built-in jroot subcommand."
-                fi
-                local ext="${src##*.}"
-                [ "$ext" = "$src" ] && ext="sh"
-                cp "$src" "$plugins_dir/$name.$ext"
-                chmod +x "$plugins_dir/$name.$ext"
-                log "Plugin script '$name' installed successfully."
+                plugin_valid_name "$name" || err "Plugin name '$name' is reserved or invalid."
+                ext="${src##*.}"; [ "$ext" = "$src" ] && ext="sh"
+                case "$ext" in py|sh) ;; *) err "Single-file plugins must use a .py or .sh extension." ;; esac
+                plugin_service_stop "$name" >/dev/null 2>&1 || true
+                cp "$src" "$root/$name.$ext"
+                chmod +x "$root/$name.$ext"
+                warn "Installed legacy single-file plugin '$name'. Use a packaged plugin.json bundle for compatibility checks."
             fi
             ;;
         remove|rm|uninstall)
             [ $# -eq 1 ] || err "Usage: jroot plugin remove <name>"
-            local name="$1" target
-            for target in "$plugins_dir/$name" "$plugins_dir/$name.sh" "$plugins_dir/$name.py" "$plugins_dir/$name"*; do
-                if [ -e "$target" ]; then
-                    rm -rf "$target"
-                    log "Plugin '$name' successfully removed."
-                    return 0
-                fi
+            local name="$1" target removed=0
+            plugin_service_stop "$name" >/dev/null 2>&1 || true
+            for target in "$root/$name" "$root/$name.py" "$root/$name.sh"; do
+                if [ -e "$target" ]; then rm -rf "$target"; removed=1; fi
             done
-            err "Plugin '$name' not found."
+            [ "$removed" -eq 1 ] || err "Plugin '$name' not found."
+            rm -rf "$(plugin_data_dir)/$name" "$(plugin_status_dir)/$name.json"
+            rm -f "$(plugin_log_dir)/$name.log" "$(plugin_log_dir)/$name.log."*
+            log "Plugin '$name' removed."
+            ;;
+        logs)
+            [ $# -ge 1 ] && [ $# -le 2 ] || err "Usage: jroot plugin logs <name> [--follow]"
+            local name="$1" log_file="$(plugin_log_dir)/$1.log"
+            [ -f "$log_file" ] || err "No logs found for plugin '$name'."
+            if [ "${2:-}" = "--follow" ]; then tail -n 50 -f "$log_file"; else tail -n 50 "$log_file"; fi
+            ;;
+        service)
+            local action="${1:-}"
+            case "$action" in
+                start)
+                    [ $# -ge 3 ] || err "Usage: jroot plugin service start <name> <hook> [args...]"
+                    local name="$2" hook="$3"; shift 3; plugin_service_start "$name" "$hook" "$@" ;;
+                stop)
+                    [ $# -ge 2 ] && [ $# -le 3 ] || err "Usage: jroot plugin service stop <name> [hook]"
+                    plugin_service_stop "$2" "${3:-}" ;;
+                status)
+                    [ $# -eq 2 ] || err "Usage: jroot plugin service status <name>"
+                    plugin_service_status "$2" ;;
+                # Compatibility with the earlier <name> <hook> form.
+                *)
+                    [ $# -ge 2 ] || err "Usage: jroot plugin service start <name> <hook> [args...]"
+                    local name="$1" hook="$2"; shift 2; plugin_service_start "$name" "$hook" "$@" ;;
+            esac
             ;;
         init-sdk|sdk)
             local sdk_dir="jroot-plugin-template"
+            [ ! -e "$sdk_dir" ] || err "Refusing to overwrite '$sdk_dir'. Choose another directory or remove it first."
             mkdir -p "$sdk_dir"
-            cat << 'SDKEOF' > "$sdk_dir/plugin.json"
+            cat <<'SDKEOF' > "$sdk_dir/plugin.json"
 {
+  "api_version": 1,
   "name": "my-plugin",
-  "version": "1.0.0",
-  "description": "An event-driven production-grade jroot plugin",
-  "author": "Developer"
+  "version": "0.1.0",
+  "description": "A JRoot plugin.",
+  "author": "Developer",
+  "entrypoint": "main.py",
+  "hooks": ["on_init"],
+  "permissions": ["jails.read", "state.read", "state.write"],
+  "requires": {
+    "python": ">=3.8",
+    "commands": []
+  }
 }
 SDKEOF
-            cat << 'SDKEOF' > "$sdk_dir/main.py"
+            cat <<'SDKEOF' > "$sdk_dir/main.py"
 #!/usr/bin/env python3
-import sys, os
+import sys
+from jroot_sdk import JRootContext
 
-def main():
-    if len(sys.argv) < 2:
-        print("MyPlugin is active and ready.")
-        return
 
-    action = sys.argv[1]
-    if action.startswith("hook:"):
-        event = action.split(":")[1]
-        data = sys.argv[2:] if len(sys.argv) > 2 else []
-        print(f"[MyPlugin Hook Received -> {event}] data: {data}", flush=True)
-    else:
-        print(f"Executing plugin command with args: {sys.argv[1:]}", flush=True)
+def main() -> int:
+    ctx = JRootContext()
+    if sys.argv[1:2] == ["hook:on_init"]:
+        jail_name, image = sys.argv[2:4]
+        ctx.log.info(f"Provisioned {jail_name} from {image}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
 SDKEOF
             chmod +x "$sdk_dir/main.py"
-            log "Created plugin SDK template under './$sdk_dir/'."
-            log "Install it via: jroot plugin install ./$sdk_dir"
+            log "Created a packaged plugin template in './$sdk_dir'."
+            log "Validate it with: python3 jroot-dev.py validate --strict ./$sdk_dir"
             ;;
-        -h|--help|help)
-            plugin_usage
-            ;;
-        *)
-            err "Unknown plugin operation '$op'. Try 'jroot plugin --help'."
-            ;;
+        -h|--help|help) plugin_usage ;;
+        *) err "Unknown plugin operation '$op'. Try 'jroot plugin --help'." ;;
     esac
 }
 
 run_plugin() {
     local name="$1"; shift
-    local plugins_dir="$JROOT_HOME/plugins"
-    local target="" p
-    
-    # Check directory bundle first
-    if [ -d "$plugins_dir/$name" ]; then
-        target="$plugins_dir/$name/main.py"
-        [ -f "$target" ] || target="$plugins_dir/$name/main.sh"
-        [ -f "$target" ] || return 1
+    plugin_find_target "$name" || return 1
+    plugin_prepare_environment "$name"
+    if [[ "$PLUGIN_TARGET" == *.py ]]; then
+        exec python3 "$PLUGIN_TARGET" "$@"
     else
-        for p in "$plugins_dir/$name" "$plugins_dir/$name.sh" "$plugins_dir/$name.py" "$plugins_dir/$name"*; do
-            [ -f "$p" ] && target="$p" && break
-        done
-    fi
-    [ -n "$target" ] || return 1
-
-    export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
-    if [[ "$target" == *.py ]]; then
-        exec python3 "$target" "$@"
-    else
-        exec bash "$target" "$@"
+        exec bash "$PLUGIN_TARGET" "$@"
     fi
 }
-
 
 cmd_size() {
     [ $# -le 1 ] || err "Usage: jroot size [name]"
@@ -4579,6 +4888,8 @@ cmd_rm() {
     if [ -f "$(ssh_pid_file "$name")" ]; then
         ssh_stop "$name" 2>/dev/null || true
     fi
+    # A removal handler runs after confirmation but before rootfs deletion.
+    trigger_event_hooks "on_remove" "$name"
     rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json"
     rm -f "$(history_file "$name")"
     rm -f "$JROOT_HOME/pids/$name.pid" 2>/dev/null || true
@@ -4645,30 +4956,77 @@ cmd_kill() {
     
     rm -f "$pidfile"
     log "Jail '$name' killed."
+    trigger_event_hooks "on_stop" "$name" "user-request"
 }
 
 cmd_ps() {
-    local found=0
+    local json=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1 ;;
+            *) err "Usage: jroot ps [--json]" ;;
+        esac
+        shift
+    done
+    if [ "$json" -eq 1 ]; then
+        python3 - "$JROOT_HOME/pids" <<'PY'
+import json, os, sys
+from pathlib import Path
+pids_dir = Path(sys.argv[1])
+processes = []
+for path in sorted(pids_dir.glob("*.pid")):
+    # Plugin service pid files belong to the plugin runtime, not a jail.
+    if path.name.startswith("plugin-"):
+        continue
+    name = path.stem
+    try:
+        pid = int(path.read_text().strip())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        path.unlink(missing_ok=True)
+        continue
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode().strip()
+    except OSError:
+        command = "unknown"
+    processes.append({"jail": name, "pid": pid, "type": "shell", "command": command})
+for path in sorted(pids_dir.glob("*.sshd")):
+    name = path.stem
+    try:
+        pid = int(path.read_text().strip())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        for suffix in (".sshd", ".sshport", ".socat", ".sshinner"):
+            (pids_dir / f"{name}{suffix}").unlink(missing_ok=True)
+        continue
+    port_file = pids_dir / f"{name}.sshport"
+    port = port_file.read_text().strip() if port_file.exists() else "?"
+    processes.append({"jail": name, "pid": pid, "type": "sshd", "command": f"port {port}"})
+print(json.dumps(processes))
+PY
+        return 0
+    fi
+    local found=0 pidfile name pid cmd port
     printf '%-16s %-8s %-6s %s\n' "JAIL" "PID" "TYPE" "COMMAND"
     for pidfile in "$JROOT_HOME/pids"/*.pid; do
         [ -f "$pidfile" ] || continue
-        local name="$(basename "$pidfile" .pid)"
-        local pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+        name="$(basename "$pidfile" .pid)"
+        [[ "$name" == plugin-* ]] && continue
+        pid="$(tr -d '[:space:]' < "$pidfile")"
         if kill -0 "$pid" 2>/dev/null; then
-            local cmd="$(ps -o cmd= -p "$pid" 2>/dev/null | head -c 50)"
+            cmd="$(ps -o cmd= -p "$pid" 2>/dev/null | head -c 50)"
             printf '%-16s %-8s %-6s %s\n' "$name" "$pid" "shell" "${cmd:-unknown}"
             found=1
         else
             rm -f "$pidfile"
         fi
     done
-    # Also show SSH daemons
     for pidfile in "$JROOT_HOME/pids"/*.sshd; do
         [ -f "$pidfile" ] || continue
-        local name="$(basename "$pidfile" .sshd)"
-        local pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+        name="$(basename "$pidfile" .sshd)"
+        pid="$(tr -d '[:space:]' < "$pidfile")"
         if kill -0 "$pid" 2>/dev/null; then
-            local port="$(cat "$JROOT_HOME/pids/$name.sshport" 2>/dev/null || echo '?')"
+            port="$(cat "$JROOT_HOME/pids/$name.sshport" 2>/dev/null || echo '?')"
             printf '%-16s %-8s %-6s %s\n' "$name" "$pid" "sshd" "port $port"
             found=1
         else
@@ -6469,6 +6827,7 @@ cmd_snapshot() {
         cp "$CONFIGS_DIR/$name.json" "$dir/$label.json"
         log "Snapshot saved: $dir/$label.tar.gz"
         record_event "$name" "snapshot" "$label ($(du -sh "$dir/$label.tar.gz" 2>/dev/null | awk '{print $1}'))"
+        trigger_event_hooks "on_snapshot" "$name" "create:$label"
     else
         rm -f "$tmp.tar.gz"
         err "Snapshot failed."
@@ -6520,6 +6879,7 @@ cmd_revert() {
     rm -rf "$tmp"
     log "Jail '$name' restored to snapshot '$label'."
     record_event "$name" "revert" "restored snapshot '$label'"
+    trigger_event_hooks "on_snapshot" "$name" "restore:$label"
 }
 
 cmd_rm_snapshot() {

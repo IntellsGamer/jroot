@@ -94,9 +94,10 @@ install: lint
 ifeq ($(PREFIX),$(HOME)/.local)
 	@bash $(INSTALLER)
 else
-	@install -d "$(BINDIR)"
+	@install -d "$(BINDIR)" "$(JROOT_HOME)/sdk"
 	@install -m 755 "$(SCRIPT)" "$(TARGET)"
-	@printf '$(GRN)[+]$(NC) Installed $(TARGET)\n'
+	@install -m 644 "jroot_sdk.py" "$(JROOT_HOME)/sdk/jroot_sdk.py"
+	@printf '$(GRN)[+]$(NC) Installed $(TARGET) and plugin SDK\n'
 	@command -v jroot >/dev/null 2>&1 || \
 		printf '$(YEL)[!]$(NC) %s is not on your PATH yet.\n' "$(BINDIR)"
 endif
@@ -104,9 +105,10 @@ endif
 # A symlink rather than a copy: handy while working on jroot, because the
 # installed command always reflects the checkout.
 dev-install: lint
-	@install -d "$(BINDIR)"
+	@install -d "$(BINDIR)" "$(JROOT_HOME)/sdk"
 	@ln -sf "$(CURDIR)/$(SCRIPT)" "$(TARGET)"
-	@printf '$(GRN)[+]$(NC) Linked $(TARGET) -> $(CURDIR)/$(SCRIPT)\n'
+	@install -m 644 "jroot_sdk.py" "$(JROOT_HOME)/sdk/jroot_sdk.py"
+	@printf '$(GRN)[+]$(NC) Linked $(TARGET) -> $(CURDIR)/$(SCRIPT) and installed plugin SDK\n'
 
 uninstall:
 	@if [ -e "$(TARGET)" ] || [ -L "$(TARGET)" ]; then \
@@ -359,6 +361,8 @@ test: check
 	@bash tests/sync.sh
 	@printf '$(CYAN)==>$(NC) tests/completion.sh\n'
 	@bash tests/completion.sh
+	@printf '$(CYAN)==>$(NC) tests/plugins.sh\n'
+	@bash tests/plugins.sh
 	@printf '$(GRN)==> test passed$(NC)\n'
 
 # -----------------------------------------------------------------------------
