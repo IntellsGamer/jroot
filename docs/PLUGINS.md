@@ -1,245 +1,247 @@
-# JRoot Plugin Developer Manual
+# JRoot Plugin Developer Manual & Cookbook
 
-This manual covers the JRoot event-driven plugin system. If you want to extend JRoot with custom audit loggers, automated backup routines, webhook bridges, or background resource monitors, this is your complete reference.
-
----
-
-## 1. How the Plugin Engine Works Under the Hood
-
-Before writing code, it helps to understand how JRoot manages plugins. JRoot is written in Bash, but plugins run as standalone scripts (usually Python 3) invoked through a strict process boundary.
-
-When you install a plugin via `jroot plugin install ./my-plugin`, JRoot does the following:
-1. **Reads and Validates `plugin.json`**: It checks that your plugin name is lowercase, has a valid semantic version, and **does not collide with any core JRoot command** (like `init`, `enter`, `sync`, or `checkpoint`).
-2. **Copies the Bundle**: It places your plugin directory into `~/.jroot/plugins/installed/<plugin-name>/`.
-3. **Allocates Data Storage**: It provisions an isolated state directory at `~/.jroot/plugins/data/<plugin-name>/` and a log file at `~/.jroot/plugins/logs/<plugin-name>.log`.
-
-### Event Dispatch Mechanism
-When a lifecycle event occurs—such as `jroot sync` completing or `jroot limit` updating—JRoot iterates over all installed plugins that declare interest in that hook. It spawns your entrypoint script with a command-line argument structure like this:
-
-```bash
-python3 main.py hook:on_sync host:/project dev:/root/project
-```
-
-Your script is responsible for inspecting `sys.argv[1]`, branching based on the hook name, parsing the remaining arguments, and executing your logic.
+Welcome to the definitive guide for extending JRoot. If you want to write custom audit loggers, automated backup routines, webhook notifiers, or background telemetry daemons, this manual covers everything from core execution mechanics to advanced design patterns.
 
 ---
 
-## 2. Complete SDK Method Reference (`jroot_sdk.py`)
+## 1. Core Mechanics: How JRoot Executes Plugins
 
-Every plugin receives an isolated copy of `jroot_sdk.py` (or automatically references the runtime SDK). The SDK provides two main classes: `Logger` and `JRootContext`.
+JRoot is written in Bash, but plugins are designed to run as standalone processes (typically Python scripts or shell scripts) connected via a strict process boundary. Understanding how JRoot talks to your plugin will save you hours of debugging.
 
-### `Logger(plugin_name)`
-Instantiated automatically by the context. Prints timestamped log lines that are captured by JRoot.
-*   `logger.info(msg)` — Writes an `INFO` level log.
-*   `logger.warn(msg)` — Writes a `WARN` level log.
-*   `logger.error(msg)` — Writes an `ERROR` level log.
-*   `logger.debug(msg)` — Writes a `DEBUG` level log.
+### The Dispatch Loop
+When a lifecycle event occurs—such as `jroot sync` finishing or `jroot limit` updating—JRoot does the following:
+1. **Scans Installed Plugins:** It looks inside `~/.jroot/plugins/installed/` for plugins that declare interest in that specific hook inside their `plugin.json`.
+2. **Prepares the Environment:** It injects standard environment variables (`JROOT_HOME`, `JROOT_PLUGIN_DATA`, `JROOT_COMMAND`) and automatically configures `PYTHONPATH` so `jroot_sdk` imports successfully.
+3. **Spawns the Entrypoint:** It invokes your entrypoint script as a subprocess, passing a structured argument vector (`sys.argv`).
 
-### `JRootContext`
-The central utility class for interacting with the host JRoot environment.
-
-| Method | Parameters | Return Type | Description |
-|---|---|---|---|
-| `list_jails()` | None | `list[dict]` | Returns metadata for all active jails, including rootfs paths and active resource limits. |
-| `get_jail(name)` | `name: str` | `dict \| None` | Loads the JSON configuration dictionary for a specific jail. Returns `None` if it doesn't exist. |
-| `run_in_jail(name, cmd)` | `name: str, cmd: str` | `tuple[int, str, str]` | Executes a shell command inside the specified jail via `jroot exec`. Returns `(exit_code, stdout, stderr)`. |
-| `get_resource_usage(name)` | `name: str` | `dict \| None` | Inspects live process accounting via `/proc`, returning RSS memory in bytes/MB, CPU seconds, and active PID count. |
-| `read_plugin_state(file, default)` | `file: str, default: Any` | `Any` | Reads a JSON file from your private plugin data directory. Returns `default` if missing or corrupted. |
-| `write_plugin_state(data, file)` | `data: Any, file: str` | `None` | Atomically writes JSON data using tempfile replacement semantics to prevent partial writes. |
-
----
-
-## 3. Real-World Example 1: Git Auto-Committer (`git-sync`)
-
-Imagine you have a development jail where you edit code. You want a plugin that automatically runs `git commit` inside the jail whenever `jroot sync` finishes pushing changes from your host.
-
-### Directory Structure
 ```text
-git-sync/
-├── plugin.json
-└── main.py
+[JRoot Core Runtime] 
+       │  (Event: on_sync)
+       ▼
+[Internal Dispatcher] ──(Injects PYTHONPATH & JROOT_PLUGIN_DATA)
+       │
+       ▼
+[Plugin Entrypoint: main.py] 
+       ├── sys.argv[1] == "hook:on_sync"
+       ├── sys.argv[2] == "host:/src"
+       └── sys.argv[3] == "dev:/dst"
 ```
 
-### `plugin.json`
-```json
-{
-  "api_version": 1,
-  "name": "git-sync",
-  "version": "1.0.0",
-  "description": "Automatically commits changes inside a jail after a host-to-jail sync operation.",
-  "author": "Developer",
-  "entrypoint": "main.py",
-  "hooks": ["on_sync"],
-  "permissions": ["jails.read", "state.read", "state.write"],
-  "requires": {
-    "python": ">=3.8",
-    "commands": ["python3"]
-  }
-}
-```
+### Process Isolation & Failure Handling
+Plugins run in isolated subprocesses. **If your plugin crashes, exits with a non-zero status, or throws an unhandled exception, JRoot logs the error to `~/.jroot/plugins/logs/<plugin-name>.log` but does NOT crash the core JRoot operation.** Your plugin's failure will never prevent a user from entering a jail or syncing files.
 
-### `main.py`
+---
+
+## 2. The Plugin Cookbook (Common Patterns)
+
+Here are real-world recipes for solving common architectural problems when writing JRoot plugins.
+
+### Recipe 1: The Notifier Pattern (Webhook / Slack Alerts)
+*Goal:* Send a notification whenever a jail resource limit is changed.
+
 ```python
 #!/usr/bin/env python3
 import sys
+import urllib.request
+import json
 from jroot_sdk import JRootContext
+
+def send_webhook(url: str, message: str):
+    payload = json.dumps({"text": message}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass # Never let a network failure crash the hook
 
 def main():
     context = JRootContext()
-    if len(sys.argv) < 2:
-        print("git-sync plugin active.")
-        return 0
-
-    action = sys.argv[1]
-    if action == "hook:on_sync":
-        # sys.argv[2] is source, sys.argv[3] is destination (e.g. dev:/root/app)
-        src, dst = sys.argv[2], sys.argv[3]
-        context.log.info(f"Sync detected from {src} to {dst}")
-
-        if ":" in dst:
-            jail_name, jail_path = dst.split(":", 1)
-            # Check if this path looks like a git repository
-            code, out, err = context.run_in_jail(jail_name, f"cd {jail_path} && git rev-parse --is-inside-work-tree")
-            if code == 0:
-                context.log.info(f"Git repository found in {jail_name}:{jail_path}. Committing changes...")
-                commit_cmd = "git add -A && git commit -m 'Auto-commit via jroot sync plugin' || true"
-                c_code, c_out, c_err = context.run_in_jail(jail_name, f"cd {jail_path} && {commit_cmd}")
-                if c_code == 0:
-                    context.log.info("Auto-commit successful.")
-                else:
-                    context.log.error(f"Auto-commit failed: {c_err}")
-            else:
-                context.log.debug(f"Target {dst} is not a git repository. Skipping.")
+    # Read user configuration from private state or config file
+    config = context.read_plugin_state("config.json", {"webhook_url": ""})
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "hook:on_limit":
+        jail, limits = sys.argv[2], sys.argv[3]
+        context.log.info(f"Limit changed on {jail}: {limits}")
+        
+        if config["webhook_url"]:
+            msg = f"⚠️ JRoot Alert: Limits adjusted for jail `{jail}` -> `{limits}`"
+            send_webhook(config["webhook_url"], msg)
+            
     return 0
 
 if __name__ == "__main__":
     sys.exit(main())
 ```
 
----
+### Recipe 2: The Command Interceptor / Validator
+*Goal:* Prevent users from running dangerous commands (like `rm -rf /`) during `jroot enter`.
 
-## 4. Real-World Example 2: Resource Watchdog & Alerting (`jail-watchdog`)
+```python
+#!/usr/bin/env python3
+sys
+from jroot_sdk import JRootContext
 
-This plugin hooks into `on_limit` and uses a background service (`on_monitor`) to watch active jail memory consumption, logging warnings if a jail exceeds safe thresholds.
+def main():
+    context = JRootContext()
+    if len(sys.argv) > 1 and sys.argv[1] == "hook:on_enter":
+        jail, command = sys.argv[2], sys.argv[3]
+        context.log.info(f"Auditing enter on {jail} with command: {command}")
+        
+        # Simple security heuristic check
+        dangerous_patterns = ["rm -rf /", "mkfs", ":(){ :|:& };:"]
+        for pattern in dangerous_patterns:
+            if pattern in command:
+                context.log.error(f"BLOCKED DANGEROUS COMMAND: {command}")
+                print(f"Error: JRoot security policy blocked command containing '{pattern}'", file=sys.stderr)
+                sys.exit(1) # Returning non-zero aborts or flags the operation depending on the hook
+                
+    return 0
 
-### `plugin.json`
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### Recipe 3: Writing a Pure Bash Plugin (No Python Needed)
+If you prefer shell scripting over Python, you can write plugins entirely in Bash. You just need a `plugin.json` and an executable shell script entrypoint.
+
+**`plugin.json`:**
 ```json
 {
   "api_version": 1,
-  "name": "jail-watchdog",
-  "version": "1.1.0",
-  "description": "Monitors memory usage across active jails and records limit adjustments.",
+  "name": "bash-audit",
+  "version": "1.0.0",
+  "description": "Simple bash-based audit logger.",
   "author": "Sysadmin",
-  "entrypoint": "main.py",
-  "hooks": ["on_limit", "on_monitor"],
-  "permissions": ["jails.read", "state.read", "state.write"],
+  "entrypoint": "audit.sh",
+  "hooks": ["on_init"],
+  "permissions": ["jails.read"],
   "requires": {
     "python": ">=3.8",
-    "commands": ["python3"]
+    "commands": ["bash"]
   }
 }
 ```
 
-### `main.py`
+**`audit.sh`:**
+```bash
+#!/usr/bin/env bash
+# Bash plugin entrypoint
+ACTION="${1:-}"
+
+if [ "$ACTION" = "hook:on_init" ]; then
+    JAIL="$2"
+    IMAGE="$3"
+    echo "$(date) - Jail created: $JAIL from $IMAGE" >> "$JROOT_PLUGIN_DATA/audit.log"
+fi
+exit 0
+```
+
+---
+
+## 3. Advanced SDK Reference (`jroot_sdk.py`)
+
+The JRoot SDK exposes typed, robust helpers for inspecting host state and managing persistent storage.
+
+### `JRootContext` Methods
+
+*   **`list_jails() -> list[dict]`**  
+    Scans `configs/` and returns metadata for every provisioned jail.
+    ```python
+    for jail in context.list_jails():
+        print(f"Jail: {jail['name']} | Image: {jail['image']} | RSS: {jail['rootfs_path']}")
+    ```
+
+*   **`get_jail(name: str) -> dict | None`**  
+    Loads the exact JSON config dictionary for a single jail. Returns `None` if the jail doesn't exist.
+
+*   **`run_in_jail(jail_name: str, command: str) -> tuple[int, str, str]`**  
+    Executes an arbitrary shell command inside the rootfs via `jroot exec`. Returns `(exit_code, stdout, stderr)`.
+
+*   **`get_resource_usage(jail_name: str) -> dict | None`**  
+    Inspects live process accounting via `/proc`, returning RSS memory and CPU ticks for active jail launcher processes:
+    ```python
+    usage = context.get_resource_usage("dev")
+    print(f"Memory: {usage['mem_mb']} MB | Active PIDs: {usage['pids']}")
+    ```
+
+*   **`read_plugin_state(filename="state.json", default=None) -> Any`**  
+    Loads JSON data from your private storage directory (`~/.jroot/plugins/data/<name>/`). Automatically handles missing files by returning your `default` value.
+
+*   **`write_plugin_state(data: Any, filename="state.json") -> None`**  
+    Atomically writes JSON state using tempfile replacement semantics (`os.replace`), preventing partial or corrupted writes if the plugin is interrupted.
+
+---
+
+## 4. Background Services & Daemon Management
+
+Plugins can run continuous background processes supervised by JRoot. 
+
+### Implementing a Daemon (`on_monitor`)
+Declare `on_monitor` in your `plugin.json` hooks array. When started, your entrypoint will receive `hook:on_monitor` as `sys.argv[1]`, followed by any arguments passed to the start command.
+
 ```python
-#!/usr/init/env python3
 import sys
 import time
 from jroot_sdk import JRootContext
 
-def handle_limit(context: JRootContext, jail: str, limits: str):
-    context.log.info(f"Watchdog noticed limit change on '{jail}': {limits}")
-    state = context.read_plugin_state("history.json", {"changes": []})
-    state["changes"].append({"jail": jail, "limits": limits, "time": time.time()})
-    context.write_plugin_state(state, "history.json")
-
-def run_monitor_daemon(context: JRootContext, target_jail: str):
-    context.log.info(f"Starting continuous watchdog monitor for jail: {target_jail}")
-    while True:
-        usage = context.get_resource_usage(target_jail)
-        if usage:
-            mem_mb = usage["mem_mb"]
-            context.log.debug(f"Jail '{target_jail}' memory RSS: {mem_mb} MB ({usage['pids']} processes)")
-            if mem_mb > 512.0:
-                context.log.warn(f"HIGH MEMORY ALERT: Jail '{target_jail}' is consuming {mem_mb} MB!")
-        time.sleep(10)
-
 def main():
     context = JRootContext()
-    if len(sys.argv) < 2:
-        print("Usage: jroot plugin invoke jail-watchdog")
-        return 0
-
-    action = sys.argv[1]
-    if action.startswith("hook:"):
-        hook = action.split(":", 1)[1]
-        args = sys.argv[2:]
-        if hook == "on_limit" and len(args) >= 2:
-            handle_limit(context, args[0], args[1])
-        elif hook == "on_monitor" and len(args) >= 1:
-            # When started as a service: jroot plugin service start jail-watchdog on_monitor <jail>
-            run_monitor_daemon(context, args[0])
+    if len(sys.argv) > 1 and sys.argv[1] == "hook:on_monitor":
+        jail_name = sys.argv[2] if len(sys.argv) > 2 else "default"
+        context.log.info(f"Watchdog daemon started for jail: {jail_name}")
+        
+        while True:
+            usage = context.get_resource_usage(jail_name)
+            if usage:
+                context.log.debug(f"Daemon heartbeat: {usage['mem_mb']} MB used")
+            time.sleep(30)
+            
     return 0
 
 if __name__ == "__main__":
     sys.exit(main())
 ```
 
----
-
-## 5. Testing, Debugging, and Simulation
-
-Never guess whether your plugin works. JRoot includes a local cross-platform development helper (`jroot-dev.py`) that simulates the entire execution environment on Linux, macOS, or Windows without requiring PRoot or rootfs downloads.
-
-### Step 1: Validate Manifest Strictness
+### Managing the Service Lifecycle
+From the host terminal, manage your background service using standard JRoot commands:
 ```bash
-python3 jroot-dev.py validate --strict ./jail-watchdog
-```
-If your manifest has missing keys, invalid semantic versioning, or uses a reserved command name, validation fails instantly with descriptive errors.
+# Start the background daemon
+jroot plugin service start my-plugin on_monitor dev
 
-### Step 2: Simulate Hook Dispatches Locally
-You can run individual hooks with mock payloads to verify your Python script parses `sys.argv` correctly:
-```bash
-python3 jroot-dev.py simulate on_limit --path ./jail-watchdog
-```
+# Check if it's running and inspect its PID
+jroot plugin service status my-plugin
 
-### Step 3: Run the Full Fixture Test Suite
-```bash
-python3 jroot-dev.py test ./jail-watchdog
+# Stop the daemon cleanly
+jroot plugin service stop my-plugin
 ```
-This automatically initializes a mock JRoot workspace, installs the plugin, triggers every declared lifecycle hook, verifies state persistence, and reports success or failure.
 
 ---
 
-## 6. Installing and Managing Plugins in Production
+## 5. Security Best Practices for Plugin Authors
 
-Once tested locally, install your plugin into your live JRoot environment:
-
-```bash
-jroot plugin install ./jail-watchdog
-```
-
-### Useful Management Commands
-*   **List installed plugins:** `jroot plugin list`
-*   **Inspect plugin metadata & last run status:** `jroot plugin inspect jail-watchdog`
-*   **Run verification checks:** `jroot plugin verify jail-watchdog`
-*   **Start a background daemon service:** `jroot plugin service start jail-watchdog on_monitor dev`
-*   **Check daemon status:** `jroot plugin service status jail-watchdog`
-*   **Stop a running daemon:** `jroot plugin service stop jail-watchdog`
-*   **Remove a plugin:** `jroot plugin remove jail-watchdog`
+1.  **Never trust input payloads:** Jail names and file paths passed in `sys.argv` should be validated before passing them to shell commands or file operations.
+2.  **Avoid blocking hooks:** Synchronous hooks (`on_init`, `on_limit`, `on_sync`, `on_snapshot`) execute directly inside the CLI request path. Keep them lightweight. Offload heavy network requests or slow operations to background services or asynchronous threads.
+3.  **Use atomic state writes:** Always use `context.write_plugin_state()` rather than manual `open(file, 'w')` to prevent state corruption.
+4.  **Respect permissions:** Declare only the permissions you actually need (`jails.read`, `state.read`, `state.write`) in your manifest.
 
 ---
 
-## 7. Troubleshooting Common Issues
+## 6. Testing Your Plugin Locally
 
-### Issue: `ModuleNotFoundError: No module named 'jroot_sdk'`
-*   **Cause:** Your script is being executed in an environment where `PYTHONPATH` does not point to the JRoot SDK directory.
-*   **Fix:** Ensure your JRoot installation is up to date. The runtime automatically injects `PYTHONPATH` and provisions `jroot_sdk.py` inside `~/.jroot/sdk/` before invoking hooks.
+You don't need a Linux PRoot environment to test your plugin. Use the cross-platform development helper `jroot-dev.py` (which runs on Windows, macOS, and Linux):
 
-### Issue: Plugin does not receive a specific hook
-*   **Cause:** The hook name is missing from the `"hooks": [...]` array in your `plugin.json`.
-*   **Fix:** Add the hook string to your manifest and re-run `jroot plugin install ./my-plugin`.
+```bash
+# 1. Initialize a test template
+python3 jroot-dev.py init my-plugin
 
-### Issue: State file corruption (`JSONDecodeError`)
-*   **Cause:** Writing directly to state files using standard `open().write()` without atomic replacement while another process is reading.
-*   **Fix:** Always use `context.write_plugin_state(data, filename)`, which utilizes temporary file rotation.
+# 2. Validate manifest strictness
+python3 jroot-dev.py validate --strict ./my-plugin
+
+# 3. Simulate a hook locally with mock data
+python3 jroot-dev.py simulate on_sync --path ./my-plugin
+
+# 4. Run the complete test fixture suite
+python3 jroot-dev.py test ./my-plugin
+```
+
+Once verified, install it into your live environment with `jroot plugin install ./my-plugin`.
