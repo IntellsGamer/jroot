@@ -3534,6 +3534,99 @@ cmd_file() {
     fi
 }
 
+sync_usage() {
+    printf '%bjroot sync%b - synchronize directories between host and jails (or between jails)\n\n' "$H" "$N"
+    printf '    %bjroot sync [options] <src> <dst>%b\n\n' "$G" "$N"
+    printf '    Options:\n'
+    printf '        %b--watch%b          Continuously watch for changes and sync in real time\n' "$G" "$N"
+    printf '        %b--delete%b         Delete extraneous files in destination\n' "$G" "$N"
+    printf '        %b--dry-run%b        Perform a trial run with no changes made\n' "$G" "$N"
+    printf '\n'
+    printf '    A path written %b<jail>:/path%b is inside that jail; anything else is a\n' "$G" "$N"
+    printf '    host path. At least one side must be a jail path.\n'
+    printf '\n'
+    printf '        %b$%b jroot sync ./project dev:/root/project            %b(host -> jail)%b\n' "$G" "$N" "$B" "$N"
+    printf '        %b$%b jroot sync dev:/root/project ./project            %b(jail -> host)%b\n' "$G" "$N" "$B" "$N"
+    printf '        %b$%b jroot sync --watch ./project dev:/root/project    %b(continuous watch)%b\n' "$G" "$N" "$B" "$N"
+}
+
+cmd_sync() {
+    local watch=0 delete_flag=0 dry_run=0
+    local -a args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --watch) watch=1; shift ;;
+            --delete) delete_flag=1; shift ;;
+            --dry-run) dry_run=1; shift ;;
+            -*) err "Unknown option: $1 (run '${CMD_HINT}help sync')" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+
+    [ ${#args[@]} -eq 2 ] || { sync_usage; err "${CMD_HINT}sync needs <src> <dst>."; }
+
+    local src="${args[0]}" dest="${args[1]}"
+    local src_jail="" src_path="" dest_jail="" dest_path=""
+
+    file_parse_side "$src" ""
+    src_jail="$FILE_SIDE_JAIL"; src_path="$FILE_SIDE_PATH"
+    file_parse_side "$dest" ""
+    dest_jail="$FILE_SIDE_JAIL"; dest_path="$FILE_SIDE_PATH"
+
+    if [ -z "$src_jail" ] && [ -z "$dest_jail" ]; then
+        err "Neither '$src' nor '$dest' is a jail path. Write '<jail>:/path' for the jail side."
+    fi
+
+    command -v rsync >/dev/null 2>&1 || err "rsync is required for 'jroot sync' but not installed on host."
+
+    local real_src="$src_path" real_dest="$dest_path"
+    if [ -n "$src_jail" ]; then
+        real_src="$(file_host_path "$src_jail" "$src_path" src)" || exit 1
+    else
+        real_src="$(realpath -m "$src_path")"
+    fi
+
+    if [ -n "$dest_jail" ]; then
+        real_dest="$(file_host_path "$dest_jail" "$dest_path" dst)" || exit 1
+        mkdir -p "$(dirname "$real_dest")"
+    else
+        real_dest="$(realpath -m "$dest_path")"
+        mkdir -p "$real_dest"
+    fi
+
+    local -a rsync_opts=("-avz")
+    [ $delete_flag -eq 1 ] && rsync_opts+=("--delete")
+    [ $dry_run -eq 1 ] && rsync_opts+=("--dry-run")
+
+    log "Synchronizing '$src' -> '$dest'..."
+    rsync "${rsync_opts[@]}" "$real_src/" "$real_dest/" || err "Sync failed: '$src' -> '$dest'"
+    log "Sync completed successfully."
+
+    if [ -n "$dest_jail" ]; then
+        record_event "$dest_jail" sync "sync $src -> $dest"
+    fi
+    if [ -n "$src_jail" ] && [ "$src_jail" != "$dest_jail" ]; then
+        record_event "$src_jail" sync "sync $src -> $dest"
+    fi
+
+    if [ $watch -eq 1 ]; then
+        local watch_dir="$real_src"
+        log "Entering watch mode on '$watch_dir' (Ctrl+C to stop)..."
+        if command -v inotifywait >/dev/null 2>&1; then
+            while inotifywait -r -q -e modify,create,delete,move "$watch_dir" >/dev/null 2>&1; do
+                log "Change detected, re-syncing..."
+                rsync "${rsync_opts[@]}" "$real_src/" "$real_dest/" || true
+            done
+        else
+            log "Notice: 'inotifywait' (from inotify-tools) not found. Falling back to 2-second polling loop."
+            while true; do
+                sleep 2
+                rsync "${rsync_opts[@]}" "$real_src/" "$real_dest/" >/dev/null 2>&1 || true
+            done
+        fi
+    fi
+}
+
 port_usage() {
     printf '%bjroot port%b - control which jailed ports may bind publicly\n\n' "$H" "$N"
     printf '    %bjroot port <name> list%b              show public ports\n' "$G" "$N"
@@ -5995,6 +6088,9 @@ cmd_help_cmd() {
                 file_usage
             fi
             ;;
+        sync)
+            sync_usage
+            ;;
         port)
             port_usage
             ;;
@@ -6145,6 +6241,7 @@ cmd_help() {
     help_row "jroot enter" "<name> --root <cmd>"   "Run a command as root (admin)"
     help_row "jroot exec" "<name> [--root] <cmd>"  "Run one command inside a jail"
     help_row "jroot file" "cp|mv <src> <dst>"      "Copy/move files between the host and jails"
+    help_row "jroot sync" "[options] <src> <dst>"  "Synchronize directories between host and jails"
     printf '                                      %b (a jail side is written %bdev:/path%b)\n' "$B" "$G" "$N"
     help_row "jroot port" "list|add|rm <name>"    "Control which jailed ports may bind publicly"
     help_row "jroot net" "[set <name> auto|off]"  "Per-jail loopback address (no port collisions)"
@@ -6999,6 +7096,7 @@ jroot_cmd() {
         enter)         shift; cmd_enter "$@" ;;
         exec)          shift; cmd_exec "$@" ;;
         file)          shift; cmd_file "$@" ;;
+        sync)          shift; cmd_sync "$@" ;;
         port)          shift; cmd_port "$@" ;;
         net)           shift; cmd_net "$@" ;;
         mnt)           shift; cmd_mnt "$@" ;;
