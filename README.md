@@ -799,12 +799,32 @@ jroot revert checkpoint dev pre-patch
 
 > **Note:** The first checkpoint is a private filesystem copy (using a reflink when the filesystem supports it). Later checkpoints use `rsync --link-dest` to share only unchanged files with an earlier immutable checkpoint; they never share writable inodes with the active jail. They are lightweight save points, not compressed archival snapshots.
 
+### Compare two checkpoints
+
+Use `jroot checkpoint diff` to inspect filesystem changes between two saved states without restoring either one.
+
+```bash
+jroot checkpoint diff dev before-upgrade after-upgrade
+```
+
+The output is concise: `A` means added, `D` removed, `M` file content, permission, or symlink-target change, `T` a file-type change, and `C` a changed saved jail-configuration field. Paths are shown from the rootfs root. The command is read-only and never starts the jail.
+
+```text
+M   /etc/app.conf
+D   /var/cache/old-index
+A   /usr/local/bin/new-tool
+C   @config.limit_mem
+
+Summary: 1 added, 1 removed, 1 modified, 0 type changed, 1 config changed
+```
+
 ### Useful commands
 
 | Command | Description |
 |---|---|
 | `jroot snapshot <name> [label]` | Create a compressed full backup |
 | `jroot checkpoint <name> [label]` | Create a fast, incremental save point |
+| `jroot checkpoint diff <name> <a> <b>` | Compare filesystem and configuration changes between checkpoints |
 | `jroot revert snapshot <name> <label>` | Restore from a compressed snapshot |
 | `jroot revert checkpoint <name> <label>` | Restore from a fast checkpoint |
 | `jroot snapshots <name>` | List all snapshots |
@@ -1368,6 +1388,7 @@ SNAPSHOTS
   jroot snapshot <name> [label]    Save a full snapshot (compressed)
   jroot snapshots <name>           List snapshots
   jroot checkpoint <name> [label]  Save an incremental checkpoint
+  jroot checkpoint diff <name> <a> <b>  Compare two checkpoint filesystems
   jroot checkpoints <name>         List checkpoints
   jroot revert snapshot <name> [label]   Restore a snapshot
   jroot revert checkpoint <name> [label] Restore a checkpoint

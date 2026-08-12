@@ -7576,7 +7576,119 @@ cmd_snapshots() {
     snapshot_list "$1"
 }
 
+checkpoint_diff_usage() {
+    printf '%bjroot checkpoint diff%b - compare two checkpoints of one jail\n\n' "$H" "$N"
+    printf '    %bjroot checkpoint diff <name> <checkpoint-a> <checkpoint-b>%b\n\n' "$G" "$N"
+    printf '    Output prefixes: %bA%b added, %bD%b removed, %bM%b changed, %bT%b type changed,\n' "$G" "$N" "$B" "$N" "$YEL" "$N" "$C_RED" "$N"
+    printf '    and %bC%b changed jail configuration field. This command is read-only.\n' "$C_CYA" "$N"
+}
+
+cmd_checkpoint_diff() {
+    [ $# -eq 3 ] || { checkpoint_diff_usage; err "Usage: jroot checkpoint diff <name> <checkpoint-a> <checkpoint-b>"; }
+    local name="$1" first="$2" second="$3" dir="$SNAPSHOTS_DIR/$1/checkpoints"
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$dir/$first" ] || err "Checkpoint '$first' not found for '$name'. Run 'jroot checkpoints $name'."
+    [ -d "$dir/$second" ] || err "Checkpoint '$second' not found for '$name'. Run 'jroot checkpoints $name'."
+    [ -f "$dir/$first.json" ] || err "Checkpoint config '$dir/$first.json' is missing."
+    [ -f "$dir/$second.json" ] || err "Checkpoint config '$dir/$second.json' is missing."
+    command -v python3 >/dev/null 2>&1 || err "jroot checkpoint diff requires python3 on the host."
+
+    printf '%bCheckpoint diff%b  %s: %b%s%b -> %b%s%b\n' "$H" "$N" "$name" "$D" "$first" "$N" "$G" "$second" "$N"
+    python3 - "$dir/$first" "$dir/$second" "$dir/$first.json" "$dir/$second.json" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+left, right, left_cfg, right_cfg = map(Path, sys.argv[1:])
+
+def kind(mode):
+    if stat.S_ISREG(mode): return "file"
+    if stat.S_ISDIR(mode): return "directory"
+    if stat.S_ISLNK(mode): return "symlink"
+    if stat.S_ISFIFO(mode): return "fifo"
+    if stat.S_ISCHR(mode): return "char-device"
+    if stat.S_ISBLK(mode): return "block-device"
+    if stat.S_ISSOCK(mode): return "socket"
+    return "other"
+
+def index(root):
+    found = {}
+    for base, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        base_path = Path(base)
+        for item in dirs + files:
+            path = base_path / item
+            rel = path.relative_to(root).as_posix()
+            try:
+                found[rel] = os.lstat(path)
+            except FileNotFoundError:
+                pass
+    return found
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.digest()
+
+def changed(a_path, a_stat, b_path, b_stat):
+    if stat.S_IMODE(a_stat.st_mode) != stat.S_IMODE(b_stat.st_mode):
+        return True
+    if stat.S_ISLNK(a_stat.st_mode):
+        return os.readlink(a_path) != os.readlink(b_path)
+    if stat.S_ISREG(a_stat.st_mode):
+        return a_stat.st_size != b_stat.st_size or digest(a_path) != digest(b_path)
+    return False
+
+left_index, right_index = index(left), index(right)
+added = removed = modified = type_changed = config_changed = 0
+for rel in sorted(set(left_index) | set(right_index)):
+    a, b = left_index.get(rel), right_index.get(rel)
+    if a is None:
+        print(f"A\t/{rel}")
+        added += 1
+        continue
+    if b is None:
+        print(f"D\t/{rel}")
+        removed += 1
+        continue
+    a_kind, b_kind = kind(a.st_mode), kind(b.st_mode)
+    if a_kind != b_kind:
+        print(f"T\t/{rel}\t{a_kind} -> {b_kind}")
+        type_changed += 1
+    elif changed(left / rel, a, right / rel, b):
+        print(f"M\t/{rel}")
+        modified += 1
+
+try:
+    left_data = json.loads(left_cfg.read_text(encoding="utf-8"))
+    right_data = json.loads(right_cfg.read_text(encoding="utf-8"))
+    if not isinstance(left_data, dict) or not isinstance(right_data, dict):
+        raise ValueError("not objects")
+    for key in sorted(set(left_data) | set(right_data)):
+        if left_data.get(key) != right_data.get(key):
+            print(f"C\t@config.{key}")
+            config_changed += 1
+except Exception:
+    if left_cfg.read_bytes() != right_cfg.read_bytes():
+        print("C\t@config")
+        config_changed += 1
+
+if not any((added, removed, modified, type_changed, config_changed)):
+    print("=\tidentical")
+print(f"\nSummary: {added} added, {removed} removed, {modified} modified, {type_changed} type changed, {config_changed} config changed")
+PY
+}
+
 cmd_checkpoint() {
+    if [ "${1:-}" = "diff" ]; then
+        shift
+        cmd_checkpoint_diff "$@"
+        return
+    fi
     [ $# -ge 1 ] || err "Usage: jroot checkpoint <name> [label]"
     local name="$1" label="${2:-}"
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
@@ -7923,10 +8035,12 @@ cmd_help_cmd() {
         checkpoint)
             printf '%bjroot checkpoint%b - save an immutable incremental jail state\n\n' "$H" "$N"
             printf '    %bjroot checkpoint <name> [label]%b\n' "$G" "$N"
+            printf '    %bjroot checkpoint diff <name> <checkpoint-a> <checkpoint-b>%b\n' "$G" "$N"
             printf '\n    The first checkpoint is a private copy; later checkpoints reuse unchanged\n'
             printf '    files from earlier immutable checkpoints without sharing writable inodes\n'
             printf '    with the active jail.\n'
             printf '    %bExample:%b jroot checkpoint dev pre-patch\n' "$G" "$N"
+            printf '    %bExample:%b jroot checkpoint diff dev before-upgrade after-upgrade\n' "$G" "$N"
             ;;
         checkpoints)
             printf '%bjroot checkpoints%b - list all checkpoints for a jail\n\n' "$H" "$N"
@@ -8049,6 +8163,7 @@ cmd_help() {
     help_row "jroot snapshot" "<name> [label]"      "Save full jail rootfs (compressed)"
     help_row "jroot snapshots" "<name>"             "List saved snapshots"
     help_row "jroot checkpoint" "<name> [label]"    "Quick incremental jail state save"
+    help_row "jroot checkpoint diff" "<name> <a> <b>" "Compare two checkpoint filesystems"
     help_row "jroot checkpoints" "<name>"           "List saved checkpoints"
     help_row "jroot revert" "snapshot|checkpoint <name> [label]" "Restore jail to a saved state"
     help_row "jroot rm-snapshot" "<name> <label>"   "Delete a snapshot"
@@ -8166,6 +8281,16 @@ _jroot_snapshots() {
         [ -e "$f" ] || continue
         n="${f##*/}"
         printf '%s\n' "${n%.tar.gz}"
+    done
+}
+
+_jroot_checkpoints() {
+    local f n
+    [ -n "$1" ] || return 0
+    for f in "$(_jroot_home)"/snapshots/"$1"/checkpoints/*; do
+        [ -d "$f" ] || continue
+        n="${f##*/}"
+        printf '%s\n' "$n"
     done
 }
 
@@ -8319,7 +8444,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
                 COMPREPLY=($(compgen -W "--root" -- "$cur"))
             fi
             ;;
-        install|info|size|snapshots|checkpoints|update|snapshot|checkpoint|rename|rm|delete)
+        install|info|size|snapshots|checkpoints|update|snapshot|rename|rm|delete)
             if [ "$idx" -eq 2 ]; then
                 COMPREPLY=($(compgen -W "$jails" -- "$cur"))
             fi
@@ -8408,6 +8533,17 @@ alpine:3.22 alpine:edge" -- "$cur"))
                 2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
                 3) COMPREPLY=($(compgen -W "$(_jroot_checkpoints "${w[2]}")" -- "$cur")) ;;
             esac
+            ;;
+        checkpoint)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "diff $jails" -- "$cur")) ;;
+                3) [ "${w[2]:-}" = "diff" ] && COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                4) [ "${w[2]:-}" = "diff" ] && COMPREPLY=($(compgen -W "$(_jroot_checkpoints "${w[3]}")" -- "$cur")) ;;
+                5) [ "${w[2]:-}" = "diff" ] && COMPREPLY=($(compgen -W "$(_jroot_checkpoints "${w[3]}")" -- "$cur")) ;;
+            esac
+            ;;
+        checkpoints)
+            [ "$idx" -eq 2 ] && COMPREPLY=($(compgen -W "$jails" -- "$cur"))
             ;;
         list|ls)
             COMPREPLY=($(compgen -W "--json" -- "$cur"))
@@ -8692,10 +8828,15 @@ _jroot() {
                 3) _jroot_checkpoints "${words[3]}" ;;
             esac
             ;;
-        checkpoint|checkpoints)
+        checkpoint)
             case $pos in
-                2) _jroot_jails ;;
+                2) compadd -- diff; _jroot_jails ;;
+                3) [[ "${words[3]}" == diff ]] && _jroot_jails ;;
+                4|5) [[ "${words[3]}" == diff ]] && _jroot_checkpoints "${words[4]}" ;;
             esac
+            ;;
+        checkpoints)
+            (( pos == 2 )) && _jroot_jails
             ;;
         list|ls)      compadd -- --json ;;
         history|logs)
@@ -8930,6 +9071,10 @@ complete -c jroot -n '__jroot_is ssh; and __jroot_at 3' -a 'start stop status pa
 complete -c jroot -n '__jroot_is ssh; and __jroot_arg_is 3 start' -a '--password-stdin --random-password --ask-password --no-password --permit-root --port= --user= --key= --password='
 
 # snapshots and the rest
+complete -c jroot -n '__jroot_is checkpoint; and __jroot_at 2' -a diff -d 'Compare two checkpoints'
+complete -c jroot -n '__jroot_is checkpoint; and __jroot_arg_is 2 diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is checkpoint; and __jroot_arg_is 2 diff; and __jroot_at 4' -a '(__jroot_checkpoints (__jroot_arg 3))' -d checkpoint
+complete -c jroot -n '__jroot_is checkpoint; and __jroot_arg_is 2 diff; and __jroot_at 5' -a '(__jroot_checkpoints (__jroot_arg 3))' -d checkpoint
 complete -c jroot -n '__jroot_is revert rm-snapshot; and __jroot_at 3' -a '(__jroot_snapshots (__jroot_arg 2))' -d snapshot
 complete -c jroot -n '__jroot_is list ls' -a --json
 complete -c jroot -n '__jroot_is history logs' -a '--json --clear --limit='

@@ -13,7 +13,7 @@ export JROOT_HOME="$root/.build/comphome"
 fails=0
 
 rm -rf "$JROOT_HOME"
-mkdir -p "$JROOT_HOME/configs" "$JROOT_HOME/snapshots/dev" \
+mkdir -p "$JROOT_HOME/configs" "$JROOT_HOME/snapshots/dev/checkpoints/baseline" "$JROOT_HOME/snapshots/dev/checkpoints/changed" \
          "$JROOT_HOME/roots/dev/etc/nginx" "$JROOT_HOME/roots/dev/usr/local/bin" \
          "$JROOT_HOME/roots/dev/root" "$JROOT_HOME/roots/web/etc"
 printf '%s\n' '{"name":"dev","image":"ubuntu:22.04","user":"root","ports":[3000,8080],"mounts":[["work","/tmp/w","ro"],["src","/tmp/s","rw"]]}' \
@@ -70,6 +70,10 @@ try 'jroot file mv dev ~/x :/ro'      '/root/'
 echo "config-derived values"
 try 'jroot revert '                   'snapshot'
 try 'jroot revert snapshot dev '      'before-test'
+try 'jroot checkpoint '               'diff'
+try 'jroot checkpoint diff '          'dev'
+try 'jroot checkpoint diff dev '      'baseline'
+try 'jroot checkpoint diff dev baseline ' 'changed'
 try 'jroot rm-snapshot dev c'         'clean'
 try 'jroot port dev '                 'list'
 try 'jroot port dev rm '              '8080'
