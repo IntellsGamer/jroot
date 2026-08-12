@@ -2726,6 +2726,24 @@ run_in_jail() {
     unset HOSTALIASES LD_PRELOAD LD_LIBRARY_PATH BASH_ENV ENV
     unset http_proxy https_proxy ftp_proxy all_proxy no_proxy
 
+    # Apply resource limits from config
+    local lim_mem lim_nofile
+    lim_mem="$(config_field "$cfg" limit_mem)"
+    lim_nofile="$(config_field "$cfg" limit_nofile)"
+    if [ -n "$lim_mem" ] && [ "$lim_mem" != "Unlimited" ]; then
+        local kb=0
+        case "$lim_mem" in
+            *G|*g) kb=$(( ${lim_mem%[Gg]} * 1024 * 1024 )) ;;
+            *M|*m) kb=$(( ${lim_mem%[Mm]} * 1024 )) ;;
+            *K|*k) kb=${lim_mem%[Kk]} ;;
+            *) kb=$(( ${lim_mem} / 1024 )) ;;
+        esac
+        [ "$kb" -gt 0 ] && ulimit -v "$kb" 2>/dev/null || true
+    fi
+    if [ -n "$lim_nofile" ] && [ "$lim_nofile" != "Unlimited" ]; then
+        ulimit -n "$lim_nofile" 2>/dev/null || true
+    fi
+
     # Host temp dir proot uses for its glue rootfs (PROOT_TMP_DIR, else /tmp).
     local proot_tmp="${PROOT_TMP_DIR:-/tmp}"
 
@@ -3127,15 +3145,17 @@ cmd_init() {
     local mount_host=0 mount_home=0 build_essential=1
     local cli_name="" cli_user="" cli_be="" cli_mh="" cli_mhomedir=""
 
+    local pull_oci=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --list|list|-l)         list_images; return 0 ;;
+            --pull|-p)              pull_oci=1 ;;
             --name=*)               cli_name="${1#*=}" ;;
             --user=*)               cli_user="${1#*=}" ;;
             --build-essential=*)    cli_be="${1#*=}" ;;
             --mount-host=*)         cli_mh="${1#*=}" ;;
             --mount-home=*)         cli_mhomedir="${1#*=}" ;;
-            -h|--help)              err "Usage: jroot init <image> [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1]\n       jroot init --list  (show available images)" ;;
+            -h|--help)              err "Usage: jroot init <image> [--pull|-p] [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1]\n       jroot init --list  (show available images)" ;;
             *)                      [ -z "$image" ] && image="$1" || err "Unexpected argument: $1" ;;
         esac
         shift
@@ -3146,12 +3166,66 @@ cmd_init() {
     tag="${image#*:}"
     [ -n "$tag" ] || tag="latest"
 
-    # Determine distro
-    case "$repo" in
-        ubuntu) distro="ubuntu" ;;
-        alpine) distro="alpine" ;;
-        *) err "Unsupported image '$repo'. Run 'jroot init --list' for supported images." ;;
-    esac
+    # Determine distro or OCI pull
+    if [ $pull_oci -eq 1 ] || [[ "$image" == */* ]] || [ "$repo" != "ubuntu" -a "$repo" != "alpine" ]; then
+        log "Pulling OCI image '$image' from Docker Hub..."
+        command -v curl >/dev/null 2>&1 || err "curl is required for OCI pulling."
+        command -v python3 >/dev/null 2>&1 || err "python3 is required for OCI pulling."
+        
+        # Parse repo and tag
+        local oci_repo="$repo" oci_tag="$tag"
+        [[ "$image" == */* ]] && oci_repo="$image" && oci_repo="${oci_repo%%:*}" && [[ "$image" == *:* ]] && oci_tag="${image#*:}"
+        [ -n "$oci_tag" ] || oci_tag="latest"
+
+        mkdir -p "$rootfs"
+        # Fetch auth token from Docker Hub registry v2
+        local token
+        token="$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$oci_repo:pull" | python3 -c "import sys, json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || true)"
+
+        local manifest_url="https://registry-hub.docker.com/v2/$oci_repo/manifests/$oci_tag"
+        # Fallback to library/ if short name
+        [[ "$oci_repo" != */* ]] && manifest_url="https://registry-hub.docker.com/v2/library/$oci_repo/manifests/$oci_tag"
+
+        local headers=("-H" "Accept: application/vnd.oci.image.manifest.v1+json" "-H" "Accept: application/vnd.docker.distribution.manifest.v2+json")
+        [ -n "$token" ] && headers+=("-H" "Authorization: Bearer $token")
+
+        local manifest_json
+        manifest_json="$(curl -s "${headers[@]}" "$manifest_url")"
+
+        # Extract layer digests
+        local digests
+        digests="$(echo "$manifest_json" | python3 -c "
+import sys, json
+try:
+    m = json.load(sys.stdin)
+    layers = m.get('layers', m.get('fsLayers', []))
+    for l in layers:
+        d = l.get('digest', l.get('blobSum', ''))
+        if d: print(d)
+except Exception as e:
+    pass
+" 2>/dev/null)"
+
+        [ -n "$digests" ] || err "Failed to fetch OCI image manifest for '$image'."
+
+        local registry_host="registry-hub.docker.com"
+        [[ "$oci_repo" == */* ]] && registry_host="registry-1.docker.io"
+
+        for digest in $digests; do
+            log "Downloading layer $digest..."
+            local blob_url="https://$registry_host/v2/$oci_repo/blobs/$digest"
+            [[ "$oci_repo" != */* ]] && blob_url="https://$registry_host/v2/library/$oci_repo/blobs/$digest"
+            
+            curl -sL -H "Authorization: Bearer $token" "$blob_url" | tar -xz -C "$rootfs" 2>/dev/null || true
+        done
+        distro="oci"
+    else
+        case "$repo" in
+            ubuntu) distro="ubuntu" ;;
+            alpine) distro="alpine" ;;
+            *) err "Unsupported image '$repo'. Run 'jroot init --list' for supported images, or use 'jroot init --pull <image>'." ;;
+        esac
+    fi
 
     # Version parsing
     if [ "$distro" = "ubuntu" ]; then
@@ -4110,10 +4184,50 @@ cmd_clean() {
     done
 }
 
+
+
+limit_usage() {
+    printf '%bjroot limit%b - set resource limits on a jail (prlimit)\n\n' "$H" "$N"
+    printf '    %bjroot limit <name> [--mem=<size>] [--cpu=<secs>] [--nofile=<n>]%b\n\n' "$G" "$N"
+    printf '    Examples:\n'
+    printf '        %b$%b jroot limit dev --mem=2G --nofile=1024\n' "$G" "$N"
+}
+
+cmd_limit() {
+    [ $# -ge 2 ] || { limit_usage; err "${CMD_HINT}limit needs <name> and options."; }
+    local name="$1"; shift
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found."
+
+    local mem="" cpu="" nofile=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mem=*) mem="${1#*=}"; shift ;;
+            --cpu=*) cpu="${1#*=}"; shift ;;
+            --nofile=*) nofile="${1#*=}"; shift ;;
+            *) err "Unknown limit option: $1" ;;
+        esac
+    done
+
+    # Save limits into jail config json
+    python3 -c "
+import json, sys
+path = '$CONFIGS_DIR/$name.json'
+d = json.load(open(path))
+if '$mem': d['limit_mem'] = '$mem'
+if '$cpu': d['limit_cpu'] = '$cpu'
+if '$nofile': d['limit_nofile'] = '$nofile'
+json.dump(d, open(path, 'w'), indent=2)
+" 2>/dev/null || err "Failed to update config for '$name'."
+
+    log "Resource limits updated for jail '$name'."
+    record_event "$name" limit "updated resource limits"
+}
+
+
 cmd_size() {
     [ $# -le 1 ] || err "Usage: jroot size [name]"
     local name="${1:-}"
-    printf '%-20s %10s %s\n' "JAIL" "ROOTFS" "SNAPSHOTS"
+    printf '%-16s %10s %10s %10s\n' "JAIL" "ROOTFS" "MAX STORAGE" "SNAPSHOTS"
     if [ -n "$name" ]; then
         [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
         size_one "$name"
@@ -4145,7 +4259,9 @@ size_one() {
     if [ "${#snaps[@]}" -gt 0 ]; then
         ssize="$(du -sh "$snapshots_dir" 2>/dev/null | awk '{print $1}')"
     fi
-    printf '%-20s %10s %10s\n' "$name" "$rsize" "$ssize"
+    local max_storage
+    max_storage="$(python3 -c "import json; print(json.load(open('$CONFIGS_DIR/$name.json')).get('max_storage', '10GB'))" 2>/dev/null || echo '10GB')"
+    printf '%-16s %10s %10s %10s\n' "$name" "$rsize" "$max_storage" "$ssize"
 }
 
 cmd_list() {
@@ -4723,7 +4839,30 @@ cmd_info() {
     printf '  build_essential:  %s\n' "$(config_field "$cfg" build_essential)"
     printf '  mount_host (/):   %s\n' "$(config_field "$cfg" mount_host)"
     printf '  mount_home (~):   %s\n' "$(config_field "$cfg" mount_home)"
-    printf '  rootfs:           %s  (%s)\n' "$rootfs" "$size"
+    local max_storage
+    max_storage="$(python3 -c "import json; print(json.load(open('$cfg')).get('max_storage', '10GB'))" 2>/dev/null || echo '10GB')"
+    printf '  rootfs:           %s  (%s / Max: %s)\n' "$rootfs" "$size" "$max_storage"
+    
+    local mem_limit nofile_limit cpu_limit
+    mem_limit="$(python3 -c "import json; print(json.load(open('$cfg')).get('limit_mem', 'Unlimited'))" 2>/dev/null)"
+    nofile_limit="$(python3 -c "import json; print(json.load(open('$cfg')).get('limit_nofile', 'Unlimited'))" 2>/dev/null)"
+    cpu_limit="$(python3 -c "import json; print(json.load(open('$cfg')).get('limit_cpu', 'Unlimited'))" 2>/dev/null)"
+    
+    printf '\n%bRESOURCE LIMITS & TELEMETRY%b\n' "$H" "$N"
+    printf '  Memory Limit:     %s\n' "$mem_limit"
+    printf '  CPU Limit:        %s\n' "$cpu_limit"
+    printf '  OpenFile Limit:   %s\n' "$nofile_limit"
+    
+    local pidfile="$JROOT_HOME/pids/$name.pid"
+    if [ -f "$pidfile" ]; then
+        local pid
+        pid="$(cat "$pidfile" 2>/dev/null | tr -d ' ')"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            local live_mem
+            live_mem="$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print int($1/1024) " MB"}')"
+            printf '  Live Memory:      %s\n' "${live_mem:-0 MB}"
+        fi
+    fi
     printf '  snapshots:        %s\n' "$count"
     if [ "$count" -gt 0 ]; then
         printf '  last snapshot:    %s\n' "$(basename "${snaps[$((count-1))]}" .tar.gz)"
@@ -6283,6 +6422,9 @@ cmd_help_cmd() {
         sync)
             sync_usage
             ;;
+        limit)
+            limit_usage
+            ;;
         bundle)
             bundle_usage
             ;;
@@ -6446,6 +6588,7 @@ cmd_help() {
     help_row "jroot exec" "<name> [--root] <cmd>"  "Run one command inside a jail"
     help_row "jroot file" "cp|mv <src> <dst>"      "Copy/move files between the host and jails"
     help_row "jroot sync" "[options] <src> <dst>"  "Synchronize directories between host and jails"
+    help_row "jroot limit" "<name> [limits]"        "Set resource limits (mem, cpu, nofile)"
     help_row "jroot bundle" "<name> <out.tar.gz>"  "Package a jail into a portable archive"
     help_row "jroot deploy" "<archive> [newname]"  "Deploy a bundled jail archive"
     help_row "jroot monitor" ""                    "Live telemetry and resource usage TUI"
@@ -7305,6 +7448,7 @@ jroot_cmd() {
         exec)          shift; cmd_exec "$@" ;;
         file)          shift; cmd_file "$@" ;;
         sync)          shift; cmd_sync "$@" ;;
+        limit)         shift; cmd_limit "$@" ;;
         bundle)        shift; cmd_bundle "$@" ;;
         deploy)        shift; cmd_deploy "$@" ;;
         monitor)       shift; cmd_monitor "$@" ;;
