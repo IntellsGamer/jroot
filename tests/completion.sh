@@ -15,7 +15,8 @@ fails=0
 rm -rf "$JROOT_HOME"
 mkdir -p "$JROOT_HOME/configs" "$JROOT_HOME/snapshots/dev/checkpoints/baseline" "$JROOT_HOME/snapshots/dev/checkpoints/changed" \
          "$JROOT_HOME/roots/dev/etc/nginx" "$JROOT_HOME/roots/dev/usr/local/bin" \
-         "$JROOT_HOME/roots/dev/root" "$JROOT_HOME/roots/web/etc"
+         "$JROOT_HOME/roots/dev/root" "$JROOT_HOME/roots/web/etc" \
+         "$JROOT_HOME/plugins/ledger"
 printf '%s\n' '{"name":"dev","image":"ubuntu:22.04","user":"root","ports":[3000,8080],"mounts":[["work","/tmp/w","ro"],["src","/tmp/s","rw"]]}' \
     > "$JROOT_HOME/configs/dev.json"
 printf '%s\n' '{"name":"web","image":"ubuntu:24.04","user":"unroot","ports":[],"mounts":[]}' \
@@ -23,6 +24,11 @@ printf '%s\n' '{"name":"web","image":"ubuntu:24.04","user":"unroot","ports":[],"
 : > "$JROOT_HOME/snapshots/dev/before-test.tar.gz"
 : > "$JROOT_HOME/snapshots/dev/clean.tar.gz"
 : > "$JROOT_HOME/roots/dev/root/app.tar.gz"
+printf '%s\n' '{"name":"ledger","version":"1.0.0"}' > "$JROOT_HOME/plugins/ledger/plugin.json"
+: > "$JROOT_HOME/plugins/audit.py"
+: > "$root/.build/completion-bundle.tar.gz"
+: > "$root/.build/jroot-compose.yml"
+cd "$root"
 
 eval "$(bash "$root/jroot" completion bash)"
 
@@ -48,6 +54,15 @@ try() {
 
 echo "commands"
 try 'jroot '                          'completion'
+try 'jroot syn'                       'sync'
+try 'jroot lim'                       'limit'
+try 'jroot bun'                       'bundle'
+try 'jroot dep'                       'deploy'
+try 'jroot mon'                       'monitor'
+try 'jroot compo'                     'compose'
+try 'jroot plu'                       'plugin'
+try 'jroot mo'                        'mount'
+try 'jroot delet'                     'delete'
 try 'jroot com'                       'compare'
 try 'jroot bui'                       'build'
 echo "jail names"
@@ -59,6 +74,13 @@ try 'jroot clean dev '                'web'
 try 'jroot compare dev '              'web'
 echo "paths inside a jail"
 try 'jroot file '                     'cp'
+try 'jroot sync '                     'dev:'
+try 'jroot sync dev:/et'              '/etc/'
+try 'jroot sync --'                   '--dry-run'
+try 'jroot bundle dev .build/completion-b' '.build/completion-bundle.tar.gz'
+try 'jroot deploy .build/completion-b' '.build/completion-bundle.tar.gz'
+try 'jroot compose '                  'status'
+try 'jroot compose up .build/jroot-c' '.build/jroot-compose.yml'
 try 'jroot file cp '                  'dev:'
 try 'jroot file cp dev:'              '/etc/'
 try 'jroot file cp dev:/et'           '/etc/'
@@ -74,14 +96,24 @@ try 'jroot checkpoint '               'diff'
 try 'jroot checkpoint diff '          'dev'
 try 'jroot checkpoint diff dev '      'baseline'
 try 'jroot checkpoint diff dev baseline ' 'changed'
+try 'jroot rm-checkpoint dev b'       'baseline'
 try 'jroot rm-snapshot dev c'         'clean'
+try 'jroot plugin '                   'service'
+try 'jroot plugin verify '            'ledger'
+try 'jroot plugin inspect '           'audit'
+try 'jroot plugin logs ledger '       '--follow'
+try 'jroot plugin service '           'start'
+try 'jroot plugin service start '     'ledger'
 try 'jroot port dev '                 'list'
 try 'jroot port dev rm '              '8080'
 try 'jroot mnt dev '                  'work'
 try 'jroot mnt dev set '              'src'
 try 'jroot mnt dev set work '         'ro'
+try 'jroot net '                      'set'
+try 'jroot net '                      'dev'
 try 'jroot net set '                  'web'
 try 'jroot net set web '              'auto'
+try 'jroot limit dev --'              '--mem='
 echo "flags"
 try 'jroot ssh dev '                  'status'
 try 'jroot ssh dev start --'          '--random-password'
@@ -98,6 +130,8 @@ try 'jroot doctor --'                 '--fix'
 try 'jroot build --'                  '--build-arg='
 try 'jroot build '                    '--tag='
 try 'jroot completion '               'fish'
+try 'jroot completions '              'fish'
+try 'jroot help '                     'sync'
 try 'jroot help '                     'ssh'
 try 'jroot help lo'                    'logs'
 try 'jroot help file '                'cp'

@@ -8294,6 +8294,19 @@ _jroot_checkpoints() {
     done
 }
 
+_jroot_plugins() {
+    local f n
+    for f in "$(_jroot_home)"/plugins/*; do
+        [ -e "$f" ] || continue
+        n="${f##*/}"
+        case "$n" in
+            data|logs|status|registry) continue ;;
+            *.py|*.sh) n="${n%.*}" ;;
+        esac
+        printf '%s\n' "$n"
+    done
+}
+
 # Public ports and mount labels out of the jail config. python3 writes it with
 # indent=2, so the file is flattened first rather than read a line at a time -
 # and a TAB press has no business forking a python interpreter.
@@ -8401,9 +8414,10 @@ _jroot() {
     fi
     COMPREPLY=()
 
-    local cmds="init build enter exec shell install config file port net mnt ssh list info
-	size history logs compare which doctor snapshot snapshots checkpoint checkpoints revert
-	rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin"
+    local cmds="init build enter exec shell install config file sync limit bundle deploy monitor compose
+        port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot
+        snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill
+        stop ps rm delete completion completions help plugin"
 
     if [ "$idx" -le 1 ]; then
         COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
@@ -8472,6 +8486,62 @@ alpine:3.22 alpine:edge" -- "$cur"))
                 _jroot_file_arg "$cur" "$ctx"
             fi
             ;;
+        sync)
+            if [ "$idx" -ge 2 ]; then
+                local -a sync_flags
+                sync_flags=($(compgen -W "--watch --delete --dry-run" -- "$cur"))
+                _jroot_file_arg "$cur" ""
+                COMPREPLY+=("${sync_flags[@]}")
+            fi
+            ;;
+        limit)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--mem= --cpu= --nofile=" -- "$cur"))
+            fi
+            ;;
+        bundle)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            elif [ "$idx" -eq 3 ]; then
+                COMPREPLY=($(compgen -f -- "$cur"))
+                compopt -o filenames 2>/dev/null
+            fi
+            ;;
+        deploy)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -f -- "$cur"))
+                compopt -o filenames 2>/dev/null
+            fi
+            ;;
+        monitor)
+            # monitor takes no arguments; completing only the command prevents
+            # suggesting options the live monitor does not accept.
+            ;;
+        compose)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "up down status" -- "$cur"))
+            elif [ "$idx" -eq 3 ]; then
+                COMPREPLY=($(compgen -f -- "$cur"))
+                compopt -o filenames 2>/dev/null
+            fi
+            ;;
+        plugin)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "list ls install add verify inspect remove rm uninstall logs service init-sdk sdk help --help -h" -- "$cur")) ;;
+                3) case "${w[2]:-}" in
+                       install|add) COMPREPLY=($(compgen -f -d -- "$cur")); compopt -o filenames 2>/dev/null ;;
+                       verify) COMPREPLY=($(compgen -W "$(_jroot_plugins) all" -- "$cur")) ;;
+                       inspect|remove|rm|uninstall|logs) COMPREPLY=($(compgen -W "$(_jroot_plugins)" -- "$cur")) ;;
+                       service) COMPREPLY=($(compgen -W "start stop status" -- "$cur")) ;;
+                   esac ;;
+                4) case "${w[2]:-}" in
+                       logs) COMPREPLY=($(compgen -W "--follow" -- "$cur")) ;;
+                       service) COMPREPLY=($(compgen -W "$(_jroot_plugins)" -- "$cur")) ;;
+                   esac ;;
+            esac
+            ;;
         port)
             case "$idx" in
                 2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
@@ -8483,9 +8553,9 @@ alpine:3.22 alpine:edge" -- "$cur"))
             ;;
         net)
             case "$idx" in
-                2) COMPREPLY=($(compgen -W "set" -- "$cur")) ;;
-                3) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
-                4) COMPREPLY=($(compgen -W "auto off" -- "$cur")) ;;
+                2) COMPREPLY=($(compgen -W "set list $jails" -- "$cur")) ;;
+                3) [ "${w[2]:-}" = "set" ] && COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                4) [ "${w[2]:-}" = "set" ] && COMPREPLY=($(compgen -W "auto off" -- "$cur")) ;;
             esac
             ;;
         mnt|mount)
@@ -8579,7 +8649,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
         doctor)
             COMPREPLY=($(compgen -W "--fix --mute=7d --mute=forever --mute=off" -- "$cur"))
             ;;
-        completion)
+        completion|completions)
             if [ "$idx" -eq 2 ]; then
                 COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
             fi
@@ -8633,6 +8703,32 @@ _jroot_snaps() {
     done
     (( ${#labels} )) || return 1
     _describe -t snapshots 'snapshot' labels
+}
+
+_jroot_checkpoints() {
+    local -a labels
+    local f
+    [[ -n "$1" ]] || return 1
+    for f in $(_jroot_home)/snapshots/$1/checkpoints/*(N/); do
+        labels+=("${f:t}")
+    done
+    (( ${#labels} )) || return 1
+    _describe -t checkpoints 'checkpoint' labels
+}
+
+_jroot_plugins() {
+    local -a names
+    local f n
+    for f in $(_jroot_home)/plugins/*(N); do
+        n="${f:t}"
+        case "$n" in
+            data|logs|status|registry) continue ;;
+            *.py|*.sh) n="${n%.*}" ;;
+        esac
+        names+=("$n")
+    done
+    (( ${#names} )) || return 1
+    _describe -t plugins 'plugin' names
 }
 
 # Public ports and mount labels out of the jail config, which is written with
@@ -8693,29 +8789,45 @@ _jroot() {
         'install:install packages inside a jail'
         'config:view or change jail settings'
         'file:copy or move files between host and jails'
+        'sync:synchronize host and jail directory trees'
+        'limit:set per-launch resource limits for a jail'
+        'bundle:package a jail into a portable archive'
+        'deploy:register a jail from a portable archive'
+        'monitor:show live telemetry for all jails'
+        'compose:operate a multi-jail stack'
         'port:control which jailed ports may bind publicly'
         'net:per-jail loopback address'
         'mnt:bind-mount a host directory into a jail'
+        'mount:alias for mnt'
         'ssh:SSH access into a jail'
         'list:list all jails'
+        'ls:alias for list'
         'info:show jail details'
         'size:show disk usage per jail'
         'history:what was done to a jail, and when'
         'logs:alias for jail event history'
         'compare:diff two jails'
+        'diff:alias for compare'
         'which:find a program across jails'
         'doctor:check the installation'
         'snapshot:save a snapshot'
         'snapshots:list snapshots'
-        'revert:restore a snapshot'
+        'checkpoint:save or compare incremental checkpoints'
+        'checkpoints:list checkpoints'
+        'revert:restore a snapshot or checkpoint'
         'rm-snapshot:delete a snapshot'
+        'rm-checkpoint:delete a checkpoint'
         'update:update runtime and jail packages'
         'clean:free disk space inside a jail'
         'rename:rename a jail'
         'kill:terminate a running jail'
+        'stop:alias for kill'
         'ps:list running jails'
         'rm:delete a jail'
+        'delete:alias for rm'
         'completion:print a shell completion script'
+        'completions:alias for completion'
+        'plugin:manage installed plugins'
         'help:show help'
     )
 
@@ -8767,6 +8879,37 @@ _jroot() {
         file)
             if (( pos == 2 )); then compadd -- cp mv; else _jroot_file_arg; fi
             ;;
+        sync)
+            (( pos >= 2 )) && compadd -- --watch --delete --dry-run
+            (( pos >= 2 )) && _jroot_file_arg
+            ;;
+        limit)
+            if (( pos == 2 )); then _jroot_jails; else compadd -S '' -- --mem= --cpu= --nofile=; fi
+            ;;
+        bundle)
+            if (( pos == 2 )); then _jroot_jails; elif (( pos == 3 )); then _files; fi
+            ;;
+        deploy)
+            (( pos == 2 )) && _files
+            ;;
+        compose)
+            if (( pos == 2 )); then compadd -- up down status; elif (( pos == 3 )); then _files; fi
+            ;;
+        plugin)
+            case $pos in
+                2) compadd -- list ls install add verify inspect remove rm uninstall logs service init-sdk sdk help --help -h ;;
+                3) case "${words[3]}" in
+                       install|add) _files ;;
+                       verify) _jroot_plugins; compadd -- all ;;
+                       inspect|remove|rm|uninstall|logs) _jroot_plugins ;;
+                       service) compadd -- start stop status ;;
+                   esac ;;
+                4) case "${words[3]}" in
+                       logs) compadd -- --follow ;;
+                       service) _jroot_plugins ;;
+                   esac ;;
+            esac
+            ;;
         port)
             case $pos in
                 2) _jroot_jails ;;
@@ -8776,9 +8919,9 @@ _jroot() {
             ;;
         net)
             case $pos in
-                2) compadd -- set ;;
-                3) _jroot_jails ;;
-                4) compadd -- auto off ;;
+                2) compadd -- set list; _jroot_jails ;;
+                3) [[ "${words[3]}" == set ]] && _jroot_jails ;;
+                4) [[ "${words[3]}" == set ]] && compadd -- auto off ;;
             esac
             ;;
         mnt|mount)
@@ -8855,7 +8998,7 @@ _jroot() {
             if (( pos == 2 )); then _jroot_jails; else compadd -- --force; fi
             ;;
         doctor)       compadd -- --fix --mute=7d --mute=forever --mute=off ;;
-        completion)   (( pos == 2 )) && compadd -- bash zsh fish ;;
+        completion|completions) (( pos == 2 )) && compadd -- bash zsh fish ;;
         help)
             if (( pos == 2 )); then
                 _describe -t commands 'jroot command' cmds
@@ -8904,6 +9047,30 @@ function __jroot_snapshots -a jail
     test -d $dir; or return
     for f in (command ls $dir 2>/dev/null)
         string match -q '*.tar.gz' -- $f; and string replace -r '\.tar\.gz$' '' -- $f
+    end
+end
+
+function __jroot_checkpoints -a jail
+    test -n "$jail"; or return
+    set -l dir (__jroot_home)/snapshots/$jail/checkpoints
+    test -d $dir; or return
+    for f in (command ls $dir 2>/dev/null)
+        test -d $dir/$f; and echo $f
+    end
+end
+
+function __jroot_plugins
+    set -l dir (__jroot_home)/plugins
+    test -d $dir; or return
+    for f in (command ls $dir 2>/dev/null)
+        switch $f
+            case data logs status registry
+                continue
+            case '*.py' '*.sh'
+                string replace -r '\.(py|sh)$' '' -- $f
+            case '*'
+                echo $f
+        end
     end
 end
 
@@ -9007,37 +9174,57 @@ complete -c jroot -n '__jroot_at 1' -a shell       -d 'Interactive jroot prompt'
 complete -c jroot -n '__jroot_at 1' -a install     -d 'Install packages inside a jail'
 complete -c jroot -n '__jroot_at 1' -a config      -d 'View or change jail settings'
 complete -c jroot -n '__jroot_at 1' -a file        -d 'Copy or move files host <-> jail'
+complete -c jroot -n '__jroot_at 1' -a sync        -d 'Synchronize host and jail directory trees'
+complete -c jroot -n '__jroot_at 1' -a limit       -d 'Set per-launch resource limits for a jail'
+complete -c jroot -n '__jroot_at 1' -a bundle      -d 'Package a jail into a portable archive'
+complete -c jroot -n '__jroot_at 1' -a deploy      -d 'Register a jail from a portable archive'
+complete -c jroot -n '__jroot_at 1' -a monitor     -d 'Show live telemetry for all jails'
+complete -c jroot -n '__jroot_at 1' -a compose     -d 'Operate a multi-jail stack'
 complete -c jroot -n '__jroot_at 1' -a port        -d 'Ports allowed to bind publicly'
 complete -c jroot -n '__jroot_at 1' -a net         -d 'Per-jail loopback address'
 complete -c jroot -n '__jroot_at 1' -a mnt         -d 'Bind-mount a host directory'
+complete -c jroot -n '__jroot_at 1' -a mount       -d 'Alias for mnt'
 complete -c jroot -n '__jroot_at 1' -a ssh         -d 'SSH access into a jail'
 complete -c jroot -n '__jroot_at 1' -a list        -d 'List all jails'
+complete -c jroot -n '__jroot_at 1' -a ls          -d 'Alias for list'
 complete -c jroot -n '__jroot_at 1' -a info        -d 'Show jail details'
 complete -c jroot -n '__jroot_at 1' -a size        -d 'Show disk usage per jail'
 complete -c jroot -n '__jroot_at 1' -a history     -d 'What was done to a jail'
 complete -c jroot -n '__jroot_at 1' -a logs        -d 'Alias for jail event history'
 complete -c jroot -n '__jroot_at 1' -a compare     -d 'Diff two jails'
+complete -c jroot -n '__jroot_at 1' -a diff        -d 'Alias for compare'
 complete -c jroot -n '__jroot_at 1' -a which       -d 'Find a program across jails'
 complete -c jroot -n '__jroot_at 1' -a doctor      -d 'Check the installation'
 complete -c jroot -n '__jroot_at 1' -a snapshot    -d 'Save a snapshot'
 complete -c jroot -n '__jroot_at 1' -a snapshots   -d 'List snapshots'
-complete -c jroot -n '__jroot_at 1' -a revert      -d 'Restore a snapshot'
+complete -c jroot -n '__jroot_at 1' -a checkpoint  -d 'Save or compare incremental checkpoints'
+complete -c jroot -n '__jroot_at 1' -a checkpoints -d 'List checkpoints'
+complete -c jroot -n '__jroot_at 1' -a revert      -d 'Restore a snapshot or checkpoint'
 complete -c jroot -n '__jroot_at 1' -a rm-snapshot -d 'Delete a snapshot'
+complete -c jroot -n '__jroot_at 1' -a rm-checkpoint -d 'Delete a checkpoint'
 complete -c jroot -n '__jroot_at 1' -a update      -d 'Update runtime and packages'
 complete -c jroot -n '__jroot_at 1' -a clean       -d 'Free disk space in a jail'
 complete -c jroot -n '__jroot_at 1' -a rename      -d 'Rename a jail'
 complete -c jroot -n '__jroot_at 1' -a kill        -d 'Terminate a running jail'
+complete -c jroot -n '__jroot_at 1' -a stop        -d 'Alias for kill'
 complete -c jroot -n '__jroot_at 1' -a ps          -d 'List running jails'
 complete -c jroot -n '__jroot_at 1' -a rm          -d 'Delete a jail'
+complete -c jroot -n '__jroot_at 1' -a delete      -d 'Alias for rm'
 complete -c jroot -n '__jroot_at 1' -a completion  -d 'Print a completion script'
+complete -c jroot -n '__jroot_at 1' -a completions -d 'Alias for completion'
+complete -c jroot -n '__jroot_at 1' -a plugin      -d 'Manage installed plugins'
 complete -c jroot -n '__jroot_at 1' -a help        -d 'Show help'
 
 # A jail name as the first argument. One long line per rule on purpose: fish
 # splits an -a list on whitespace and a backslash inside single quotes stays a
 # literal backslash, so there is no safe way to wrap these.
-complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount ssh which history logs compare kill stop revert rm-snapshot rm-checkpoint' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount ssh which history logs compare kill stop rm-snapshot rm-checkpoint limit bundle' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is clean; and __jroot_from 2' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is compare diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is revert; and __jroot_at 2' -a 'snapshot checkpoint'
+complete -c jroot -n '__jroot_is revert; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is revert; and __jroot_arg_is 2 snapshot; and __jroot_at 4' -a '(__jroot_snapshots (__jroot_arg 3))' -d snapshot
+complete -c jroot -n '__jroot_is revert; and __jroot_arg_is 2 checkpoint; and __jroot_at 4' -a '(__jroot_checkpoints (__jroot_arg 3))' -d checkpoint
 
 # init
 complete -c jroot -n '__jroot_is build; and __jroot_at 2' -a '--file= --tag= --build-arg= --no-cache' -F
@@ -9049,16 +9236,25 @@ complete -c jroot -n '__jroot_is init; and __jroot_from 3' -a '--name= --user=ro
 complete -c jroot -n '__jroot_is enter exec; and __jroot_from 3' -a --root
 complete -c jroot -n '__jroot_is config; and __jroot_from 3' -a '--show --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1'
 
-# file: 'cp'/'mv', then jail-aware paths. -F so ordinary host paths still work.
+# file and sync use jail-aware paths. -F keeps ordinary host paths available.
 complete -c jroot -n '__jroot_is file; and __jroot_at 2' -a 'cp mv'
 complete -c jroot -n '__jroot_is file; and __jroot_from 3' -a '(__jroot_file_arg)' -F
+complete -c jroot -n '__jroot_is sync; and __jroot_from 2' -a '(__jroot_file_arg)' -F
+complete -c jroot -n '__jroot_is sync; and __jroot_from 2' -a '--watch --delete --dry-run'
+
+# limits, archives, and compose
+complete -c jroot -n '__jroot_is limit; and __jroot_from 3' -a '--mem= --cpu= --nofile='
+complete -c jroot -n '__jroot_is bundle; and __jroot_at 3' -F
+complete -c jroot -n '__jroot_is deploy; and __jroot_at 2' -F
+complete -c jroot -n '__jroot_is compose; and __jroot_at 2' -a 'up down status'
+complete -c jroot -n '__jroot_is compose; and __jroot_at 3' -F
 
 # port / net / mnt
 complete -c jroot -n '__jroot_is port; and __jroot_at 3' -a 'list add rm'
 complete -c jroot -n '__jroot_is port; and __jroot_at 4; and __jroot_arg_is 3 rm' -a '(__jroot_cfg_list (__jroot_arg 2) ports)'
-complete -c jroot -n '__jroot_is net; and __jroot_at 2' -a set
-complete -c jroot -n '__jroot_is net; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
-complete -c jroot -n '__jroot_is net; and __jroot_at 4' -a 'auto off'
+complete -c jroot -n '__jroot_is net; and __jroot_at 2' -a 'set list (__jroot_jails)'
+complete -c jroot -n '__jroot_is net; and __jroot_arg_is 2 set; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is net; and __jroot_arg_is 2 set; and __jroot_at 4' -a 'auto off'
 complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 3' -a 'list set rm'
 complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 3' -a '(__jroot_cfg_list (__jroot_arg 2) labels)' -d 'mount label'
 complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 4; and __jroot_arg_is 3 set rm' -a '(__jroot_cfg_list (__jroot_arg 2) labels)' -d 'mount label'
@@ -9070,20 +9266,28 @@ complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 5' -a 'rw ro'
 complete -c jroot -n '__jroot_is ssh; and __jroot_at 3' -a 'start stop status passwd log'
 complete -c jroot -n '__jroot_is ssh; and __jroot_arg_is 3 start' -a '--password-stdin --random-password --ask-password --no-password --permit-root --port= --user= --key= --password='
 
-# snapshots and the rest
+# snapshots, checkpoints, and plugins
 complete -c jroot -n '__jroot_is checkpoint; and __jroot_at 2' -a diff -d 'Compare two checkpoints'
 complete -c jroot -n '__jroot_is checkpoint; and __jroot_arg_is 2 diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is checkpoint; and __jroot_arg_is 2 diff; and __jroot_at 4' -a '(__jroot_checkpoints (__jroot_arg 3))' -d checkpoint
 complete -c jroot -n '__jroot_is checkpoint; and __jroot_arg_is 2 diff; and __jroot_at 5' -a '(__jroot_checkpoints (__jroot_arg 3))' -d checkpoint
-complete -c jroot -n '__jroot_is revert rm-snapshot; and __jroot_at 3' -a '(__jroot_snapshots (__jroot_arg 2))' -d snapshot
+complete -c jroot -n '__jroot_is rm-snapshot; and __jroot_at 3' -a '(__jroot_snapshots (__jroot_arg 2))' -d snapshot
+complete -c jroot -n '__jroot_is rm-checkpoint; and __jroot_at 3' -a '(__jroot_checkpoints (__jroot_arg 2))' -d checkpoint
+complete -c jroot -n '__jroot_is plugin; and __jroot_at 2' -a 'list ls install add verify inspect remove rm uninstall logs service init-sdk sdk help --help -h'
+complete -c jroot -n '__jroot_is plugin; and __jroot_arg_is 2 install add; and __jroot_at 3' -F
+complete -c jroot -n '__jroot_is plugin; and __jroot_arg_is 2 verify; and __jroot_at 3' -a '(__jroot_plugins) all'
+complete -c jroot -n '__jroot_is plugin; and __jroot_arg_is 2 inspect remove rm uninstall logs; and __jroot_at 3' -a '(__jroot_plugins)' -d plugin
+complete -c jroot -n '__jroot_is plugin; and __jroot_arg_is 2 logs; and __jroot_at 4' -a --follow
+complete -c jroot -n '__jroot_is plugin; and __jroot_arg_is 2 service; and __jroot_at 3' -a 'start stop status'
+complete -c jroot -n '__jroot_is plugin; and __jroot_arg_is 2 service; and __jroot_at 4' -a '(__jroot_plugins)' -d plugin
 complete -c jroot -n '__jroot_is list ls' -a --json
 complete -c jroot -n '__jroot_is history logs' -a '--json --clear --limit='
 complete -c jroot -n '__jroot_is compare diff; and __jroot_from 4' -a --all
 complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
 complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
 complete -c jroot -n '__jroot_is doctor' -a '--fix --mute=7d --mute=forever --mute=off'
-complete -c jroot -n '__jroot_is completion; and __jroot_at 2' -a 'bash zsh fish'
-complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec shell install config file port net mnt ssh list info size history logs compare which doctor snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin'
+complete -c jroot -n '__jroot_is completion completions; and __jroot_at 2' -a 'bash zsh fish'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec shell install config file sync limit bundle deploy monitor compose port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
 complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
 FISH_COMPLETION_EOF
 }

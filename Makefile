@@ -361,6 +361,10 @@ test: check
 	@bash tests/sync.sh
 	@printf '$(CYAN)==>$(NC) tests/completion.sh\n'
 	@bash tests/completion.sh
+	@printf '$(CYAN)==>$(NC) tests/completion-audit.sh\n'
+	@bash tests/completion-audit.sh
+	@printf '$(CYAN)==>$(NC) tests/completion-shells.sh\n'
+	@bash tests/completion-shells.sh
 	@printf '$(CYAN)==>$(NC) tests/plugins.sh\n'
 	@bash tests/plugins.sh
 	@printf '$(CYAN)==>$(NC) tests/init.sh\n'
