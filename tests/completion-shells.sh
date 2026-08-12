@@ -46,6 +46,7 @@ end
 require_candidate '' sync
 require_candidate 'sync ' dev:
 require_candidate 'limit dev --' --mem=
+require_candidate 'bundle ' dev
 require_candidate 'compose ' status
 require_candidate 'checkpoint ' dev
 require_candidate 'checkpoint ' diff
