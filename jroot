@@ -100,6 +100,10 @@ H="$C_CYA"; G="$C_GRN"; B="$C_BLU"; D="$C_DIM"; N="$C_NC"
 # anything can clobber it: init/update/verify all call run_in_jail more than once
 # per run, and the later calls still need the real host home for /mnt/home.
 REAL_HOME="$HOME"
+# Kept separately from JROOT_HOME so an alternate runtime location can still
+# discover the SDK bundled beside a source checkout or launcher.
+JROOT_LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+JROOT_LAUNCHER_PATH="$JROOT_LAUNCHER_DIR/$(basename "${BASH_SOURCE[0]}")"
 JROOT_HOME="${JROOT_HOME:-$REAL_HOME/.jroot}"
 ROOTS_DIR="$JROOT_HOME/roots"
 CONFIGS_DIR="$JROOT_HOME/configs"
@@ -3377,11 +3381,20 @@ cmd_enter() {
     local enter_mode="shell"
     [ "${#cmd[@]}" -gt 0 ] && enter_mode="command"
     trigger_event_hooks "on_enter" "$name" "$enter_mode"
+    # Keep a PID record for both interactive shells and foreground commands.
+    # The record lets `jroot ps`, `monitor`, and `kill` operate on a real
+    # in-flight PRoot invocation; only remove a record still owned by us so a
+    # concurrently started command cannot have its newer PID file deleted.
+    local pidfile="$JROOT_HOME/pids/$name.pid" rc=0
+    mkdir -p "$JROOT_HOME/pids"
+    printf '%s\n' "$$" > "$pidfile" 2>/dev/null || true
     if [ "$force_root" = 1 ]; then
-        run_in_jail --root "$name" "${cmd[@]}"
+        run_in_jail --root "$name" "${cmd[@]}" || rc=$?
     else
-        run_in_jail "$name" "${cmd[@]}"
+        run_in_jail "$name" "${cmd[@]}" || rc=$?
     fi
+    [ "$(cat "$pidfile" 2>/dev/null || true)" = "$$" ] && rm -f "$pidfile"
+    return "$rc"
 }
 
 cmd_exec() {
@@ -3398,11 +3411,16 @@ cmd_exec() {
     [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
 
     trigger_event_hooks "on_enter" "$name" "command"
+    local pidfile="$JROOT_HOME/pids/$name.pid" rc=0
+    mkdir -p "$JROOT_HOME/pids"
+    printf '%s\n' "$$" > "$pidfile" 2>/dev/null || true
     if [ "$force_root" = 1 ]; then
-        run_in_jail --root "$name" "$@"
+        run_in_jail --root "$name" "$@" || rc=$?
     else
-        run_in_jail "$name" "$@"
+        run_in_jail "$name" "$@" || rc=$?
     fi
+    [ "$(cat "$pidfile" 2>/dev/null || true)" = "$$" ] && rm -f "$pidfile"
+    return "$rc"
 }
 
 file_usage() {
@@ -3662,6 +3680,19 @@ cmd_sync() {
     fi
 }
 
+# A host-side shim bind can leave an intentionally unreadable, zero-byte
+# mount-point file in a rootfs. It is not jail data and the launcher recreates
+# the bind when needed; excluding only this exact transient placeholder keeps
+# snapshots and bundles complete without masking unrelated archive errors.
+jail_archive_exclude_options() {
+    local name="$1" shim
+    JAIL_ARCHIVE_EXCLUDES=()
+    shim="$(jail_local_shim "$name")"
+    if [ -f "$shim" ] && [ ! -r "$shim" ] && [ ! -s "$shim" ]; then
+        JAIL_ARCHIVE_EXCLUDES+=("--exclude=$name/usr/local/lib/libjroot.so")
+    fi
+}
+
 bundle_usage() {
     printf '%bjroot bundle%b - package a jail into a portable archive\n\n' "$H" "$N"
     printf '    %bjroot bundle <name> <output.tar.gz>%b\n\n' "$G" "$N"
@@ -3676,7 +3707,8 @@ cmd_bundle() {
     [ -d "$rootfs" ] || err "Rootfs for '$name' is missing."
 
     log "Bundling jail '$name' into '$out'..."
-    tar -czf "$out" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+    jail_archive_exclude_options "$name"
+    tar -czf "$out" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
     log "Jail '$name' successfully bundled to '$out'."
     record_event "$name" bundle "bundled to $out"
 }
@@ -3743,7 +3775,7 @@ cmd_monitor() {
         printf '%b                        JROOT LIVE TELEMETRY                            %b\n' "$H" "$N"
         printf '%b========================================================================%b\n' "$H" "$N"
         printf '%-14s %-8s %-8s %-12s %-10s %s\n' "JAIL" "PID" "STATUS" "ROOTFS SIZE" "MEMORY" "COMMAND"
-        printf '%------------------------------------------------------------------------\n'
+        printf '%s\n' '------------------------------------------------------------------------'
 
         for cfg in "$CONFIGS_DIR"/*.json; do
             [ -f "$cfg" ] || continue
@@ -3787,64 +3819,201 @@ compose_usage() {
     printf '    %bjroot compose status [file]%b     Show status of compose stack\n' "$G" "$N"
 }
 
+compose_specs() {
+    local file="$1"
+    command -v python3 >/dev/null 2>&1 || err "python3 is required for compose parsing."
+    python3 - "$file" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+def _scalar(value):
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("["):
+        try:
+            parsed = json.loads(value)
+        except Exception as exc:
+            raise ValueError(f"invalid flow-style command list: {exc}")
+        if not isinstance(parsed, list):
+            raise ValueError("flow-style command must be a JSON list")
+        return parsed
+    if (value.startswith("\"") and value.endswith("\"")) or (value.startswith("'") and value.endswith("'")):
+        return value[1:-1]
+    return value
+
+def _simple_yaml(text):
+    # Dependency-free subset for the documented compose form. PyYAML, when
+    # available, still handles full YAML; this path accepts named jails plus
+    # image and command fields (strings, JSON-style lists, or block lists).
+    data = {"jails": {}}
+    current = None
+    command_list = None
+    saw_jails = False
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        if indent == 0:
+            if stripped != "jails:":
+                raise ValueError(f"line {number}: expected 'jails:'")
+            saw_jails = True
+            continue
+        if not saw_jails:
+            raise ValueError(f"line {number}: expected a top-level 'jails:' mapping")
+        if indent == 2 and stripped.endswith(":"):
+            current = stripped[:-1].strip()
+            if not current:
+                raise ValueError(f"line {number}: empty jail name")
+            data["jails"][current] = {}
+            command_list = None
+            continue
+        if current is None:
+            raise ValueError(f"line {number}: jail entry expected")
+        if indent >= 6 and command_list is not None and stripped.startswith("- "):
+            command_list.append(_scalar(stripped[2:]))
+            continue
+        if indent != 4 or ":" not in stripped:
+            raise ValueError(f"line {number}: expected an image or command field")
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key == "command" and not value:
+            command_list = []
+            data["jails"][current][key] = command_list
+        else:
+            data["jails"][current][key] = _scalar(value)
+            command_list = None
+    if not saw_jails:
+        raise ValueError("missing top-level 'jails:' mapping")
+    return data
+
+source = Path(sys.argv[1])
+try:
+    raw = source.read_text(encoding="utf-8")
+    try:
+        import yaml
+    except ImportError:
+        data = _simple_yaml(raw)
+    else:
+        data = yaml.safe_load(raw) or {}
+except Exception as exc:
+    print(f"Could not parse compose file: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+jails = data.get("jails")
+if not isinstance(jails, dict) or not jails:
+    print("Compose file must contain a non-empty 'jails:' mapping.", file=sys.stderr)
+    raise SystemExit(1)
+
+for name, config in jails.items():
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        print(f"Invalid jail name in compose file: {name!r}", file=sys.stderr)
+        raise SystemExit(1)
+    config = config or {}
+    if not isinstance(config, dict):
+        print(f"Jail {name!r} must map to an object.", file=sys.stderr)
+        raise SystemExit(1)
+    image = config.get("image", "ubuntu:22.04")
+    command = config.get("command", ["/bin/sh", "-c", "exec sleep infinity"])
+    if not isinstance(image, str) or not image:
+        print(f"Jail {name!r} has an invalid image.", file=sys.stderr)
+        raise SystemExit(1)
+    if isinstance(command, str):
+        command = ["/bin/sh", "-c", command]
+    if not isinstance(command, list) or not command or not all(isinstance(part, str) and part for part in command):
+        print(f"Jail {name!r} has an invalid command; use a string or a non-empty list of strings.", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"{name}\t{image}\t{json.dumps(command)}")
+PY
+}
+
+compose_read_command() {
+    local encoded="$1"
+    python3 - "$encoded" <<'PY'
+import json, sys
+try:
+    value = json.loads(sys.argv[1])
+except Exception as exc:
+    print(f"Invalid internal compose command: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+for item in value:
+    print(item)
+PY
+}
+
 cmd_compose() {
     local op="${1:-up}"
     local file="${2:-jroot-compose.yml}"
     [ -f "$file" ] || err "Compose file '$file' not found."
 
-    command -v python3 >/dev/null 2>&1 || err "python3 is required for compose parsing."
+    local specs
+    specs="$(compose_specs "$file")" || err "Could not read compose file '$file'."
 
     case "$op" in
         up)
             log "Parsing compose file '$file'..."
-            python3 -c "
-import json, yaml if __import__('importlib.util').find_spec('yaml') else None
-# Simple parser or pyyaml
-try:
-    import yaml
-    data = yaml.safe_load(open('$file'))
-except:
-    import json
-    # fallback or simple line parser
-    data = {}
-    print('Error: PyYAML not installed. Install with pip3 install pyyaml.')
-    exit(1)
-
-jails = data.get('jails', {})
-for name, cfg in jails.items():
-    image = cfg.get('image', 'ubuntu:22.04')
-    print(f'INIT:{name}:{image}')
-" | while read -r line; do
-                case "$line" in
-                    INIT:*)
-                        IFS=':' read -r _ jname jimg <<< "$line"
-                        if [ ! -f "$CONFIGS_DIR/$jname.json" ]; then
-                            log "Initializing compose jail '$jname' ($jimg)..."
-                            cmd_init "$jimg" --name="$jname" --noninteractive >/dev/null 2>&1 || cmd_init "$jimg" --noninteractive >/dev/null 2>&1 || true
-                        fi
-                        # Start enter in background or ssh
-                        log "Entering/starting jail '$jname'..."
-                        ;;
-                esac
-            done
-            log "Compose stack started."
+            local line jname jimg encoded pidfile pid
+            while IFS=$'\t' read -r jname jimg encoded; do
+                [ -n "$jname" ] || continue
+                if [ ! -f "$CONFIGS_DIR/$jname.json" ]; then
+                    log "Initializing compose jail '$jname' ($jimg)..."
+                    cmd_init "$jimg" --name="$jname" --user=root --build-essential=0 --mount-host=0 --mount-home=0 \
+                        || err "Failed to initialize compose jail '$jname'."
+                fi
+                pidfile="$JROOT_HOME/pids/$jname.pid"
+                if [ -f "$pidfile" ]; then
+                    pid="$(cat "$pidfile" 2>/dev/null || true)"
+                    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                        log "Compose jail '$jname' is already running (PID $pid)."
+                        continue
+                    fi
+                    rm -f "$pidfile"
+                fi
+                local -a command=()
+                mapfile -t command < <(compose_read_command "$encoded") || err "Invalid command for compose jail '$jname'."
+                log "Starting compose jail '$jname': ${command[*]}"
+                bash "$0" enter "$jname" "${command[@]}" > "$JROOT_HOME/pids/$jname.compose.log" 2>&1 &
+                pid=$!
+                sleep 0.2
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    tail -n 20 "$JROOT_HOME/pids/$jname.compose.log" >&2 || true
+                    err "Compose jail '$jname' exited during startup."
+                fi
+            done <<< "$specs"
+            log "Compose stack started. Run 'jroot compose status $file' to inspect it."
             ;;
         down)
             log "Stopping compose stack from '$file'..."
-            python3 -c "
-import yaml
-data = yaml.safe_load(open('$file'))
-for name in data.get('jails', {}):
-    print(name)
-" | while read -r jname; do
+            local line jname jimg encoded
+            while IFS=$'\t' read -r jname jimg encoded; do
                 [ -n "$jname" ] || continue
-                log "Killing jail '$jname'..."
-                cmd_kill "$jname" 2>/dev/null || true
-            done
+                if [ -f "$JROOT_HOME/pids/$jname.pid" ]; then
+                    log "Killing compose jail '$jname'..."
+                    cmd_kill "$jname" --force || true
+                else
+                    log "Compose jail '$jname' is already stopped."
+                fi
+            done <<< "$specs"
             log "Compose stack stopped."
             ;;
         status)
-            cmd_monitor
+            printf '%-18s %-10s %s\n' "JAIL" "STATUS" "PID"
+            local line jname jimg encoded pid
+            while IFS=$'\t' read -r jname jimg encoded; do
+                [ -n "$jname" ] || continue
+                pid="$(cat "$JROOT_HOME/pids/$jname.pid" 2>/dev/null || true)"
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                    printf '%-18s %-10s %s\n' "$jname" "RUNNING" "$pid"
+                else
+                    rm -f "$JROOT_HOME/pids/$jname.pid" 2>/dev/null || true
+                    printf '%-18s %-10s %s\n' "$jname" "STOPPED" "-"
+                fi
+            done <<< "$specs"
             ;;
         *)
             compose_usage
@@ -4223,6 +4392,30 @@ plugin_data_dir() { printf '%s\n' "$JROOT_HOME/plugins/data"; }
 plugin_status_dir() { printf '%s\n' "$JROOT_HOME/plugins/status"; }
 plugin_sdk_dir() { printf '%s\n' "$JROOT_HOME/sdk"; }
 
+# The installer places the SDK under JROOT_HOME.  Alternate JROOT_HOME values
+# are useful for portable installs, CI, and isolated test environments, so
+# provision or refresh that copy lazily from a known local source.
+plugin_provision_sdk() {
+    local destination candidate
+    destination="$(plugin_sdk_dir)/jroot_sdk.py"
+
+    for candidate in "${JROOT_SDK_SOURCE:-}" \
+                     "$JROOT_LAUNCHER_DIR/jroot_sdk.py" \
+                     "$REAL_HOME/.jroot/sdk/jroot_sdk.py"; do
+        [ -n "$candidate" ] && [ -f "$candidate" ] || continue
+        if [ ! -s "$destination" ] || [ "$candidate" -nt "$destination" ]; then
+            mkdir -p "$(plugin_sdk_dir)" 2>/dev/null || return 1
+            cp "$candidate" "$destination" 2>/dev/null || return 1
+            chmod 644 "$destination" 2>/dev/null || true
+        fi
+        return 0
+    done
+
+    [ -s "$destination" ] && return 0
+    warn "Plugin SDK is unavailable. Re-run the jroot installer or set JROOT_SDK_SOURCE to jroot_sdk.py."
+    return 1
+}
+
 plugin_ensure_dirs() {
     mkdir -p "$(plugin_root)" "$(plugin_log_dir)" "$(plugin_data_dir)" \
              "$(plugin_status_dir)" "$JROOT_HOME/pids" 2>/dev/null || true
@@ -4365,7 +4558,13 @@ plugin_find_target() {
 plugin_prepare_environment() {
     local name="$1"
     plugin_ensure_dirs
+    plugin_provision_sdk || return 1
     export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
+    # SDK subprocess helpers must call this same launcher and runtime, rather
+    # than an older jroot that happens to be first on PATH. Use Bash explicitly:
+    # source checkouts are often not executable, while installed copies are.
+    printf -v JROOT_COMMAND 'bash %q' "$JROOT_LAUNCHER_PATH"
+    export JROOT_COMMAND
     export JROOT_PLUGIN_API="$PLUGIN_API_VERSION" JROOT_PLUGIN_NAME="$name"
     export JROOT_PLUGIN_DATA="$(plugin_data_dir)/$name"
     export JROOT_PLUGIN_LOG="$(plugin_log_dir)/$name.log"
@@ -4401,7 +4600,10 @@ plugin_dispatch() {
         return 0
     fi
     local log_file="$(plugin_log_dir)/$name.log" rc=0
-    plugin_prepare_environment "$name"
+    if ! plugin_prepare_environment "$name"; then
+        plugin_write_status "$name" "$event" "failed" 1 "$log_file"
+        return 1
+    fi
     export JROOT_PLUGIN_EVENT="$event"
     {
         printf '\n[%s] event=%s plugin=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$name"
@@ -4458,7 +4660,7 @@ plugin_service_start() {
         fi
         rm -f "$pid_file"
     fi
-    plugin_prepare_environment "$name"
+    plugin_prepare_environment "$name" || err "Unable to prepare the plugin SDK for '$name'."
     export JROOT_PLUGIN_EVENT="$hook"
     {
         printf '\n[%s] service-start event=%s plugin=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$hook" "$name"
@@ -6832,7 +7034,8 @@ cmd_snapshot() {
     tmp="$(mktemp "$dir/.snap.XXXXXX")"
     rm -f "$tmp"
     log "Snapshotting '$name' as '$label'..."
-    if tar -czf "$tmp.tar.gz" -C "$ROOTS_DIR" "$name" 2>/dev/null; then
+    jail_archive_exclude_options "$name"
+    if tar -czf "$tmp.tar.gz" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$ROOTS_DIR" "$name" 2>/dev/null; then
         mv "$tmp.tar.gz" "$dir/$label.tar.gz"
         cp "$CONFIGS_DIR/$name.json" "$dir/$label.json"
         log "Snapshot saved: $dir/$label.tar.gz"

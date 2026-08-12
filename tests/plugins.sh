@@ -15,8 +15,9 @@ ok() { printf '  ok    %s\n' "$*"; }
 
 rm -rf "$WORK"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$PLUGIN" "$HOME_DIR/sdk" "$HOME_DIR/configs" "$HOME_DIR/roots/sample-jail"
-cp "$ROOT/jroot_sdk.py" "$HOME_DIR/sdk/jroot_sdk.py"
+mkdir -p "$PLUGIN" "$HOME_DIR/configs" "$HOME_DIR/roots/sample-jail"
+# Exercise lazy SDK provisioning rather than pre-seeding the isolated runtime.
+export JROOT_SDK_SOURCE="$ROOT/jroot_sdk.py"
 printf '%s\n' '{"name":"sample-jail","image":"ubuntu:22.04","user":"root"}' > "$HOME_DIR/configs/sample-jail.json"
 
 cat > "$PLUGIN/plugin.json" <<'JSON'
@@ -77,6 +78,7 @@ JROOT_HOME="$HOME_DIR" bash -c '
 ' _ "$LIB" || fail "lifecycle hook dispatcher"
 
 STATE="$HOME_DIR/plugins/data/example-plugin/events.json"
+[ -s "$HOME_DIR/sdk/jroot_sdk.py" ] || fail "automatic SDK provisioning"
 python3 - "$STATE" <<'PY' || fail "lifecycle event state"
 import json, sys
 expected = {"on_init", "on_enter", "on_stop", "on_remove", "on_sync", "on_snapshot", "on_limit"}
@@ -84,7 +86,7 @@ with open(sys.argv[1], encoding="utf-8") as f:
     observed = {entry["event"] for entry in json.load(f)}
 raise SystemExit(0 if expected <= observed else 1)
 PY
-ok "all documented lifecycle hooks dispatch"
+ok "all documented lifecycle hooks dispatch with automatic SDK provisioning"
 
 JROOT_HOME="$HOME_DIR" bash "$SCRIPT" plugin service start example-plugin on_monitor sample-jail >/dev/null || fail "service startup"
 STATUS_OUTPUT="$(JROOT_HOME="$HOME_DIR" bash "$SCRIPT" plugin service status example-plugin)"

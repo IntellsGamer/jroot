@@ -3,6 +3,7 @@ import os
 import json
 import glob
 import subprocess
+import shlex
 from datetime import datetime
 from pathlib import Path
 
@@ -62,11 +63,18 @@ class JRootContext:
         cfg["rootfs_path"] = os.path.join(self.roots_dir, name)
         return cfg
 
+    def _jroot_command(self):
+        """Return the configured JRoot launcher as an argv prefix, without a shell."""
+        configured = os.environ.get("JROOT_COMMAND", "jroot")
+        command = shlex.split(configured)
+        if not command:
+            raise RuntimeError("JROOT_COMMAND must not be empty")
+        return command
+
     def run_in_jail(self, jail_name, command):
         """Execute a shell command in a jail and return (exit_code, stdout, stderr)."""
-        jroot_command = os.environ.get("JROOT_COMMAND", "jroot")
         res = subprocess.run(
-            [jroot_command, "exec", jail_name, "/bin/sh", "-c", command],
+            [*self._jroot_command(), "exec", jail_name, "/bin/sh", "-c", command],
             capture_output=True, text=True, check=False,
         )
         return res.returncode, res.stdout, res.stderr
@@ -78,8 +86,7 @@ class JRootContext:
         PRoot does not expose a kernel-enforced aggregate to this SDK.
         """
         try:
-            jroot_command = os.environ.get("JROOT_COMMAND", "jroot")
-            res = subprocess.run([jroot_command, "ps", "--json"], capture_output=True, text=True, check=False)
+            res = subprocess.run([*self._jroot_command(), "ps", "--json"], capture_output=True, text=True, check=False)
             if res.returncode != 0:
                 raise RuntimeError(res.stderr.strip() or "jroot ps --json failed")
             processes = json.loads(res.stdout)
