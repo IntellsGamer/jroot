@@ -21,6 +21,7 @@
 #   jroot info [name]           Show a jail's details and rootfs size
 #   jroot size [name]           Show disk usage per jail
 #   jroot history [name]        What was done to a jail, and when
+#   jroot logs [name]           Alias for a jail's history/events
 #   jroot compare <a> <b>       Diff two jails (config + package lists)
 #   jroot which [jail] <prog>   Find a program across jails
 #   jroot update [name]         Update runtime + jail packages (all if no name)
@@ -7884,6 +7885,12 @@ cmd_help_cmd() {
             printf '    %bjroot history <name> --clear%b\n' "$G" "$N"
             printf '\n    Records creation, installs, updates, snapshots, reverts, config\n'
             printf '    changes, renames and cleans. Logs live in %b~/.jroot/history%b.\n' "$G" "$N"
+            printf '    %bjroot logs%b is an exact alias for this command.\n' "$G" "$N"
+            ;;
+        logs)
+            printf '%bjroot logs%b - alias for a jail event history\n\n' "$H" "$N"
+            printf '    %bjroot logs [name] [--limit=N] [--json] [--clear]%b\n' "$G" "$N"
+            printf '\n    This command delegates directly to %bjroot history%b and accepts the same flags.\n' "$G" "$N"
             ;;
         compare|diff)
             printf '%bjroot compare%b - config and package differences between two jails\n\n' "$H" "$N"
@@ -8033,6 +8040,7 @@ cmd_help() {
     help_row "jroot info" "[name]"                 "Show a jail's details and disk usage"
     help_row "jroot size" "[name]"                 "Show disk usage per jail"
     help_row "jroot history" "[name]"              "Show what was done to a jail, and when"
+    help_row "jroot logs" "[name]"                 "Alias for a jail's event history"
     help_row "jroot compare" "<jailA> <jailB>"     "Diff two jails (config + packages)"
     help_row "jroot which" "[jail] <program>"      "Find a program across jails"
     printf '\n'
@@ -8269,7 +8277,7 @@ _jroot() {
     COMPREPLY=()
 
     local cmds="init build enter exec shell install config file port net mnt ssh list info
-	size history compare which doctor snapshot snapshots checkpoint checkpoints revert
+	size history logs compare which doctor snapshot snapshots checkpoint checkpoints revert
 	rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin"
 
     if [ "$idx" -le 1 ]; then
@@ -8404,7 +8412,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
         list|ls)
             COMPREPLY=($(compgen -W "--json" -- "$cur"))
             ;;
-        history)
+        history|logs)
             if [ "$idx" -eq 2 ]; then
                 COMPREPLY=($(compgen -W "$jails --json --limit= --clear" -- "$cur"))
             else
@@ -8557,6 +8565,7 @@ _jroot() {
         'info:show jail details'
         'size:show disk usage per jail'
         'history:what was done to a jail, and when'
+        'logs:alias for jail event history'
         'compare:diff two jails'
         'which:find a program across jails'
         'doctor:check the installation'
@@ -8689,7 +8698,7 @@ _jroot() {
             esac
             ;;
         list|ls)      compadd -- --json ;;
-        history)
+        history|logs)
             (( pos == 2 )) && _jroot_jails
             compadd -- --json --clear
             compadd -S '' -- --limit=
@@ -8865,6 +8874,7 @@ complete -c jroot -n '__jroot_at 1' -a list        -d 'List all jails'
 complete -c jroot -n '__jroot_at 1' -a info        -d 'Show jail details'
 complete -c jroot -n '__jroot_at 1' -a size        -d 'Show disk usage per jail'
 complete -c jroot -n '__jroot_at 1' -a history     -d 'What was done to a jail'
+complete -c jroot -n '__jroot_at 1' -a logs        -d 'Alias for jail event history'
 complete -c jroot -n '__jroot_at 1' -a compare     -d 'Diff two jails'
 complete -c jroot -n '__jroot_at 1' -a which       -d 'Find a program across jails'
 complete -c jroot -n '__jroot_at 1' -a doctor      -d 'Check the installation'
@@ -8884,7 +8894,7 @@ complete -c jroot -n '__jroot_at 1' -a help        -d 'Show help'
 # A jail name as the first argument. One long line per rule on purpose: fish
 # splits an -a list on whitespace and a backslash inside single quotes stays a
 # literal backslash, so there is no safe way to wrap these.
-complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount ssh which history compare kill stop revert rm-snapshot rm-checkpoint' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount ssh which history logs compare kill stop revert rm-snapshot rm-checkpoint' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is clean; and __jroot_from 2' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is compare diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
 
@@ -8922,13 +8932,13 @@ complete -c jroot -n '__jroot_is ssh; and __jroot_arg_is 3 start' -a '--password
 # snapshots and the rest
 complete -c jroot -n '__jroot_is revert rm-snapshot; and __jroot_at 3' -a '(__jroot_snapshots (__jroot_arg 2))' -d snapshot
 complete -c jroot -n '__jroot_is list ls' -a --json
-complete -c jroot -n '__jroot_is history' -a '--json --clear --limit='
+complete -c jroot -n '__jroot_is history logs' -a '--json --clear --limit='
 complete -c jroot -n '__jroot_is compare diff; and __jroot_from 4' -a --all
 complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
 complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
 complete -c jroot -n '__jroot_is doctor' -a '--fix --mute=7d --mute=forever --mute=off'
 complete -c jroot -n '__jroot_is completion; and __jroot_at 2' -a 'bash zsh fish'
-complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec shell install config file port net mnt ssh list info size history compare which doctor snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec shell install config file port net mnt ssh list info size history logs compare which doctor snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin'
 complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
 FISH_COMPLETION_EOF
 }
@@ -8956,7 +8966,7 @@ jroot_cmd() {
         config)        shift; cmd_config "$@" ;;
         list|ls)       shift; cmd_list "$@" ;;
         info)          shift; cmd_info "$@" ;;
-        history)       shift; cmd_history "$@" ;;
+        history|logs)  shift; cmd_history "$@" ;;
         compare|diff)  shift; cmd_compare "$@" ;;
         which)         shift; cmd_which "$@" ;;
         size)          shift; cmd_size "$@" ;;

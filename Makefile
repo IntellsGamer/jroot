@@ -371,6 +371,8 @@ test: check
 	@bash tests/maintenance.sh
 	@printf '$(CYAN)==>$(NC) tests/checkpoint.sh\n'
 	@bash tests/checkpoint.sh
+	@printf '$(CYAN)==>$(NC) tests/logs.sh\n'
+	@bash tests/logs.sh
 	@printf '$(GRN)==> test passed$(NC)\n'
 
 # -----------------------------------------------------------------------------

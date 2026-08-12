@@ -1128,7 +1128,10 @@ jroot history                  # every jail, oldest first, with a JAIL column
 jroot history dev --limit=20   # only the last 20 events
 jroot history dev --json       # machine-readable
 jroot history dev --clear      # forget this jail's history
+jroot logs dev                 # exact alias for: jroot history dev
 ```
+
+`jroot logs` is provided for the operational wording many users expect; it reads the same event records as `jroot history` and accepts the same `--limit`, `--json`, and `--clear` flags.
 
 A rename carries the log over, and deleting a jail deletes its log with it.
 
@@ -1354,6 +1357,7 @@ INSPECTION
   jroot info [name]                Show jail details
   jroot size [name]                Show disk usage per jail
   jroot history [name]             What was done to a jail, and when
+  jroot logs [name]                Alias for a jail's event history
   jroot compare <jailA> <jailB>    Diff two jails (config + packages)
   jroot which [jail] <program>     Find a program across jails
   jroot doctor [--fix]             Diagnose JRoot and repair safe faults
