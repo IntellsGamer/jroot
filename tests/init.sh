@@ -97,6 +97,30 @@ if (cmd_deploy "$bundle" diff) >/dev/null 2>&1; then
     exit 1
 fi
 [ ! -e "$CONFIGS_DIR/diff.json" ]
+
+# The first bootstrap command runs before build-essential/build-base exists in a
+# fresh jail. Shim resolution must therefore wait until bootstrap has completed,
+# rather than caching a false no-gcc result and warning the user.
+unset JROOT_SKIP_BOOTSTRAP
+shim_order=""
+bootstrap() {
+    [ "${JROOT_SHIM_DEFER:-0}" = "1" ] || {
+        printf 'bootstrap ran without shim deferral\n' >&2
+        return 1
+    }
+    shim_order="${shim_order}bootstrap "
+    return 0
+}
+resolve_jail_shim() {
+    [ "${JROOT_SHIM_DEFER:-0}" != "1" ] || {
+        printf 'shim resolved before bootstrap completed\n' >&2
+        return 1
+    }
+    shim_order="${shim_order}resolve "
+    SHIM_MODE="local"
+}
+cmd_init alpine:3.22 --name=timed-alpine --user=root --build-essential=1 --mount-host=0 --mount-home=0 >/dev/null
+[ "$shim_order" = "bootstrap resolve " ]
 BASH
 
 printf 'all init dispatch checks passed\n'

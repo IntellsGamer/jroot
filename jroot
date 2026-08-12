@@ -3009,7 +3009,7 @@ run_in_jail() {
     # proot itself never see it). Which copy of the shim to use depends on the
     # jail's libc - see resolve_jail_shim. JROOT_SHIM_OFF=1 skips it entirely.
     local shim_mode=""
-    if [ -z "${JROOT_SHIM_OFF:-}" ] && [ "${SHIM_RESOLVING:-0}" != "1" ]; then
+    if [ -z "${JROOT_SHIM_OFF:-}" ] && [ "${SHIM_RESOLVING:-0}" != "1" ] && [ "${JROOT_SHIM_DEFER:-0}" != "1" ]; then
         resolve_jail_shim "$name"
         shim_mode="$SHIM_MODE"
     fi
@@ -3458,7 +3458,13 @@ cmd_init() {
         warn "Skipping bootstrap (env JROOT_SKIP_APT/JROOT_SKIP_BOOTSTRAP)."
         bootstrapped=0
         record_event "$name" "bootstrap" "skipped by env"
-    elif bootstrap "$name" "$distro" "$version"; then
+    elif JROOT_SHIM_DEFER=1 bootstrap "$name" "$distro" "$version"; then
+        # Alpine/musl and older glibc jails may need their own shim. During the
+        # initial package install gcc does not exist yet, so resolving there
+        # would cache a false "none" result and emit a misleading warning.
+        if [ -z "${JROOT_SHIM_OFF:-}" ]; then
+            JROOT_SHIM_DEFER=0 resolve_jail_shim "$name"
+        fi
         log "Core packages installed."
         record_event "$name" "bootstrap" "core packages installed"
     else
