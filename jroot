@@ -4178,6 +4178,107 @@ PY
     record_event "$name" limit "updated resource limits"
 }
 
+
+plugin_usage() {
+    printf '%bjroot plugin%b - manage and run community/custom extensions\n\n' "$H" "$N"
+    printf '    %bjroot plugin list%b                  list installed plugins\n' "$G" "$N"
+    printf '    %bjroot plugin install <path|url>%b    install a plugin script into ~/.jroot/plugins/\n' "$G" "$N"
+    printf '    %bjroot plugin remove <name>%b         uninstall a plugin\n' "$G" "$N"
+    printf '    %bjroot <plugin-name> [args...]%b      run an installed plugin directly\n\n' "$G" "$N"
+    printf '    %bEnvironment exposed to plugins:%b\n' "$H" "$N"
+    printf '        JROOT_HOME          path to ~/.jroot storage\n'
+    printf '        JROOT_ROOTS         path to ~/.jroot/roots\n'
+    printf '        JROOT_CONFIGS       path to ~/.jroot/configs\n'
+    printf '        JROOT_BIN           path to ~/.jroot/bin\n'
+}
+
+
+is_reserved_command() {
+    local cmd="$1"
+    case "$cmd" in
+        init|enter|exec|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|install|config|list|ls|info|size|history|compare|diff|which|doctor|snapshot|snapshots|revert|rm-snapshot|update|clean|rename|kill|stop|ps|ssh|completion|completions|help|plugin)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+cmd_plugin() {
+    local op="${1:-list}"; shift || true
+    local plugins_dir="$JROOT_HOME/plugins"
+    mkdir -p "$plugins_dir" 2>/dev/null || true
+
+    case "$op" in
+        list|ls)
+            local p found=0
+            printf '%-20s %s\n' "PLUGIN" "PATH"
+            for p in "$plugins_dir"/*; do
+                [ -f "$p" ] || continue
+                found=1
+                printf '%-20s %s\n' "$(basename "$p" | sed 's/\.[^.]*$//')" "$p"
+            done
+            [ "$found" = 1 ] || log "No plugins installed in $plugins_dir. Install one with: jroot plugin install <path>"
+            ;;
+        install|add)
+            [ $# -eq 1 ] || err "Usage: jroot plugin install <path-to-script>"
+            local src="$1" name
+            [ -f "$src" ] || err "Plugin script not found: '$src'"
+            name="$(basename "$src" | sed 's/\.[^.]*$//')"
+            if is_reserved_command "$name"; then
+                err "Plugin name '$name' is a reserved built-in jroot subcommand and cannot be shadowed."
+            fi
+            local ext="${src##*.}"
+            [ "$ext" = "$src" ] && ext="sh"
+            cp "$src" "$plugins_dir/$name.$ext"
+            chmod +x "$plugins_dir/$name.$ext"
+            name="$name.$ext"
+            chmod +x "$plugins_dir/$name"
+            log "Plugin '$name' successfully installed to $plugins_dir/$name."
+            ;;
+        remove|rm|uninstall)
+            [ $# -eq 1 ] || err "Usage: jroot plugin remove <name>"
+            local name="$1" target
+            for target in "$plugins_dir/$name" "$plugins_dir/$name.sh" "$plugins_dir/$name.py"; do
+                if [ -f "$target" ]; then
+                    rm -f "$target"
+                    log "Plugin '$name' removed."
+                    return 0
+                fi
+            done
+            err "Plugin '$name' not found."
+            ;;
+        -h|--help|help)
+            plugin_usage
+            ;;
+        *)
+            err "Unknown plugin operation '$op'. Try 'jroot plugin --help'."
+            ;;
+    esac
+}
+
+run_plugin() {
+    local name="$1"; shift
+    local plugins_dir="$JROOT_HOME/plugins"
+    local target="" p
+    for p in "$plugins_dir/$name" "$plugins_dir/$name.sh" "$plugins_dir/$name.py" "$plugins_dir/$name"* ; do
+        if [ -f "$p" ]; then
+            target="$p"
+            break
+        fi
+    done
+    [ -n "$target" ] || return 1
+
+    export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
+    if [[ "$target" == *.py ]]; then
+        exec python3 "$target" "$@"
+    else
+        exec bash "$target" "$@"
+    fi
+}
+
+
 cmd_size() {
     [ $# -le 1 ] || err "Usage: jroot size [name]"
     local name="${1:-}"
@@ -6539,7 +6640,7 @@ cmd_help_cmd() {
             printf '    %bjroot help%b            (all commands)\n' "$G" "$N"
             printf '    %bjroot help <command>%b   (one command, e.g. %bjroot help file cp%b)\n' "$G" "$N"
             ;;
-        *)  err "Unknown command: $cmd (try '${CMD_HINT}help')" ;;
+                *)             if run_plugin "$1" "$@"; then exit 0; else err "Unknown command: $1 (run '${CMD_HINT}help')"; fi ;;
     esac
 }
 
@@ -6600,6 +6701,7 @@ cmd_help() {
     help_row "jroot ps" ""              "List running jails"
     help_row "jroot ssh" "<name> start|stop|status" "SSH access into a jail (persistent daemon)"
     help_row "jroot completion" "bash|zsh|fish" "Print a shell completion script"
+    help_row "jroot plugin" "[list|install|rm]"  "Manage and execute plugins"
     help_row "jroot help" "[command]"     "Show help (for one command too)"
     printf '\n'
 
@@ -6812,7 +6914,7 @@ _jroot() {
 
     local cmds="init enter exec shell install config file port net mnt ssh list info
 size history compare which doctor snapshot snapshots revert rm-snapshot update
-clean rename kill ps rm completion help"
+clean rename kill ps rm completion help plugin"
 
     if [ "$idx" -le 1 ]; then
         COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
@@ -7410,7 +7512,7 @@ complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
 complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
 complete -c jroot -n '__jroot_is doctor' -a '--mute=7d --mute=forever --mute=off'
 complete -c jroot -n '__jroot_is completion; and __jroot_at 2' -a 'bash zsh fish'
-complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init enter exec shell install config file port net mnt ssh list info size history compare which doctor snapshot snapshots revert rm-snapshot update clean rename kill ps rm completion help'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init enter exec shell install config file port net mnt ssh list info size history compare which doctor snapshot snapshots revert rm-snapshot update clean rename kill ps rm completion help plugin'
 complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
 FISH_COMPLETION_EOF
 }
@@ -7454,8 +7556,15 @@ jroot_cmd() {
         ps)            shift; cmd_ps "$@" ;;
         ssh)           shift; cmd_ssh "$@" ;;
         completion|completions) shift; cmd_completion "$@" ;;
+        plugin)        shift; cmd_plugin "$@" ;;
         help|--help|-h) shift; cmd_help "$@" ;;
-        *)             err "Unknown command: $1 (run '${CMD_HINT}help')" ;;
+        *)
+            if run_plugin "$1" "$@"; then
+                exit 0
+            else
+                err "Unknown command: $1 (run '${CMD_HINT}help')"
+            fi
+            ;;
     esac
 }
 
