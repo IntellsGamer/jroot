@@ -365,6 +365,12 @@ test: check
 	@bash tests/plugins.sh
 	@printf '$(CYAN)==>$(NC) tests/init.sh\n'
 	@bash tests/init.sh
+	@printf '$(CYAN)==>$(NC) tests/build.sh\n'
+	@bash tests/build.sh
+	@printf '$(CYAN)==>$(NC) tests/maintenance.sh\n'
+	@bash tests/maintenance.sh
+	@printf '$(CYAN)==>$(NC) tests/checkpoint.sh\n'
+	@bash tests/checkpoint.sh
 	@printf '$(GRN)==> test passed$(NC)\n'
 
 # -----------------------------------------------------------------------------

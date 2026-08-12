@@ -32,7 +32,7 @@ KNOWN_HOOKS = {
     "on_limit",
 }
 RESERVED_COMMANDS = {
-    "init", "enter", "exec", "shell", "install", "file", "sync", "limit",
+    "init", "build", "enter", "exec", "shell", "install", "file", "sync", "limit",
     "bundle", "deploy", "monitor", "compose", "port", "net", "mnt", "mount",
     "config", "list", "ls", "info", "history", "compare", "diff", "which",
     "size", "update", "clean", "snapshot", "snapshots", "checkpoint", "checkpoints",

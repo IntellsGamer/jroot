@@ -3348,6 +3348,394 @@ cmd_init() {
     warn ""
 }
 
+# ---------------------------------------------------------------------------
+# JRootfile builds
+# ---------------------------------------------------------------------------
+build_usage() {
+    printf '%bjroot build%b - build a jail from a Dockerfile-like JRootfile\n\n' "$H" "$N"
+    printf '    %bjroot build%b [options] <context>\n\n' "$G" "$N"
+    printf '    %b-f, --file <path>%b         JRootfile path (default: <context>/JRootfile)\n' "$G" "$N"
+    printf '    %b-t, --tag <name>%b          Name for the resulting jail\n' "$G" "$N"
+    printf '    %b--build-arg NAME=VALUE%b    Set an ARG used by the JRootfile (repeatable)\n' "$G" "$N"
+    printf '    %b--no-cache%b                Accepted for Docker-style scripts; builds are uncached\n\n' "$G" "$N"
+    printf '    The context is the only source tree available to COPY and local ADD.\n'
+    printf '    Read docs/JROOTFILE.md for the supported instruction reference.\n'
+}
+
+build_trim() {
+    BUILD_TRIMMED="$1"
+    BUILD_TRIMMED="${BUILD_TRIMMED%$'\r'}"
+    BUILD_TRIMMED="${BUILD_TRIMMED#"${BUILD_TRIMMED%%[![:space:]]*}"}"
+    BUILD_TRIMMED="${BUILD_TRIMMED%"${BUILD_TRIMMED##*[![:space:]]}"}"
+}
+
+build_metadata_set() {
+    local name="$1" key="$2" value="$3" path="$JROOT_HOME/builds/$1.json"
+    mkdir -p "$JROOT_HOME/builds"
+    python3 - "$path" "$key" "$value" <<'PY'
+import json, sys
+from pathlib import Path
+path, key, value = sys.argv[1:]
+p = Path(path)
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+data[key] = value
+p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+build_metadata_label() {
+    local name="$1" label="$2" value="$3" path="$JROOT_HOME/builds/$1.json"
+    mkdir -p "$JROOT_HOME/builds"
+    python3 - "$path" "$label" "$value" <<'PY'
+import json, sys
+from pathlib import Path
+path, label, value = sys.argv[1:]
+p = Path(path)
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+labels = data.setdefault("labels", {})
+if not isinstance(labels, dict):
+    labels = data["labels"] = {}
+labels[label] = value
+p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+build_metadata_append() {
+    local name="$1" key="$2" value="$3" path="$JROOT_HOME/builds/$1.json"
+    mkdir -p "$JROOT_HOME/builds"
+    python3 - "$path" "$key" "$value" <<'PY'
+import json, sys
+from pathlib import Path
+path, key, value = sys.argv[1:]
+p = Path(path)
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+items = data.setdefault(key, [])
+if not isinstance(items, list):
+    items = data[key] = []
+if value not in items:
+    items.append(value)
+p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+build_metadata_get() {
+    local name="$1" key="$2" path="$JROOT_HOME/builds/$1.json"
+    [ -f "$path" ] || return 1
+    python3 - "$path" "$key" <<'PY'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], "")
+except Exception:
+    value = ""
+print(value if isinstance(value, str) else "")
+PY
+}
+
+build_expand_args() {
+    local text="$1" key
+    for key in "${!BUILD_ARGS[@]}"; do
+        text="${text//\$\{$key\}/${BUILD_ARGS[$key]}}"
+        text="${text//\$$key/${BUILD_ARGS[$key]}}"
+    done
+    printf '%s' "$text"
+}
+
+build_context_source() {
+    local context="$1" source="$2" candidate
+    case "$source" in
+        /*|../*|*/../*|..)
+            return 1 ;;
+    esac
+    candidate="$(realpath -m "$context/$source" 2>/dev/null)" || return 1
+    case "$candidate" in
+        "$context"|"$context"/*) [ -e "$candidate" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+build_destination_path() {
+    local rootfs="$1" workdir="$2" destination="$3" target
+    if [[ "$destination" = /* ]]; then
+        target="$destination"
+    else
+        target="$workdir/$destination"
+    fi
+    target="$(realpath -m "/$target" 2>/dev/null)" || return 1
+    case "$target" in /../*|/..) return 1 ;; esac
+    BUILD_DESTINATION="$rootfs$target"
+}
+
+build_run_instruction() {
+    local name="$1" run_user="$2" shell_path="$3" shell_flag="$4" workdir="$5" command="$6" q_workdir
+    printf -v q_workdir '%q' "$workdir"
+    command="mkdir -p $q_workdir && cd $q_workdir && $command"
+    if [ "$run_user" = "root" ]; then
+        run_in_jail --root "$name" "$shell_path" "$shell_flag" "$command"
+    else
+        run_in_jail "$name" "$shell_path" "$shell_flag" "$command"
+    fi
+}
+
+build_prepare_user() {
+    local name="$1" distro="$2" requested="$3" cfg="$CONFIGS_DIR/$name.json"
+    case "$requested" in
+        root)
+            set_config_field "$cfg" user root || return 1
+            ;;
+        jail)
+            if [ ! -d "$ROOTS_DIR/$name/home/jail" ]; then
+                if [ "$distro" = "ubuntu" ]; then
+                    setup_unroot_user "$name"
+                else
+                    setup_unroot_alpine "$name"
+                fi
+            fi
+            set_config_field "$cfg" user unroot || return 1
+            ;;
+        *)
+            warn "JRootfile USER supports 'root' and JRoot's built-in unprivileged user 'jail'; got '$requested'."
+            return 1
+            ;;
+    esac
+}
+
+build_copy_instruction() {
+    local kind="$1" context="$2" name="$3" workdir="$4" body="$5"
+    local -a words sources=() expanded=()
+    local destination source rootfs="$ROOTS_DIR/$name" temp="" source_path
+    read -r -a words <<< "$body"
+    [ "${#words[@]}" -ge 2 ] || { warn "$kind requires at least one source and a destination."; return 1; }
+    destination="${words[${#words[@]}-1]}"
+    unset 'words[${#words[@]}-1]'
+    sources=("${words[@]}")
+    build_destination_path "$rootfs" "$workdir" "$destination" || { warn "$kind destination escapes the jail rootfs: '$destination'."; return 1; }
+    if [ "${#sources[@]}" -gt 1 ] && [[ "$destination" != */ ]]; then
+        warn "$kind with multiple sources requires a directory destination ending in '/'."
+        return 1
+    fi
+    for source in "${sources[@]}"; do
+        if [ "$kind" = "ADD" ] && [[ "$source" =~ ^https?:// ]]; then
+            [ "${#sources[@]}" -eq 1 ] || { warn "ADD URLs cannot be combined with other sources."; return 1; }
+            command -v curl >/dev/null 2>&1 || { warn "ADD URL requires curl on the host."; return 1; }
+            temp="$(mktemp)" || return 1
+            if ! curl -fL --connect-timeout 15 --max-time 300 -o "$temp" "$source"; then
+                rm -f "$temp"
+                return 1
+            fi
+            expanded+=("$temp")
+        else
+            build_context_source "$context" "$source" || { warn "$kind source must exist inside the build context: '$source'."; rm -f "$temp"; return 1; }
+            source_path="$(realpath -m "$context/$source")"
+            expanded+=("$source_path")
+        fi
+    done
+    local destination_is_dir=0
+    if [[ "$destination" = */ ]] || [ -d "$BUILD_DESTINATION" ]; then
+        destination_is_dir=1
+        mkdir -p "$BUILD_DESTINATION" || { rm -f "$temp"; return 1; }
+    else
+        mkdir -p "$(dirname "$BUILD_DESTINATION")" || { rm -f "$temp"; return 1; }
+    fi
+    if [ "$kind" = "ADD" ] && [ "${#expanded[@]}" -eq 1 ] && [ -f "${expanded[0]}" ] && tar -tf "${expanded[0]}" >/dev/null 2>&1 && [[ "$source" != http*://* ]]; then
+        mkdir -p "$BUILD_DESTINATION"
+        tar -xf "${expanded[0]}" -C "$BUILD_DESTINATION"
+    else
+        for source_path in "${expanded[@]}"; do
+            if [ -d "$source_path" ]; then
+                [ "$destination_is_dir" -eq 1 ] || { warn "$kind directory source requires a directory destination."; rm -f "$temp"; return 1; }
+                cp -a "$source_path"/. "$BUILD_DESTINATION"/
+            else
+                cp -a "$source_path" "$BUILD_DESTINATION"
+            fi
+        done
+    fi
+    rm -f "$temp"
+}
+
+cmd_build() {
+    local context="" file="" tag="" no_cache=0 arg image="" name="" distro="" workdir="/" run_user="root"
+    local shell_path="/bin/sh" shell_flag="-c" line raw instruction body step=0 created=0
+    local -a cli_build_args=() words
+    declare -A BUILD_ARGS=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--file) [ $# -ge 2 ] || err "Usage: jroot build [options] <context>"; file="$2"; shift ;;
+            --file=*) file="${1#*=}" ;;
+            -t|--tag) [ $# -ge 2 ] || err "Usage: jroot build [options] <context>"; tag="$2"; shift ;;
+            --tag=*) tag="${1#*=}" ;;
+            --build-arg) [ $# -ge 2 ] || err "--build-arg requires NAME=VALUE"; cli_build_args+=("$2"); shift ;;
+            --build-arg=*) cli_build_args+=("${1#*=}") ;;
+            --no-cache) no_cache=1 ;;
+            -h|--help) build_usage; return 0 ;;
+            -*) err "Unknown build option: $1" ;;
+            *) [ -z "$context" ] || err "Only one build context may be supplied."; context="$1" ;;
+        esac
+        shift
+    done
+    [ -n "$context" ] || err "Usage: jroot build [options] <context>"
+    [ -d "$context" ] || err "Build context is not a directory: $context"
+    context="$(cd "$context" && pwd -P)"
+    if [ -z "$file" ]; then file="$context/JRootfile"; elif [[ "$file" != /* ]]; then file="$(pwd -P)/$file"; fi
+    [ -f "$file" ] || err "JRootfile not found: $file"
+    if [ -z "$tag" ]; then tag="$(basename "$context" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')"; fi
+    [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid build tag: '$tag'"
+    [ ! -e "$CONFIGS_DIR/$tag.json" ] || err "Jail '$tag' already exists. Choose another tag with --tag."
+    for arg in "${cli_build_args[@]}"; do
+        [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || err "Invalid --build-arg '$arg'; use NAME=VALUE."
+        BUILD_ARGS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    done
+    [ "$no_cache" -eq 0 ] || log "JRoot builds do not reuse layers; --no-cache has no additional effect."
+    log "Building '$tag' from $(basename "$file") with context $context"
+
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        build_trim "$raw"; line="$BUILD_TRIMMED"
+        [ -n "$line" ] || continue
+        [[ "$line" = \#* ]] && continue
+        instruction="${line%%[[:space:]]*}"
+        body="${line#"$instruction"}"
+        build_trim "$body"; body="$(build_expand_args "$BUILD_TRIMMED")"
+        instruction="$(printf '%s' "$instruction" | tr '[:lower:]' '[:upper:]')"
+        step=$((step + 1))
+        log "Step $step: $instruction${body:+ $body}"
+        case "$instruction" in
+            ARG)
+                [[ "$body" =~ ^([A-Za-z_][A-Za-z0-9_]*)(=(.*))?$ ]] || err "JRootfile ARG must use NAME or NAME=DEFAULT."
+                local arg_name="${BASH_REMATCH[1]}" arg_default="${BASH_REMATCH[3]:-}"
+                [ -n "${BUILD_ARGS[$arg_name]+set}" ] || BUILD_ARGS["$arg_name"]="$arg_default"
+                ;;
+            FROM)
+                [ "$created" -eq 0 ] || err "Multi-stage FROM is not supported by jroot build. Use one JRootfile per jail."
+                image="${body%%[[:space:]]*}"
+                [ -n "$image" ] || err "JRootfile FROM requires an image such as ubuntu:22.04."
+                distro="${image%%:*}"
+                case "$distro" in ubuntu|alpine) ;; *) err "JRootfile FROM supports JRoot images only: ubuntu:<version> or alpine:<version>." ;; esac
+                cmd_init "$image" "--name=$tag" --user=root --build-essential=0 --mount-host=0 --mount-home=0
+                created=1; name="$tag"
+                build_metadata_set "$name" source_image "$image"
+                build_metadata_set "$name" jrootfile "$(realpath -m "$file")"
+                ;;
+            RUN)
+                [ "$created" -eq 1 ] || err "JRootfile RUN requires FROM first."
+                [ -n "$body" ] || err "JRootfile RUN requires a command."
+                if ! build_run_instruction "$name" "$run_user" "$shell_path" "$shell_flag" "$workdir" "$body"; then
+                    record_event "$name" "build" "FAILED at RUN: $body"
+                    err "JRootfile RUN failed at step $step. The partially built jail '$name' was left for inspection."
+                fi
+                ;;
+            COPY|ADD)
+                [ "$created" -eq 1 ] || err "JRootfile $instruction requires FROM first."
+                if ! build_copy_instruction "$instruction" "$context" "$name" "$workdir" "$body"; then
+                    record_event "$name" "build" "FAILED at $instruction: $body"
+                    err "JRootfile $instruction failed at step $step."
+                fi
+                ;;
+            WORKDIR)
+                [ "$created" -eq 1 ] || err "JRootfile WORKDIR requires FROM first."
+                [ -n "$body" ] || err "JRootfile WORKDIR requires a path."
+                if [[ "$body" = /* ]]; then workdir="$body"; else workdir="$workdir/$body"; fi
+                workdir="$(realpath -m "/$workdir")"
+                build_run_instruction "$name" "$run_user" "$shell_path" "$shell_flag" / "mkdir -p $(printf '%q' "$workdir")" || err "Could not create WORKDIR '$workdir'."
+                ;;
+            USER)
+                [ "$created" -eq 1 ] || err "JRootfile USER requires FROM first."
+                build_prepare_user "$name" "$distro" "$body" || err "Could not select USER '$body'."
+                run_user="$body"
+                ;;
+            ENV)
+                [ "$created" -eq 1 ] || err "JRootfile ENV requires FROM first."
+                read -r -a words <<< "$body"
+                [ "${#words[@]}" -ge 1 ] || err "JRootfile ENV requires KEY=VALUE pairs."
+                for arg in "${words[@]}"; do
+                    [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || err "JRootfile ENV currently requires KEY=VALUE syntax."
+                    local env_key="${BASH_REMATCH[1]}" env_value="${BASH_REMATCH[2]}" env_line
+                    BUILD_ARGS["$env_key"]="$env_value"
+                    printf -v env_line 'export %s=%q' "$env_key" "$env_value"
+                    build_run_instruction "$name" root /bin/sh -c / "mkdir -p /etc/profile.d && printf '%s\\n' $(printf '%q' "$env_line") >> /etc/profile.d/jroot-build-env.sh" || err "Could not persist ENV $env_key."
+                done
+                ;;
+            EXPOSE)
+                [ "$created" -eq 1 ] || err "JRootfile EXPOSE requires FROM first."
+                read -r -a words <<< "$body"
+                for arg in "${words[@]}"; do
+                    arg="${arg%/tcp}"; arg="${arg%/udp}"
+                    [[ "$arg" =~ ^[0-9]{1,5}$ ]] || err "JRootfile EXPOSE accepts numeric ports only."
+                    cmd_port "$name" add "$arg" || err "Could not expose port $arg."
+                    build_metadata_append "$name" exposed_ports "$arg"
+                done
+                ;;
+            VOLUME)
+                [ "$created" -eq 1 ] || err "JRootfile VOLUME requires FROM first."
+                read -r -a words <<< "$body"
+                for arg in "${words[@]}"; do
+                    [[ "$arg" = /* ]] || err "JRootfile VOLUME paths must be absolute."
+                    build_run_instruction "$name" root /bin/sh -c / "mkdir -p $(printf '%q' "$arg")" || err "Could not create VOLUME path '$arg'."
+                    build_metadata_append "$name" volumes "$arg"
+                done
+                ;;
+            LABEL)
+                [ "$created" -eq 1 ] || err "JRootfile LABEL requires FROM first."
+                read -r -a words <<< "$body"
+                for arg in "${words[@]}"; do
+                    [[ "$arg" == *=* ]] || err "JRootfile LABEL requires key=value pairs."
+                    build_metadata_label "$name" "${arg%%=*}" "${arg#*=}"
+                done
+                ;;
+            CMD|ENTRYPOINT|HEALTHCHECK|STOPSIGNAL)
+                [ "$created" -eq 1 ] || err "JRootfile $instruction requires FROM first."
+                if [ "$instruction" = "HEALTHCHECK" ] && [ "$body" = "NONE" ]; then body=""; fi
+                build_metadata_set "$name" "$(printf '%s' "$instruction" | tr '[:upper:]' '[:lower:]')" "$body"
+                ;;
+            SHELL)
+                [ "$created" -eq 1 ] || err "JRootfile SHELL requires FROM first."
+                read -r shell_path shell_flag < <(python3 - "$body" <<'PY'
+import json, sys
+try:
+    value = json.loads(sys.argv[1])
+    if isinstance(value, list) and len(value) == 2 and all(isinstance(v, str) for v in value):
+        print(value[0], value[1])
+except Exception:
+    pass
+PY
+)
+                [ -n "$shell_path" ] && [ -n "$shell_flag" ] || err "JRootfile SHELL requires a two-item JSON array, e.g. SHELL [\"/bin/bash\", \"-c\"]."
+                ;;
+            MAINTAINER)
+                [ "$created" -eq 1 ] || err "JRootfile MAINTAINER requires FROM first."
+                build_metadata_label "$name" maintainer "$body"
+                ;;
+            ONBUILD)
+                err "JRootfile ONBUILD is not supported because jroot build does not implement multi-stage or child-image builds."
+                ;;
+            *)
+                err "Unsupported JRootfile instruction '$instruction' at step $step."
+                ;;
+        esac
+    done < "$file"
+
+    [ "$created" -eq 1 ] || err "JRootfile must begin with FROM <image>."
+    record_event "$name" "build" "built from $(basename "$file")"
+    log "Build complete: jail '$name'"
+    log "  Enter:      jroot enter $name"
+    log "  Metadata:   $JROOT_HOME/builds/$name.json"
+    [ -n "$(build_metadata_get "$name" healthcheck 2>/dev/null || true)" ] && log "  Update will run the JRootfile HEALTHCHECK after package upgrades."
+}
+
 cmd_enter() {
     ensure_runtime
     [ -x "$PROOT_BIN" ] || install_proot
@@ -4376,7 +4764,7 @@ PLUGIN_API_VERSION=1
 
 is_reserved_command() {
     case "$1" in
-        init|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -4436,7 +4824,7 @@ except Exception as exc:
     print(f"Invalid plugin.json: {exc}", file=sys.stderr)
     raise SystemExit(1)
 errors = []
-reserved = {"init","enter","exec","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
+reserved = {"init","build","enter","exec","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
 
 name = manifest.get("name")
 if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
@@ -5328,13 +5716,45 @@ print("seccomp=%s landlock=%s" % (seccomp, landlock))
 ' 2>/dev/null || printf 'seccomp=unknown landlock=unknown\n'
 }
 
+doctor_stale_pid_files() {
+    local pidfile pid
+    shopt -s nullglob
+    for pidfile in "$JROOT_HOME/pids"/*.pid "$JROOT_HOME/pids"/*.sshd; do
+        [ -f "$pidfile" ] || continue
+        pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+        [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && continue
+        printf '%s\n' "$pidfile"
+    done
+    shopt -u nullglob
+}
+
+doctor_fix_stale_pid_files() {
+    local pidfile name removed=0
+    while IFS= read -r pidfile; do
+        [ -n "$pidfile" ] || continue
+        case "$pidfile" in
+            *.sshd)
+                name="$(basename "$pidfile" .sshd)"
+                rm -f "$pidfile" "$JROOT_HOME/pids/$name.sshport" \
+                      "$JROOT_HOME/pids/$name.socat" "$JROOT_HOME/pids/$name.sshinner" \
+                      "$JROOT_HOME/pids/$name.sshlog" 2>/dev/null || true
+                ;;
+            *) rm -f "$pidfile" 2>/dev/null || true ;;
+        esac
+        removed=$((removed + 1))
+    done < <(doctor_stale_pid_files)
+    printf '%s\n' "$removed"
+}
+
 cmd_doctor() {
-    local mute=""
+    local mute="" fix=0 fixed_stale=0
     while [ $# -gt 0 ]; do
         case "$1" in
+            --fix)
+                fix=1
+                ;;
             --mute=*)
                 mute="${1#*=}"
-                shift
                 ;;
             --mute)
                 echo "Usage: jroot doctor --mute=7d|--mute=forever"
@@ -5344,9 +5764,10 @@ cmd_doctor() {
                 return 0
                 ;;
             *)
-                shift
+                err "Usage: jroot doctor [--fix] [--mute=7d|forever|off]"
                 ;;
         esac
+        shift
     done
 
     # Handle mute option
@@ -5379,6 +5800,11 @@ cmd_doctor() {
     fi
 
     ensure_runtime
+    if [ "$fix" -eq 1 ]; then
+        fixed_stale="$(doctor_fix_stale_pid_files)"
+        log "doctor --fix refreshed runtime directories and generated launch helpers."
+        [ "$fixed_stale" -eq 0 ] || log "doctor --fix removed $fixed_stale stale PID record(s)."
+    fi
     local ok=0 warn=0 fail=0
     local status=
 
@@ -5451,6 +5877,14 @@ cmd_doctor() {
         report "gcc: $(command -v gcc)" ok
     fi
 
+    local stale_pid_files
+    stale_pid_files="$(doctor_stale_pid_files)"
+    if [ -n "$stale_pid_files" ]; then
+        report "stale PID record(s)" fail "Run 'jroot doctor --fix' to remove stale jail, SSH, and plugin-service PID files."
+    else
+        report "tracked process PID records" ok
+    fi
+
     local cfgs=() cfg name rootfs
     shopt -s nullglob
     cfgs=("$CONFIGS_DIR"/*.json)
@@ -5483,7 +5917,59 @@ cmd_doctor() {
     fi
 
     printf '\n  Summary: %d ok, %d warn, %d fail\n' "$ok" "$warn" "$fail"
+    if [ "$fail" -gt 0 ] && [ "$fix" -eq 0 ]; then
+        printf '  Repairable faults may be fixed with: jroot doctor --fix\n'
+    elif [ "$fix" -eq 1 ] && [ "$fail" -gt 0 ]; then
+        printf '  Some faults need manual repair; --fix never deletes jails or rewrites invalid configs.\n'
+    fi
     [ "$fail" -eq 0 ]
+}
+
+update_health_check() {
+    local name="$1" healthcheck
+    [ -f "$ROOTS_DIR/$name/etc/os-release" ] || { warn "Update health check: /etc/os-release is missing."; return 1; }
+    [ -e "$ROOTS_DIR/$name/bin/sh" ] || { warn "Update health check: /bin/sh is missing."; return 1; }
+    if ! run_in_jail --root "$name" /bin/sh -c 'test -r /etc/os-release && test -x /bin/sh && /bin/sh -c "exit 0"'; then
+        warn "Update health check: the rootfs no longer launches a basic shell."
+        return 1
+    fi
+    healthcheck="$(build_metadata_get "$name" healthcheck 2>/dev/null || true)"
+    if [ -n "$healthcheck" ]; then
+        log "Running JRootfile HEALTHCHECK for '$name'..."
+        if ! run_in_jail --root "$name" /bin/sh -c "$healthcheck"; then
+            warn "JRootfile HEALTHCHECK failed."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+update_offer_rollback() {
+    local name="$1" checkpoint="$2" reason="$3" response
+    warn "Update of '$name' failed: $reason"
+    warn "The jail was checkpointed as '$checkpoint' before updating."
+    record_event "$name" "update" "FAILED: $reason; checkpoint=$checkpoint"
+    if [ -t 0 ] && [ "${NONINTERACTIVE:-0}" != "1" ]; then
+        printf 'Restore checkpoint "%s" now? This discards the failed update. [y/N]: ' "$checkpoint"
+        read -r response || response="N"
+        case "$response" in
+            y|Y|yes|YES)
+                if restore_checkpoint_now "$name" "$checkpoint"; then
+                    record_event "$name" "update" "rolled back to checkpoint $checkpoint"
+                    trigger_event_hooks "on_snapshot" "$name" "restore-checkpoint:$checkpoint"
+                    log "Update rollback completed."
+                else
+                    warn "Automatic rollback failed. Restore manually: jroot revert checkpoint $name $checkpoint"
+                fi
+                ;;
+            *)
+                log "Rollback not selected. Restore later with: jroot revert checkpoint $name $checkpoint"
+                ;;
+        esac
+    else
+        warn "Non-interactive session: no rollback was attempted. Restore with: jroot revert checkpoint $name $checkpoint"
+    fi
+    return 1
 }
 
 cmd_update() {
@@ -5500,15 +5986,22 @@ cmd_update() {
     done
 
     if [ -n "$name" ]; then
+        [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
         [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
-        local image_tag distro version
+        local image_tag distro version checkpoint_label package_failed=0 update_rc=0
         image_tag="$(config_field "$CONFIGS_DIR/$name.json" image)"
         distro="${image_tag%%:*}"
         version="${image_tag#*:}"
-        
+        case "$distro" in ubuntu|alpine) ;; *) err "Unknown distro: $distro" ;; esac
+
+        checkpoint_label="pre-update-$(date +%Y%m%d-%H%M%S)"
+        while [ -e "$SNAPSHOTS_DIR/$name/checkpoints/$checkpoint_label" ]; do
+            checkpoint_label="${checkpoint_label}-x"
+        done
+        log "Creating safety checkpoint before updating '$name'..."
+        cmd_checkpoint "$name" "$checkpoint_label" || err "Update cancelled because the pre-update checkpoint could not be created."
+
         write_rootfs_niceties "$name"
-        
-        # Update based on distro
         if [ "$distro" = "ubuntu" ]; then
             local codename
             codename="$(version_to_codename "$version" 2>/dev/null || true)"
@@ -5517,35 +6010,42 @@ cmd_update() {
             config_apt "$name" "$codename"
             write_sudoers "$name"
             log "Updating packages inside '$name' (apt-get update && upgrade)..."
-            run_in_jail --root "$name" /bin/sh -c "
+            run_in_jail --root "$name" /bin/sh -c '
+                set -e
                 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-                DEBIAN_FRONTEND=noninteractive
-                dpkg --configure -a 2>/dev/null || true
-                apt-get update || true
-                apt-get upgrade -y --allow-unauthenticated || true
-            " || { warn "Package upgrade inside '$name' failed (network?)."; record_event "$name" "update" "FAILED (apt)"; return 1; }
-        elif [ "$distro" = "alpine" ]; then
+                export DEBIAN_FRONTEND=noninteractive
+                dpkg --configure -a
+                apt-get update
+                apt-get upgrade -y
+            ' || { update_rc=$?; package_failed=1; }
+        else
             log "Refreshing apk config for '$name'..."
             config_apk "$name" "$version"
             log "Updating packages inside '$name' (apk update && upgrade)..."
-            run_in_jail --root "$name" /bin/sh -c "
+            run_in_jail --root "$name" /bin/sh -c '
+                set -e
                 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
                 apk update
                 apk upgrade --no-cache
-            " || { warn "Package upgrade inside '$name' failed (network?)."; record_event "$name" "update" "FAILED (apk)"; return 1; }
-        else
-            err "Unknown distro: $distro"
+            ' || { update_rc=$?; package_failed=1; }
         fi
-        
+
         if [ "$(config_field "$CONFIGS_DIR/$name.json" user)" = "unroot" ]; then
-            if [ "$distro" = "ubuntu" ]; then
-                setup_unroot_user "$name"
-            elif [ "$distro" = "alpine" ]; then
-                setup_unroot_alpine "$name"
-            fi
+            if [ "$distro" = "ubuntu" ]; then setup_unroot_user "$name"; else setup_unroot_alpine "$name"; fi
         fi
-        log "Jail '$name' is up to date."
-        record_event "$name" "update" "packages upgraded ($distro $version)"
+
+        if ! update_health_check "$name"; then
+            update_offer_rollback "$name" "$checkpoint_label" "post-update rootfs health check failed"
+            return 1
+        fi
+        if [ "$package_failed" -eq 1 ]; then
+            warn "Package manager exited with status $update_rc, but '$name' passed the rootfs health check."
+            warn "No rollback prompt was shown because the jail still launches. The checkpoint is retained: $checkpoint_label"
+            record_event "$name" "update" "package manager failed ($distro exit=$update_rc), health check passed; checkpoint=$checkpoint_label"
+            return 1
+        fi
+        log "Jail '$name' is up to date and passed its post-update health check."
+        record_event "$name" "update" "packages upgraded ($distro $version), checkpoint=$checkpoint_label"
         return 0
     fi
 
@@ -5553,7 +6053,7 @@ cmd_update() {
     install_proot
     log "proot is up to date: $("$PROOT_BIN" --version 2>/dev/null | grep -m1 -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' || true)"
 
-    local cfgs=() cfg
+    local cfgs=() cfg failures=0
     shopt -s nullglob
     cfgs=("$CONFIGS_DIR"/*.json)
     shopt -u nullglob
@@ -5562,8 +6062,9 @@ cmd_update() {
         return 0
     fi
     for cfg in "${cfgs[@]}"; do
-        cmd_update "$(basename "$cfg" .json)" || true
+        cmd_update "$(basename "$cfg" .json)" || failures=$((failures + 1))
     done
+    [ "$failures" -eq 0 ] || { warn "$failures jail update(s) did not complete successfully."; return 1; }
 }
 
 cmd_info() {
@@ -7087,9 +7588,24 @@ cmd_checkpoint() {
     local target="$dir/$label"
     [ ! -e "$target" ] || err "Checkpoint '$label' already exists for '$name'."
 
+    local previous=""
+    previous="$(find "$dir" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' 2>/dev/null | sort -nr | head -n1 | cut -f2-)"
     log "Creating incremental checkpoint for '$name' as '$label'..."
-    # Use hard links for speed and efficiency.
-    cp -al "$ROOTS_DIR/$name" "$target" || err "Checkpoint failed."
+    # A checkpoint must never hard-link to the live rootfs: a normal in-place
+    # write in the jail would then also alter the saved state. The first
+    # checkpoint is a private copy (reflink when the filesystem supports it).
+    # Later checkpoints use rsync's link-dest mode, which links only files
+    # whose content *and attributes* still match the prior immutable checkpoint.
+    # A changed file receives a new inode in the new checkpoint.
+    if [ -n "$previous" ] && command -v rsync >/dev/null 2>&1; then
+        mkdir -p "$target" || err "Checkpoint directory creation failed."
+        if ! rsync -a --delete --link-dest="$previous" "$ROOTS_DIR/$name/" "$target/"; then
+            rm -rf "$target"
+            err "Checkpoint update failed."
+        fi
+    else
+        cp -a --reflink=auto "$ROOTS_DIR/$name" "$target" || err "Checkpoint failed."
+    fi
     cp "$CONFIGS_DIR/$name.json" "$target.json"
     log "Checkpoint saved: $target"
     record_event "$name" "checkpoint" "$label"
@@ -7100,6 +7616,28 @@ cmd_checkpoints() {
     [ $# -eq 1 ] || err "Usage: jroot checkpoints <name>"
     [ -f "$CONFIGS_DIR/$1.json" ] || err "Jail '$1' not found. Run 'jroot list' to see jails."
     checkpoint_list "$1"
+}
+
+restore_checkpoint_now() {
+    local name="$1" label="$2" dir="$SNAPSHOTS_DIR/$name/checkpoints"
+    local rootfs="$ROOTS_DIR/$name" old_rootfs
+    [ -d "$dir/$label" ] || return 1
+    [ -f "$dir/$label.json" ] || return 1
+    old_rootfs="${rootfs}.old.$(date +%s).$$"
+    mv "$rootfs" "$old_rootfs" || return 1
+    # Do not hard-link the restored live rootfs to a checkpoint. A subsequent
+    # package install or ordinary write must never mutate the retained restore point.
+    if ! cp -a --reflink=auto "$dir/$label" "$rootfs"; then
+        mv "$old_rootfs" "$rootfs" 2>/dev/null || true
+        return 1
+    fi
+    cp "$dir/$label.json" "$CONFIGS_DIR/$name.json" || {
+        rm -rf "$rootfs"
+        mv "$old_rootfs" "$rootfs" 2>/dev/null || true
+        return 1
+    }
+    rm -rf "$old_rootfs" &
+    return 0
 }
 
 cmd_revert() {
@@ -7156,15 +7694,7 @@ cmd_revert() {
         rm -rf "$tmp"
     else
         log "Restoring '$name' from checkpoint '$label'..."
-        # Quick revert: move current away and link from checkpoint.
-        local old_rootfs="${rootfs}.old.$(date +%s)"
-        mv "$rootfs" "$old_rootfs"
-        if ! cp -al "$dir/$label" "$rootfs"; then
-            mv "$old_rootfs" "$rootfs"
-            err "Restore failed."
-        fi
-        cp "$dir/$label.json" "$CONFIGS_DIR/$name.json"
-        rm -rf "$old_rootfs" & # Background cleanup
+        restore_checkpoint_now "$name" "$label" || err "Restore failed."
     fi
 
     log "Jail '$name' restored to $type '$label'."
@@ -7222,6 +7752,9 @@ help_row() {
 cmd_help_cmd() {
     local cmd="$1"; shift
     case "$cmd" in
+        build)
+            build_usage
+            ;;
         init)
             printf '%bjroot init%b - create a jail from an Ubuntu or Alpine image\n\n' "$H" "$N"
             printf '    %bjroot init <image> [--name=<n>] [flags]%b\n' "$G" "$N"
@@ -7381,10 +7914,11 @@ cmd_help_cmd() {
             printf '    %bjroot snapshots <name>%b\n' "$G" "$N"
             ;;
         checkpoint)
-            printf '%bjroot checkpoint%b - quickly save jail state using hard links\n\n' "$H" "$N"
+            printf '%bjroot checkpoint%b - save an immutable incremental jail state\n\n' "$H" "$N"
             printf '    %bjroot checkpoint <name> [label]%b\n' "$G" "$N"
-            printf '\n    Creates a fast, incremental copy of the jail state. Unchanged files\n'
-            printf '    share storage via hard links, making this nearly instantaneous.\n'
+            printf '\n    The first checkpoint is a private copy; later checkpoints reuse unchanged\n'
+            printf '    files from earlier immutable checkpoints without sharing writable inodes\n'
+            printf '    with the active jail.\n'
             printf '    %bExample:%b jroot checkpoint dev pre-patch\n' "$G" "$N"
             ;;
         checkpoints)
@@ -7407,16 +7941,21 @@ cmd_help_cmd() {
             printf '    %bjroot rm-checkpoint <name> <label>%b\n' "$G" "$N"
             ;;
         update)
-            printf '%bjroot update%b - update proot + packages in a jail\n\n' "$H" "$N"
+            printf '%bjroot update%b - checkpoint, update, and health-check a jail\n\n' "$H" "$N"
             printf '    %bjroot update [name]%b   (no name = all jails)\n' "$G" "$N"
+            printf '\n    An incremental safety checkpoint is created before every jail package update. JRoot\n'
+            printf '    validates that the rootfs still launches after the package manager exits.\n'
+            printf '    Only a failed rootfs health check offers an interactive rollback prompt.\n'
             ;;
         doctor)
-            printf '%bjroot doctor%b - check the setup for problems\n\n' "$H" "$N"
+            printf '%bjroot doctor%b - check the setup and repair safe runtime faults\n\n' "$H" "$N"
             printf '    %bjroot doctor%b\n' "$G" "$N"
+            printf '    %bjroot doctor --fix%b        (repair stale PID records and runtime helpers)\n' "$G" "$N"
             printf '    %bjroot doctor --mute=7d%b   (mute warnings for 7 days)\n' "$G" "$N"
             printf '    %bjroot doctor --mute=forever%b  (mute warnings forever)\n' "$G" "$N"
             printf '    %bjroot doctor --mute=off%b  (unmute warnings)\n' "$G" "$N"
-            printf '\n    Mutes gcc/python3 warnings that may not be relevant to your use case.\n'
+            printf '\n    The normal diagnostic suggests --fix only when it finds actual faults.\n'
+            printf '    It does not suggest it for capability warnings such as missing gcc.\n'
             ;;
         rm|delete)
             printf '%bjroot rm%b - permanently delete a jail\n\n' "$H" "$N"
@@ -7468,6 +8007,7 @@ cmd_help() {
     printf '    %b<command>%b %b[arguments...]%b\n\n' "$G" "$N" "$B" "$N"
 
     printf '%bCREATE & USE%b\n' "$H" "$N"
+    help_row "jroot build" "[options] <context>"    "Build a jail from a Dockerfile-like JRootfile"
     help_row "jroot init" "<image> [flags]"        "Create a jail (see FLAGS below)"
     help_row "jroot init" "--list"                 "List available images"
     help_row "jroot enter" "<name>"                "Open a shell inside a jail"
@@ -7508,9 +8048,9 @@ cmd_help() {
     printf '\n'
 
     printf '%bMAINTENANCE%b\n' "$H" "$N"
-    help_row "jroot update" "[name]"    "Update proot + packages (all jails if no name)"
+    help_row "jroot update" "[name]"    "Checkpoint, update, and health-check packages"
     help_row "jroot clean" "<name>..."  "Free disk space inside a jail"
-    help_row "jroot doctor" "[--mute=7d|forever|off]" "Check setup, or mute warnings"
+    help_row "jroot doctor" "[--fix|--mute=...]" "Check setup and repair safe runtime faults"
     help_row "jroot rm" "<name>"        "Permanently delete a jail"
     help_row "jroot rename" "<n> <new>" "Rename a jail (updates hostname/prompt/snapshots)"
     help_row "jroot kill" "<name>"      "Terminate a running jail"
@@ -7728,9 +8268,9 @@ _jroot() {
     fi
     COMPREPLY=()
 
-    local cmds="init enter exec shell install config file port net mnt ssh list info
-size history compare which doctor snapshot snapshots checkpoint checkpoints revert
-rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin"
+    local cmds="init build enter exec shell install config file port net mnt ssh list info
+	size history compare which doctor snapshot snapshots checkpoint checkpoints revert
+	rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin"
 
     if [ "$idx" -le 1 ]; then
         COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
@@ -7742,6 +8282,15 @@ rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin"
     jails="$(_jroot_jails)"
 
     case "$cmd" in
+        build)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "--file= --tag= --build-arg= --no-cache" -- "$cur"))
+                COMPREPLY+=( $(compgen -d -- "$cur") )
+                compopt -o filenames 2>/dev/null
+            else
+                COMPREPLY=($(compgen -W "-f --file= -t --tag= --build-arg= --no-cache" -- "$cur"))
+            fi
+            ;;
         init)
             # 'jroot init --list' is the authoritative list; these are the ones
             # worth offering without shelling out.
@@ -7884,7 +8433,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
             fi
             ;;
         doctor)
-            COMPREPLY=($(compgen -W "--mute=7d --mute=forever --mute=off" -- "$cur"))
+            COMPREPLY=($(compgen -W "--fix --mute=7d --mute=forever --mute=off" -- "$cur"))
             ;;
         completion)
             if [ "$idx" -eq 2 ]; then
@@ -7993,6 +8542,7 @@ _jroot() {
     local -a cmds
     cmds=(
         'init:create a jail from an Ubuntu or Alpine image'
+        'build:build a jail from a JRootfile'
         'enter:open a shell, or run a command, inside a jail'
         'exec:run one command inside a jail'
         'shell:interactive jroot prompt'
@@ -8033,6 +8583,14 @@ _jroot() {
     local pos=$(( CURRENT - 1 ))
 
     case "$cmd" in
+        build)
+            if (( pos == 2 )); then
+                compadd -S '' -- --file= --tag= --build-arg= --no-cache
+                _files -/
+            else
+                compadd -S '' -- -f --file= -t --tag= --build-arg= --no-cache
+            fi
+            ;;
         init)
             local -a images
             if (( pos == 2 )); then
@@ -8146,7 +8704,7 @@ _jroot() {
         kill|stop)
             if (( pos == 2 )); then _jroot_jails; else compadd -- --force; fi
             ;;
-        doctor)       compadd -- --mute=7d --mute=forever --mute=off ;;
+        doctor)       compadd -- --fix --mute=7d --mute=forever --mute=off ;;
         completion)   (( pos == 2 )) && compadd -- bash zsh fish ;;
         help)
             if (( pos == 2 )); then
@@ -8292,6 +8850,7 @@ complete -c jroot -f
 
 # Commands
 complete -c jroot -n '__jroot_at 1' -a init        -d 'Create a jail from an image'
+complete -c jroot -n '__jroot_at 1' -a build       -d 'Build a jail from a JRootfile'
 complete -c jroot -n '__jroot_at 1' -a enter       -d 'Open a shell inside a jail'
 complete -c jroot -n '__jroot_at 1' -a exec        -d 'Run one command inside a jail'
 complete -c jroot -n '__jroot_at 1' -a shell       -d 'Interactive jroot prompt'
@@ -8330,6 +8889,8 @@ complete -c jroot -n '__jroot_is clean; and __jroot_from 2' -a '(__jroot_jails)'
 complete -c jroot -n '__jroot_is compare diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
 
 # init
+complete -c jroot -n '__jroot_is build; and __jroot_at 2' -a '--file= --tag= --build-arg= --no-cache' -F
+complete -c jroot -n '__jroot_is build; and __jroot_from 3' -a '-f --file= -t --tag= --build-arg= --no-cache' -F
 complete -c jroot -n '__jroot_is init; and __jroot_at 2' -a '--list ubuntu:16.04 ubuntu:18.04 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 ubuntu:24.10 alpine:3.19 alpine:3.20 alpine:3.21 alpine:3.22 alpine:edge'
 complete -c jroot -n '__jroot_is init; and __jroot_from 3' -a '--name= --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1'
 
@@ -8365,9 +8926,9 @@ complete -c jroot -n '__jroot_is history' -a '--json --clear --limit='
 complete -c jroot -n '__jroot_is compare diff; and __jroot_from 4' -a --all
 complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
 complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
-complete -c jroot -n '__jroot_is doctor' -a '--mute=7d --mute=forever --mute=off'
+complete -c jroot -n '__jroot_is doctor' -a '--fix --mute=7d --mute=forever --mute=off'
 complete -c jroot -n '__jroot_is completion; and __jroot_at 2' -a 'bash zsh fish'
-complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init enter exec shell install config file port net mnt ssh list info size history compare which doctor snapshot snapshots revert rm-snapshot update clean rename kill ps rm completion help plugin'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec shell install config file port net mnt ssh list info size history compare which doctor snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin'
 complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
 FISH_COMPLETION_EOF
 }
@@ -8376,6 +8937,7 @@ jroot_cmd() {
     [ $# -ge 1 ] || { cmd_help; return 0; }
     case "$1" in
         init)          shift; cmd_init "$@" ;;
+        build)         shift; cmd_build "$@" ;;
         enter)         shift; cmd_enter "$@" ;;
         exec)          shift; cmd_exec "$@" ;;
         file)          shift; cmd_file "$@" ;;

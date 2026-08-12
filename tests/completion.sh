@@ -49,6 +49,7 @@ try() {
 echo "commands"
 try 'jroot '                          'completion'
 try 'jroot com'                       'compare'
+try 'jroot bui'                       'build'
 echo "jail names"
 try 'jroot enter '                    'dev'
 try 'jroot enter d'                   'dev'
@@ -87,6 +88,9 @@ try 'jroot list --'                   '--json'
 try 'jroot history dev --l'           '--limit='
 try 'jroot kill dev '                 '--force'
 try 'jroot doctor --mute='            'forever'
+try 'jroot doctor --'                 '--fix'
+try 'jroot build --'                  '--build-arg='
+try 'jroot build '                    '--tag='
 try 'jroot completion '               'fish'
 try 'jroot help '                     'ssh'
 try 'jroot help file '                'cp'

@@ -100,7 +100,8 @@ HOST
 │  filesystem mapping                │
 │  identity mapping                  │
 │  package management                │
-│  snapshots & revert                │
+│  snapshots, checkpoints & revert   │
+│  JRootfile reproducible builds     │
 │  security layer (seccomp+landlock) │
 │  per-jail loopback address         │
 │  /proc process filtering           │
@@ -148,6 +149,9 @@ A JRoot environment is fundamentally a directory.
 │
 ├── cache/
 │   └── ubuntu-base-*.tar.gz
+│
+├── builds/
+│   └── my-service.json
 │
 └── bin/
     ├── proot
@@ -198,7 +202,10 @@ That's the core idea.
 | 🔑 | SSH into a jail             | **Yes** |
 | 📁 | File transfer (any direction) | **Yes** |
 |  📸 | Full rootfs snapshots       | **Yes** |
-|  ↩️ | Snapshot restoration        | **Yes** |
+|  ⚡ | Incremental checkpoints     | **Yes** |
+|  ↩️ | Snapshot/checkpoint restore | **Yes** |
+|  🧱 | Dockerfile-like JRoot builds | **Yes** |
+|  🔄 | Checkpointed package updates | **Yes** |
 | 🏷️ | Jail rename                 | **Yes** |
 |  🩺 | Installation diagnostics    | **Yes** |
 | 🛡️ | Seccomp protection          | **Yes** |
@@ -782,7 +789,7 @@ jroot revert snapshot dev before-major-upgrade
 ```
 
 ### ⚡ Checkpoints
-Checkpoints use **filesystem hard links** to create an instant copy of the jail state. Unchanged files share the same disk space, making creation and restoration nearly instantaneous.
+Checkpoints preserve a quickly restorable filesystem state without creating a compressed archive. The first checkpoint is a private copy (using reflinks when available); later checkpoints reuse unchanged files from the prior immutable checkpoint with `rsync --link-dest`. This keeps later save points space-efficient without sharing writable inodes with the active jail.
 
 ```bash
 jroot checkpoint dev pre-patch
@@ -790,7 +797,7 @@ jroot checkpoints dev
 jroot revert checkpoint dev pre-patch
 ```
 
-> **Note:** Because checkpoints share inodes with the active jail via hard links, they are extremely space-efficient but should be treated as transient, lightweight save points.
+> **Note:** The first checkpoint is a private filesystem copy (using a reflink when the filesystem supports it). Later checkpoints use `rsync --link-dest` to share only unchanged files with an earlier immutable checkpoint; they never share writable inodes with the active jail. They are lightweight save points, not compressed archival snapshots.
 
 ### Useful commands
 
@@ -952,6 +959,8 @@ jroot revert checkpoint dev <TAB>  →  pre-patch       debug        (this jail'
 jroot port dev rm <TAB>          →  3000  8080                   (this jail's public ports)
 jroot mnt dev set <TAB>          →  work  secrets                (this jail's mounts)
 jroot ssh dev start --<TAB>      →  --port=  --key=  --random-password  ...
+jroot build --<TAB>              →  --file=  --tag=  --build-arg=  --no-cache
+jroot doctor --<TAB>             →  --fix  --mute=7d  --mute=forever  ...
 ```
 
 And, most useful with `jroot file`, **paths inside a jail**:
@@ -1008,6 +1017,72 @@ Summary: 8 ok, 0 warn, 0 fail
 ```
 
 The diagnostic system is implemented directly in JRoot rather than relying on a collection of external commands.
+
+### Safe repair mode
+
+`jroot doctor --fix` refreshes JRoot's generated runtime helpers and removes **stale PID records** for stopped jail, SSH, and plugin-service processes. It never deletes a jail, removes a rootfs, or rewrites an invalid configuration file.
+
+```bash
+jroot doctor
+# ... reports an actual [FAIL], for example a stale PID record
+# Repairable faults may be fixed with: jroot doctor --fix
+
+jroot doctor --fix
+```
+
+The normal diagnostic recommends `--fix` only when it finds a real fault. Capability notices such as a missing compiler, unavailable Landlock support, or an intentionally muted warning do not trigger that recommendation.
+
+---
+
+# 🔄 Safe package updates
+
+`jroot update <name>` now creates a checkpoint before it touches packages. It updates the distribution, confirms that the rootfs still launches a basic shell, and runs a JRootfile `HEALTHCHECK` when the jail was built with one.
+
+```bash
+jroot update dev
+# Creates: pre-update-YYYYMMDD-HHMMSS
+# Runs apt/apk update and upgrade
+# Validates the rootfs after the package manager exits
+```
+
+A failed package-manager command does not automatically discard the jail if the rootfs remains healthy; the retained checkpoint gives you a deliberate rollback option. JRoot asks whether to restore the checkpoint only after a failed post-update rootfs health check. In non-interactive use it prints the restore command rather than performing a destructive rollback.
+
+```bash
+jroot checkpoints dev
+jroot revert checkpoint dev pre-update-20260812-120000
+```
+
+---
+
+# 🧱 Reproducible JRootfile builds
+
+A `JRootfile` is a Dockerfile-like recipe that turns a source directory into a normal JRoot jail. It supports familiar instructions including `FROM`, `RUN`, `COPY`, `ADD`, `WORKDIR`, `ARG`, `ENV`, `EXPOSE`, `VOLUME`, `LABEL`, `CMD`, `ENTRYPOINT`, and `HEALTHCHECK`.
+
+```text
+my-service/
+├── JRootfile
+└── app/
+    └── server.py
+```
+
+```dockerfile
+FROM ubuntu:22.04
+WORKDIR /srv/my-service
+COPY app/ ./
+RUN apt-get update && apt-get install -y python3
+EXPOSE 8080
+HEALTHCHECK test -f /srv/my-service/server.py
+CMD ["python3", "/srv/my-service/server.py"]
+```
+
+```bash
+jroot build --tag my-service ./my-service
+jroot exec my-service python3 /srv/my-service/server.py
+```
+
+Builds create ordinary jails: use `jroot enter`, `jroot snapshot`, `jroot checkpoint`, `jroot update`, and `jroot rm` exactly as you would for a jail created by `jroot init`. `COPY` and local `ADD` may read only files inside the supplied build context, which prevents a recipe from silently reading unrelated host paths.
+
+Read the full [JRootfile Reference](./docs/JROOTFILE.md) for every supported instruction, context rules, build arguments, metadata, health checks, Dockerfile differences, and full examples.
 
 ---
 
@@ -1247,6 +1322,7 @@ The current CLI handles runtime installation, rootfs acquisition, configuration,
 CREATE & USE
 
   jroot init <image> [flags]       Create a jail
+  jroot build [options] <context>  Build a jail from a JRootfile
   jroot enter <name>               Enter a jail (interactive shell)
   jroot enter <name> <command>     Run a command inside a jail
   jroot enter <name> --root ...    Run a command as root
@@ -1280,14 +1356,14 @@ INSPECTION
   jroot history [name]             What was done to a jail, and when
   jroot compare <jailA> <jailB>    Diff two jails (config + packages)
   jroot which [jail] <program>     Find a program across jails
-  jroot doctor                     Diagnose JRoot
+  jroot doctor [--fix]             Diagnose JRoot and repair safe faults
 
 
 SNAPSHOTS
 
   jroot snapshot <name> [label]    Save a full snapshot (compressed)
   jroot snapshots <name>           List snapshots
-  jroot checkpoint <name> [label]  Save a quick checkpoint (hard links)
+  jroot checkpoint <name> [label]  Save an incremental checkpoint
   jroot checkpoints <name>         List checkpoints
   jroot revert snapshot <name> [label]   Restore a snapshot
   jroot revert checkpoint <name> [label] Restore a checkpoint
@@ -1297,7 +1373,7 @@ SNAPSHOTS
 
 MAINTENANCE
 
-  jroot update [name]              Update runtime/packages
+  jroot update [name]              Checkpoint, update, and health-check packages
   jroot clean <name>...            Free disk space inside a jail
   jroot rename <name> <newname>    Rename a jail
   jroot kill <name>                Terminate a running jail
@@ -1467,6 +1543,9 @@ JRoot can manage multiple independent environments:
 │   ├── ubuntu-test.json
 │   └── ubuntu-build.json
 │
+├── builds/
+│   └── ubuntu-build.json
+│
 └── snapshots/
     ├── ubuntu-dev/
     └── ubuntu-test/
@@ -1613,6 +1692,14 @@ something is making a decision.
 
 And that's usually where the fun starts.
 
+
+## Documentation
+
+| Guide | What it covers |
+|---|---|
+| [JRootfile Reference](./docs/JROOTFILE.md) | `jroot build`, supported Dockerfile-like syntax, context safety, metadata, and health checks. |
+| [Plugin Development Guide](./docs/PLUGINS.md) | Plugin manifests, hooks, SDK, services, testing, and troubleshooting. |
+| [Windows Plugin Development](./docs/WINDOWS_DEV.md) | Cross-platform plugin authoring and validation before deployment to Linux. |
 
 ## Plugin development
 
