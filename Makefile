@@ -365,6 +365,8 @@ test: check
 	@bash tests/completion-audit.sh
 	@printf '$(CYAN)==>$(NC) tests/completion-shells.sh\n'
 	@bash tests/completion-shells.sh
+	@printf '$(CYAN)==>$(NC) tests/reserved-names.sh\n'
+	@bash tests/reserved-names.sh
 	@printf '$(CYAN)==>$(NC) tests/plugins.sh\n'
 	@bash tests/plugins.sh
 	@printf '$(CYAN)==>$(NC) tests/init.sh\n'

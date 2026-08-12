@@ -8274,12 +8274,22 @@ cat <<'BASH_COMPLETION_EOF'
 
 _jroot_home() { printf '%s' "${JROOT_HOME:-$HOME/.jroot}"; }
 
+_jroot_reserved_name() {
+    case "$1" in
+        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _jroot_jails() {
     local f n
     for f in "$(_jroot_home)"/configs/*.json; do
         [ -e "$f" ] || continue
         n="${f##*/}"
-        printf '%s\n' "${n%.json}"
+        n="${n%.json}"
+        _jroot_reserved_name "$n" && continue
+        printf '%s\n' "$n"
     done
 }
 
@@ -8693,11 +8703,21 @@ cat <<'ZSH_COMPLETION_EOF'
 
 _jroot_home() { print -r -- "${JROOT_HOME:-$HOME/.jroot}" }
 
+_jroot_reserved_name() {
+    case "$1" in
+        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _jroot_jails() {
     local -a names
-    local f
+    local f name
     for f in $(_jroot_home)/configs/*.json(N); do
-        names+=("${f:t:r}")
+        name="${f:t:r}"
+        _jroot_reserved_name "$name" && continue
+        names+=("$name")
     done
     (( ${#names} )) || return 1
     _describe -t jails 'jail' names
@@ -9042,11 +9062,18 @@ end
 
 # 'ls' rather than a glob: an unmatched glob is an error in fish, and "no jails
 # yet" is a completely normal state.
+function __jroot_reserved_name -a name
+    contains -- $name init build enter exec shell install file sync limit bundle deploy monitor compose port net mnt mount config list ls info history compare diff which size update clean snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh completion completions plugin help data logs status registry
+end
+
 function __jroot_jails
     set -l dir (__jroot_home)/configs
     test -d $dir; or return
     for f in (command ls $dir 2>/dev/null)
-        string match -q '*.json' -- $f; and string replace -r '\.json$' '' -- $f
+        string match -q '*.json' -- $f; or continue
+        set -l name (string replace -r '\.json$' '' -- $f)
+        __jroot_reserved_name $name; and continue
+        echo $name
     end
 end
 
