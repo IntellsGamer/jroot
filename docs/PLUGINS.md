@@ -1,72 +1,80 @@
-# JRoot Plugin System
+# JRoot Enterprise Plugin Ecosystem
 
-JRoot provides an event-driven extension architecture designed for enterprise userspace container management. The plugin subsystem enables modular integration through lifecycle hook interception, isolated state persistence, and custom command registration without conflicting with core runtime operations.
-
----
-
-## Architecture Overview
-
-Plugins interface with JRoot via executable scripts or packages placed in the plugin search path. The runtime dispatches events to registered plugin handlers, passing relevant execution context and state parameters as command-line arguments.
+JRoot provides an event-driven extension architecture designed for enterprise userspace container management. The plugin subsystem enables modular integration through lifecycle hook interception, isolated state persistence, and custom command registration.
 
 ---
 
-## Quickstart: SDK Template Generation
+## Pro Features: Logging & Services
 
-To bootstrap a new plugin conforming to standard structure and SDK practices:
+For production-grade extensions, JRoot includes advanced telemetry and background execution capabilities.
+
+### Structured Logging
+All plugin output (stdout/stderr) is automatically captured and routed to `$JROOT_HOME/plugins/logs/<plugin_name>.log`.
 
 ```bash
-jroot plugin init-sdk
+# View recent logs for a plugin
+jroot plugin logs my-plugin
 ```
 
-This generates a local `./jroot-plugin-template/` directory containing:
-1. **`plugin.json`**: Manifest declaring plugin metadata, versioning, and author information.
-2. **`main.py`**: Event-handling entry point demonstrating hook dispatches and SDK utilities.
+### Background Services
+Plugins can register long-running background tasks (e.g., resource monitors, auto-cleanup daemons) using the `service` command.
 
----
-
-## Lifecycle Hooks & Event Dispatch
-
-Plugins subscribe to core runtime events using standard hook arguments (`hook:<event_name>`):
-
-| Lifecycle Event | Trigger Condition | Parameter Payload |
-| :--- | :--- | :--- |
-| **`on_init`** | Executed immediately after a new jail instance is provisioned. | `[jail_name, image]` |
-| **`on_enter`** | Executed when attaching a shell or running a command inside a jail. | `[jail_name]` |
-| **`on_stop`** | Executed upon stopping or terminating a jail container. | `[jail_name]` |
-| **`on_remove`** | Executed when a jail instance is permanently purged. | `[jail_name]` |
-| **`on_sync`** | Executed during bidirectional filesystem synchronization (`jroot sync`). | `[src, dst]` |
-| **`on_snapshot`** | Executed when creating or restoring container snapshots. | `[jail_name, action:label]` |
-| **`on_limit`** | Executed when updating resource governance limits. | `[jail_name]` |
-
----
-
-## Private Plugin Data Persistence
-
-Each plugin is provisioned with a dedicated persistent storage directory (`$JROOT_PLUGIN_DATA`), isolating local state, configuration files, and caches to prevent state pollution across distinct plugins.
+```bash
+# Run a plugin hook as a background service
+jroot plugin service my-plugin on_monitor
+```
 
 ---
 
 ## Python SDK Reference (`JRootContext`)
 
-The `JRootContext` library provides helper utilities for programmatic jail inspection, command execution, and state persistence:
+The `JRootContext` library provides enterprise-grade utilities for programmatic jail inspection, command execution, and telemetry:
 
 ```python
 #!/usr/bin/env python3
-import sys
 from jroot_sdk import JRootContext
 
 def main():
     ctx = JRootContext()
     
-    # Manage isolated persistent plugin state
-    state = ctx.read_plugin_state("state.json", {"executions": 0})
-    state["executions"] += 1
-    ctx.write_plugin_state(state, "state.json")
-
-    print(f"Total executions: {state['executions']}")
-    for jail in ctx.list_jails():
-        print(f"Container: {jail['name']} ({jail['image']})")
+    # 1. Structured Logging
+    ctx.log.info("Starting resource audit...")
+    
+    # 2. Real-time Resource Monitoring
+    usage = ctx.get_resource_usage("production-jail")
+    if usage and usage["mem_mb"] > 512:
+        ctx.log.warn(f"Jail exceeding threshold: {usage['mem_mb']}MB")
+    
+    # 3. Persistent State
+    state = ctx.read_plugin_state("audit.json", {"count": 0})
+    state["count"] += 1
+    ctx.write_plugin_state(state, "audit.json")
 
 if __name__ == "__main__":
     main()
 ```
+
+---
+
+## Lifecycle Hooks Reference
+
+| Lifecycle Event | Trigger Condition | Parameter Payload |
+| :--- | :--- | :--- |
+| **`on_init`** | Executed after a new jail instance is provisioned. | `[jail_name, image]` |
+| **`on_enter`** | Executed when attaching a shell or running a command. | `[jail_name]` |
+| **`on_stop`** | Executed upon stopping or terminating a jail. | `[jail_name]` |
+| **`on_remove`** | Executed when a jail instance is purged. | `[jail_name]` |
+| **`on_sync`** | Executed during bidirectional synchronization. | `[src, dst]` |
+| **`on_snapshot`** | Executed when managing snapshots. | `[jail_name, action:label]` |
+| **`on_limit`** | Executed when updating resource governance. | `[jail_name]` |
+| **`on_monitor`** | Custom hook for background service monitoring. | `[jail_name]` |
+
+---
+
+## Development Workflow
+
+1.  **Initialize**: `jroot plugin init-sdk`
+2.  **Validate**: `python jroot-dev.py validate .`
+3.  **Simulate**: `python jroot-dev.py simulate on_init myjail ubuntu:22.04`
+4.  **Install**: `jroot plugin install .`
+5.  **Service**: `jroot plugin service my-plugin on_monitor myjail`

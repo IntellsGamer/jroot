@@ -4188,29 +4188,33 @@ PY
 trigger_event_hooks() {
     local event="$1"; shift
     local plugins_dir="$JROOT_HOME/plugins"
+    local logs_dir="$JROOT_HOME/plugins/logs"
+    mkdir -p "$logs_dir" 2>/dev/null || true
     [ -d "$plugins_dir" ] || return 0
 
-    local p target
+    local p target name
     for p in "$plugins_dir"/*; do
+        [ -e "$p" ] || continue
+        name="$(basename "$p" | sed 's/\.[^.]*$//')"
         if [ -d "$p" ]; then
-            # Directory plugin with manifest or main entry
             target="$p/main.py"
             [ -f "$target" ] || target="$p/main.sh"
             if [ -f "$target" ]; then
                 export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
+                export JROOT_PLUGIN_DATA="$JROOT_HOME/plugins/data/$name"
+                mkdir -p "$JROOT_PLUGIN_DATA" 2>/dev/null || true
                 if [[ "$target" == *.py ]]; then
-                    python3 "$target" "hook:$event" "$@" 2>/dev/null || true
+                    python3 "$target" "hook:$event" "$@" >> "$logs_dir/$name.log" 2>&1 || true
                 else
-                    bash "$target" "hook:$event" "$@" 2>/dev/null || true
+                    bash "$target" "hook:$event" "$@" >> "$logs_dir/$name.log" 2>&1 || true
                 fi
             fi
         elif [ -f "$p" ]; then
-            # Single file plugin
             export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
             if [[ "$p" == *.py ]]; then
-                python3 "$p" "hook:$event" "$@" 2>/dev/null || true
+                python3 "$p" "hook:$event" "$@" >> "$logs_dir/$name.log" 2>&1 || true
             else
-                bash "$p" "hook:$event" "$@" 2>/dev/null || true
+                bash "$p" "hook:$event" "$@" >> "$logs_dir/$name.log" 2>&1 || true
             fi
         fi
     done
@@ -4222,6 +4226,8 @@ plugin_usage() {
     printf '    %bjroot plugin install <dir|file>%b    install a plugin or packaged bundle\n' "$G" "$N"
     printf '    %bjroot plugin remove <name>%b         uninstall a plugin\n' "$G" "$N"
     printf '    %bjroot plugin init-sdk%b              generate a starter Python plugin template\n\n' "$G" "$N"
+    printf '    %bjroot plugin logs <name>%b            view recent plugin execution logs\n' "$G" "$N"
+    printf '    %bjroot plugin service <name> <hook>%b  run a plugin hook as a background service\n' "$G" "$N"
     printf '    %bSupported Lifecycle Hooks (Event-Driven):%b
 ' "$H" "$N"
     printf '        on_init       triggered when a new jail is created
@@ -4262,6 +4268,38 @@ cmd_plugin() {
                 printf '%-20s %-10s %s\n' "$name" "$version" "$desc"
             done
             [ "$found" = 1 ] || log "No plugins installed. Create one using 'jroot plugin init-sdk'."
+            ;;
+        logs)
+            [ $# -eq 1 ] || err "Usage: jroot plugin logs <name>"
+            local name="$1" log_file="$JROOT_HOME/plugins/logs/$name.log"
+            [ -f "$log_file" ] || err "No logs found for plugin '$name'."
+            tail -n 50 "$log_file"
+            ;;
+        service)
+            [ $# -ge 2 ] || err "Usage: jroot plugin service <name> <hook> [args...]"
+            local name="$1" hook="$2"; shift 2
+            local target="" p=""
+            for p in "$plugins_dir/$name" "$plugins_dir/$name.py" "$plugins_dir/$name.sh"; do
+                if [ -d "$p" ]; then
+                    target="$p/main.py"; [ -f "$target" ] || target="$p/main.sh"
+                elif [ -f "$p" ]; then
+                    target="$p"
+                fi
+                [ -n "$target" ] && break
+            done
+            [ -n "$target" ] || err "Plugin '$name' not found."
+            local logs_dir="$JROOT_HOME/plugins/logs"
+            mkdir -p "$logs_dir" 2>/dev/null || true
+            export JROOT_HOME JROOT_ROOTS="$ROOTS_DIR" JROOT_CONFIGS="$CONFIGS_DIR" JROOT_BIN="$BIN_DIR"
+            export JROOT_PLUGIN_DATA="$JROOT_HOME/plugins/data/$name"
+            mkdir -p "$JROOT_PLUGIN_DATA" 2>/dev/null || true
+            log "Starting plugin service '$name' for hook '$hook' in background..."
+            if [[ "$target" == *.py ]]; then
+                nohup python3 "$target" "hook:$hook" "$@" >> "$logs_dir/$name.log" 2>&1 &
+            else
+                nohup bash "$target" "hook:$hook" "$@" >> "$logs_dir/$name.log" 2>&1 &
+            fi
+            echo $! > "$JROOT_HOME/pids/plugin_$name.pid"
             ;;
         install|add)
             [ $# -eq 1 ] || err "Usage: jroot plugin install <path-to-script-or-directory>"

@@ -151,6 +151,12 @@ def main():
     p_sim.add_argument("hook_args", nargs="*", help="Arguments passed to the hook")
     p_sim.add_argument("--path", default=".", help="Path to plugin directory")
     
+    # service
+    p_svc = subparsers.add_parser("service", help="Simulate a background service plugin")
+    p_svc.add_argument("hook", help="Hook name to run in background")
+    p_svc.add_argument("hook_args", nargs="*", help="Arguments passed to the hook")
+    p_svc.add_argument("--path", default=".", help="Path to plugin directory")
+
     args = parser.parse_args()
     
     if args.command == "init":
@@ -159,6 +165,10 @@ def main():
         cmd_validate(args)
     elif args.command == "simulate":
         cmd_simulate(args)
+    elif args.command == "service":
+        print(f"[*] Simulating background service for hook '{args.hook}'...")
+        cmd_simulate(args) # Reuse simulate logic for now, but in a real dev tool it might fork
+
 
 if __name__ == "__main__":
     main()
