@@ -4376,7 +4376,7 @@ PLUGIN_API_VERSION=1
 
 is_reserved_command() {
     case "$1" in
-        init|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|revert|rm-snapshot|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -4436,7 +4436,8 @@ except Exception as exc:
     print(f"Invalid plugin.json: {exc}", file=sys.stderr)
     raise SystemExit(1)
 errors = []
-reserved = {"init","enter","exec","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","revert","rm-snapshot","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
+reserved = {"init","enter","exec","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
+
 name = manifest.get("name")
 if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
     errors.append("name must be a lowercase identifier of 1-64 characters.")
@@ -4962,7 +4963,7 @@ size_one() {
     shopt -s nullglob
     snaps=("$snapshots_dir"/*.tar.gz)
     shopt -u nullglob
-    if [ "${#snaps[@]}" -gt 0 ]; then
+    if [ -d "$snapshots_dir" ]; then
         ssize="$(du -sh "$snapshots_dir" 2>/dev/null | awk '{print $1}')"
     fi
     local max_storage
@@ -6999,7 +7000,7 @@ cmd_ssh() {
 }
 
 # ---------------------------------------------------------------------------
-# Snapshots / revert (tar.gz rootfs + config at snapshot time)
+# Snapshots / Checkpoints / revert
 # ---------------------------------------------------------------------------
 snapshot_list() {
     local name="$1"
@@ -7017,6 +7018,26 @@ snapshot_list() {
         printf '%-20s %-14s %s\n' "$(basename "$s" .tar.gz)" \
             "$(du -sh "$s" 2>/dev/null | awk '{print $1}')" \
             "$(date -r "$s" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+    done
+}
+
+checkpoint_list() {
+    local name="$1"
+    local dir="$SNAPSHOTS_DIR/$name/checkpoints"
+    local checkpoints=() c
+    shopt -s nullglob
+    checkpoints=("$dir"/*/)
+    shopt -u nullglob
+    if [ "${#checkpoints[@]}" -eq 0 ]; then
+        log "No checkpoints for '$name' yet. Run: jroot checkpoint $name"
+        return 1
+    fi
+    printf '%-20s %-14s %s\n' "LABEL" "SIZE" "DATE"
+    for c in "${checkpoints[@]}"; do
+        c="${c%/}"
+        printf '%-20s %-14s %s\n' "$(basename "$c")" \
+            "$(du -sh "$c" 2>/dev/null | awk '{print $1}')" \
+            "$(date -r "$c" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
     done
 }
 
@@ -7053,25 +7074,68 @@ cmd_snapshots() {
     snapshot_list "$1"
 }
 
-cmd_revert() {
-    [ $# -ge 1 ] || err "Usage: jroot revert <name> [label]"
+cmd_checkpoint() {
+    [ $# -ge 1 ] || err "Usage: jroot checkpoint <name> [label]"
     local name="$1" label="${2:-}"
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing."
+    [ -n "$label" ] || label="$(date +%Y%m%d-%H%M%S)"
+    [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid checkpoint label: '$label'"
+
+    local dir="$SNAPSHOTS_DIR/$name/checkpoints"
+    mkdir -p "$dir"
+    local target="$dir/$label"
+    [ ! -e "$target" ] || err "Checkpoint '$label' already exists for '$name'."
+
+    log "Creating incremental checkpoint for '$name' as '$label'..."
+    # Use hard links for speed and efficiency.
+    cp -al "$ROOTS_DIR/$name" "$target" || err "Checkpoint failed."
+    cp "$CONFIGS_DIR/$name.json" "$target.json"
+    log "Checkpoint saved: $target"
+    record_event "$name" "checkpoint" "$label"
+    trigger_event_hooks "on_snapshot" "$name" "checkpoint-create:$label"
+}
+
+cmd_checkpoints() {
+    [ $# -eq 1 ] || err "Usage: jroot checkpoints <name>"
+    [ -f "$CONFIGS_DIR/$1.json" ] || err "Jail '$1' not found. Run 'jroot list' to see jails."
+    checkpoint_list "$1"
+}
+
+cmd_revert() {
+    [ $# -ge 2 ] || err "Usage: jroot revert snapshot|checkpoint <name> [label]"
+    local type="$1" name="$2" label="${3:-}"
+    case "$type" in
+        snapshot|checkpoint) ;;
+        *) err "Revert type must be 'snapshot' or 'checkpoint'." ;;
+    esac
+
+    [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
     local dir="$SNAPSHOTS_DIR/$name"
+    [ "$type" = "checkpoint" ] && dir="$dir/checkpoints"
 
     if [ -z "$label" ]; then
-        log "Available snapshots for '$name':"
-        snapshot_list "$name" || return 1
+        log "Available ${type}s for '$name':"
+        if [ "$type" = "snapshot" ]; then
+            snapshot_list "$name" || return 1
+        else
+            checkpoint_list "$name" || return 1
+        fi
         printf 'Which label to restore? [none]: '
         read -r label || label=""
         [ -n "$label" ] || { log "Aborted."; return 0; }
     fi
 
-    [ -f "$dir/$label.tar.gz" ] || err "Snapshot '$label' not found for '$name'. Run 'jroot snapshots $name'."
-    [ -f "$dir/$label.json" ] || err "Snapshot config '$dir/$label.json' missing."
+    if [ "$type" = "snapshot" ]; then
+        [ -f "$dir/$label.tar.gz" ] || err "Snapshot '$label' not found for '$name'. Run 'jroot snapshots $name'."
+        [ -f "$dir/$label.json" ] || err "Snapshot config '$dir/$label.json' missing."
+    else
+        [ -d "$dir/$label" ] || err "Checkpoint '$label' not found for '$name'. Run 'jroot checkpoints $name'."
+        [ -f "$dir/$label.json" ] || err "Checkpoint config '$dir/$label.json' missing."
+    fi
 
     local response
-    printf 'Restore jail "%s" to snapshot "%s"? This replaces the current rootfs. [y/N]: ' "$name" "$label"
+    printf 'Restore jail "%s" to %s "%s"? This replaces the current rootfs. [y/N]: ' "$name" "$type" "$label"
     read -r response || response="N"
     case "$response" in
         y|Y|yes|YES) ;;
@@ -7079,20 +7143,33 @@ cmd_revert() {
     esac
 
     local rootfs="$ROOTS_DIR/$name" tmp
-    tmp="$(mktemp -d "$SNAPSHOTS_DIR/.restore.XXXXXX")"
-    log "Restoring '$name' from '$label'..."
-    if ! tar -xzf "$dir/$label.tar.gz" -C "$tmp" 2>/dev/null; then
+    if [ "$type" = "snapshot" ]; then
+        tmp="$(mktemp -d "$SNAPSHOTS_DIR/.restore.XXXXXX")"
+        log "Restoring '$name' from snapshot '$label'..."
+        if ! tar -xzf "$dir/$label.tar.gz" -C "$tmp" 2>/dev/null; then
+            rm -rf "$tmp"
+            err "Restore failed: corrupt snapshot archive."
+        fi
+        rm -rf "$rootfs"
+        mv "$tmp/$name" "$rootfs"
+        cp "$dir/$label.json" "$CONFIGS_DIR/$name.json"
         rm -rf "$tmp"
-        err "Restore failed: corrupt snapshot archive."
+    else
+        log "Restoring '$name' from checkpoint '$label'..."
+        # Quick revert: move current away and link from checkpoint.
+        local old_rootfs="${rootfs}.old.$(date +%s)"
+        mv "$rootfs" "$old_rootfs"
+        if ! cp -al "$dir/$label" "$rootfs"; then
+            mv "$old_rootfs" "$rootfs"
+            err "Restore failed."
+        fi
+        cp "$dir/$label.json" "$CONFIGS_DIR/$name.json"
+        rm -rf "$old_rootfs" & # Background cleanup
     fi
 
-    rm -rf "$rootfs"
-    mv "$tmp/$name" "$rootfs"
-    cp "$dir/$label.json" "$CONFIGS_DIR/$name.json"
-    rm -rf "$tmp"
-    log "Jail '$name' restored to snapshot '$label'."
-    record_event "$name" "revert" "restored snapshot '$label'"
-    trigger_event_hooks "on_snapshot" "$name" "restore:$label"
+    log "Jail '$name' restored to $type '$label'."
+    record_event "$name" "revert" "restored $type '$label'"
+    trigger_event_hooks "on_snapshot" "$name" "restore-$type:$label"
 }
 
 cmd_rm_snapshot() {
@@ -7108,9 +7185,25 @@ cmd_rm_snapshot() {
         *) log "Aborted."; return 0 ;;
     esac
     rm -f "$dir/$label.tar.gz" "$dir/$label.json"
-    rmdir "$dir" 2>/dev/null || true
     log "Snapshot '$label' deleted."
     record_event "$name" "rm-snapshot" "$label"
+}
+
+cmd_rm_checkpoint() {
+    [ $# -eq 2 ] || err "Usage: jroot rm-checkpoint <name> <label>"
+    local name="$1" label="$2"
+    local dir="$SNAPSHOTS_DIR/$name/checkpoints"
+    [ -d "$dir/$label" ] || err "Checkpoint '$label' not found for '$name'. Run 'jroot checkpoints $name'."
+    local response
+    printf 'Delete checkpoint "%s/%s"? [y/N]: ' "$name" "$label"
+    read -r response || response="N"
+    case "$response" in
+        y|Y|yes|YES) ;;
+        *) log "Aborted."; return 0 ;;
+    esac
+    rm -rf "$dir/$label" "$dir/$label.json"
+    log "Checkpoint '$label' deleted."
+    record_event "$name" "rm-checkpoint" "$label"
 }
 
 help_header() {
@@ -7287,14 +7380,31 @@ cmd_help_cmd() {
             printf '%bjroot snapshots%b - list saved snapshots for a jail\n\n' "$H" "$N"
             printf '    %bjroot snapshots <name>%b\n' "$G" "$N"
             ;;
+        checkpoint)
+            printf '%bjroot checkpoint%b - quickly save jail state using hard links\n\n' "$H" "$N"
+            printf '    %bjroot checkpoint <name> [label]%b\n' "$G" "$N"
+            printf '\n    Creates a fast, incremental copy of the jail state. Unchanged files\n'
+            printf '    share storage via hard links, making this nearly instantaneous.\n'
+            printf '    %bExample:%b jroot checkpoint dev pre-patch\n' "$G" "$N"
+            ;;
+        checkpoints)
+            printf '%bjroot checkpoints%b - list all checkpoints for a jail\n\n' "$H" "$N"
+            printf '    %bjroot checkpoints <name>%b\n' "$G" "$N"
+            ;;
         revert)
-            printf '%bjroot revert%b - restore a jail from a snapshot\n\n' "$H" "$N"
-            printf '    %bjroot revert <name> [label]%b\n' "$G" "$N"
-            printf '\n    Without a label, the latest snapshot is used.\n'
+            printf '%bjroot revert%b - restore a jail to a previously saved state\n\n' "$H" "$N"
+            printf '    %bjroot revert snapshot <name> [label]%b\n' "$G" "$N"
+            printf '    %bjroot revert checkpoint <name> [label]%b\n' "$G" "$N"
+            printf '\n    %bWARNING:%b This replaces the current jail rootfs with the saved content.\n' "$C_YEL" "$N"
+            printf '    If no label is given, it shows a list to choose from.\n'
             ;;
         rm-snapshot)
             printf '%bjroot rm-snapshot%b - delete a saved snapshot\n\n' "$H" "$N"
             printf '    %bjroot rm-snapshot <name> <label>%b\n' "$G" "$N"
+            ;;
+        rm-checkpoint)
+            printf '%bjroot rm-checkpoint%b - delete a jail checkpoint\n\n' "$H" "$N"
+            printf '    %bjroot rm-checkpoint <name> <label>%b\n' "$G" "$N"
             ;;
         update)
             printf '%bjroot update%b - update proot + packages in a jail\n\n' "$H" "$N"
@@ -7388,10 +7498,13 @@ cmd_help() {
     printf '\n'
 
     printf '%bSNAPSHOTS%b\n' "$H" "$N"
-    help_row "jroot snapshot" "<name> [label]"      "Save a full backup (rootfs + config)"
+    help_row "jroot snapshot" "<name> [label]"      "Save full jail rootfs (compressed)"
     help_row "jroot snapshots" "<name>"             "List saved snapshots"
-    help_row "jroot revert" "<name> [label]"        "Restore a jail from a snapshot"
+    help_row "jroot checkpoint" "<name> [label]"    "Quick incremental jail state save"
+    help_row "jroot checkpoints" "<name>"           "List saved checkpoints"
+    help_row "jroot revert" "snapshot|checkpoint <name> [label]" "Restore jail to a saved state"
     help_row "jroot rm-snapshot" "<name> <label>"   "Delete a snapshot"
+    help_row "jroot rm-checkpoint" "<name> <label>" "Delete a checkpoint"
     printf '\n'
 
     printf '%bMAINTENANCE%b\n' "$H" "$N"
@@ -7616,8 +7729,8 @@ _jroot() {
     COMPREPLY=()
 
     local cmds="init enter exec shell install config file port net mnt ssh list info
-size history compare which doctor snapshot snapshots revert rm-snapshot update
-clean rename kill ps rm completion help plugin"
+size history compare which doctor snapshot snapshots checkpoint checkpoints revert
+rm-snapshot rm-checkpoint update clean rename kill ps rm completion help plugin"
 
     if [ "$idx" -le 1 ]; then
         COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
@@ -7649,7 +7762,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
                 COMPREPLY=($(compgen -W "--root" -- "$cur"))
             fi
             ;;
-        install|info|size|snapshots|update|snapshot|rename|rm|delete)
+        install|info|size|snapshots|checkpoints|update|snapshot|checkpoint|rename|rm|delete)
             if [ "$idx" -eq 2 ]; then
                 COMPREPLY=($(compgen -W "$jails" -- "$cur"))
             fi
@@ -7716,10 +7829,27 @@ alpine:3.22 alpine:edge" -- "$cur"))
                    fi ;;
             esac
             ;;
-        revert|rm-snapshot)
+        revert)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "snapshot checkpoint" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                4) if [ "${w[2]:-}" = "snapshot" ]; then
+                       COMPREPLY=($(compgen -W "$(_jroot_snapshots "${w[3]}")" -- "$cur"))
+                   else
+                       COMPREPLY=($(compgen -W "$(_jroot_checkpoints "${w[3]}")" -- "$cur"))
+                   fi ;;
+            esac
+            ;;
+        rm-snapshot)
             case "$idx" in
                 2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
                 3) COMPREPLY=($(compgen -W "$(_jroot_snapshots "${w[2]}")" -- "$cur")) ;;
+            esac
+            ;;
+        rm-checkpoint)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "$(_jroot_checkpoints "${w[2]}")" -- "$cur")) ;;
             esac
             ;;
         list|ls)
@@ -7972,10 +8102,32 @@ _jroot() {
                    fi ;;
             esac
             ;;
-        revert|rm-snapshot)
+        revert)
+            case $pos in
+                2) compadd -- snapshot checkpoint ;;
+                3) _jroot_jails ;;
+                4) if [[ "${words[3]}" == snapshot ]]; then
+                       _jroot_snaps "${words[4]}"
+                   else
+                       _jroot_checkpoints "${words[4]}"
+                   fi ;;
+            esac
+            ;;
+        rm-snapshot)
             case $pos in
                 2) _jroot_jails ;;
                 3) _jroot_snaps "${words[3]}" ;;
+            esac
+            ;;
+        rm-checkpoint)
+            case $pos in
+                2) _jroot_jails ;;
+                3) _jroot_checkpoints "${words[3]}" ;;
+            esac
+            ;;
+        checkpoint|checkpoints)
+            case $pos in
+                2) _jroot_jails ;;
             esac
             ;;
         list|ls)      compadd -- --json ;;
@@ -8173,7 +8325,7 @@ complete -c jroot -n '__jroot_at 1' -a help        -d 'Show help'
 # A jail name as the first argument. One long line per rule on purpose: fish
 # splits an -a list on whitespace and a backslash inside single quotes stays a
 # literal backslash, so there is no safe way to wrap these.
-complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec install config info size snapshots snapshot update rename rm delete clean port mnt mount ssh which history compare kill stop revert rm-snapshot' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount ssh which history compare kill stop revert rm-snapshot rm-checkpoint' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is clean; and __jroot_from 2' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is compare diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
 
@@ -8250,8 +8402,11 @@ jroot_cmd() {
         clean)         shift; cmd_clean "$@" ;;
         snapshot)      shift; cmd_snapshot "$@" ;;
         snapshots)     shift; cmd_snapshots "$@" ;;
+        checkpoint)    shift; cmd_checkpoint "$@" ;;
+        checkpoints)   shift; cmd_checkpoints "$@" ;;
         revert)        shift; cmd_revert "$@" ;;
         rm-snapshot)   shift; cmd_rm_snapshot "$@" ;;
+        rm-checkpoint) shift; cmd_rm_checkpoint "$@" ;;
         doctor)        shift; cmd_doctor "$@" ;;
         rm|delete)     shift; cmd_rm "$@" ;;
         rename)        shift; cmd_rename "$@" ;;

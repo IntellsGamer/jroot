@@ -768,41 +768,42 @@ jroot sync --watch ./my-app dev:/root/my-app
 
 ---
 
-# 📸 Snapshots
+# 📸 Snapshots & Checkpoints
 
-JRoot can save the complete rootfs and its configuration as a snapshot.
+JRoot provides two ways to save and restore jail states: **Snapshots** for long-term backups and **Checkpoints** for rapid experimentation.
 
-```bash
-jroot snapshot ubuntu before-test
-```
-
-Then:
-
-```text
-ubuntu/
-   │
-   ├── experiment
-   ├── experiment
-   ├── experiment
-   └── 💥
-```
-
-Something breaks?
+### 📦 Snapshots
+Snapshots are compressed `.tar.gz` archives of the entire rootfs and configuration. They are safe for long-term storage and can be moved between machines.
 
 ```bash
-jroot revert ubuntu before-test
+jroot snapshot dev before-major-upgrade
+jroot snapshots dev
+jroot revert snapshot dev before-major-upgrade
 ```
 
-The snapshot system stores the root filesystem as a compressed archive alongside the jail configuration and restores both together.
+### ⚡ Checkpoints
+Checkpoints use **filesystem hard links** to create an instant copy of the jail state. Unchanged files share the same disk space, making creation and restoration nearly instantaneous.
+
+```bash
+jroot checkpoint dev pre-patch
+jroot checkpoints dev
+jroot revert checkpoint dev pre-patch
+```
+
+> **Note:** Because checkpoints share inodes with the active jail via hard links, they are extremely space-efficient but should be treated as transient, lightweight save points.
 
 ### Useful commands
 
-```bash
-jroot snapshots ubuntu
-jroot snapshot ubuntu clean
-jroot revert ubuntu clean
-jroot rm-snapshot ubuntu clean
-```
+| Command | Description |
+|---|---|
+| `jroot snapshot <name> [label]` | Create a compressed full backup |
+| `jroot checkpoint <name> [label]` | Create a fast, incremental save point |
+| `jroot revert snapshot <name> <label>` | Restore from a compressed snapshot |
+| `jroot revert checkpoint <name> <label>` | Restore from a fast checkpoint |
+| `jroot snapshots <name>` | List all snapshots |
+| `jroot checkpoints <name>` | List all checkpoints |
+| `jroot rm-snapshot <name> <label>` | Delete a snapshot |
+| `jroot rm-checkpoint <name> <label>` | Delete a checkpoint |
 
 
 ### Portability with `bundle` and `deploy`
@@ -946,7 +947,8 @@ It completes rather more than command names:
 ```bash
 jroot en<TAB>                    →  enter  exec
 jroot enter <TAB>                →  dev  web  build
-jroot revert dev <TAB>           →  before-upgrade  clean        (this jail's snapshots)
+jroot revert snapshot dev <TAB>  →  before-upgrade  clean        (this jail's snapshots)
+jroot revert checkpoint dev <TAB>  →  pre-patch       debug        (this jail's checkpoints)
 jroot port dev rm <TAB>          →  3000  8080                   (this jail's public ports)
 jroot mnt dev set <TAB>          →  work  secrets                (this jail's mounts)
 jroot ssh dev start --<TAB>      →  --port=  --key=  --random-password  ...
@@ -1283,10 +1285,14 @@ INSPECTION
 
 SNAPSHOTS
 
-  jroot snapshot <name> [label]    Save a snapshot
+  jroot snapshot <name> [label]    Save a full snapshot (compressed)
   jroot snapshots <name>           List snapshots
-  jroot revert <name> [label]      Restore a snapshot
-  jroot rm-snapshot <name> <label> Delete a snapshot
+  jroot checkpoint <name> [label]  Save a quick checkpoint (hard links)
+  jroot checkpoints <name>         List checkpoints
+  jroot revert snapshot <name> [label]   Restore a snapshot
+  jroot revert checkpoint <name> [label] Restore a checkpoint
+  jroot rm-snapshot <name> <label>   Delete a snapshot
+  jroot rm-checkpoint <name> <label> Delete a checkpoint
 
 
 MAINTENANCE

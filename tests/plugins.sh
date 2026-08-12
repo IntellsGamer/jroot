@@ -95,6 +95,13 @@ JROOT_HOME="$HOME_DIR" bash "$SCRIPT" plugin service stop example-plugin on_moni
 JROOT_HOME="$HOME_DIR" bash "$SCRIPT" plugin inspect example-plugin | grep -q 'last_result: stopped (service:on_monitor' || fail "service stop status"
 ok "background service lifecycle"
 
+# Checkpoint and revert syntax
+mkdir -p "$HOME_DIR/snapshots/sample-jail/checkpoints/pre-patch"
+: > "$HOME_DIR/snapshots/sample-jail/checkpoints/pre-patch.json"
+JROOT_HOME="$HOME_DIR" bash "$SCRIPT" checkpoints sample-jail | grep -q "pre-patch" || fail "checkpoint not listed"
+JROOT_HOME="$HOME_DIR" bash "$SCRIPT" help revert | grep -q "snapshot" || fail "help syntax not updated"
+ok "checkpoint and revert syntax verification"
+
 BAD="$WORK/bad-plugin"
 mkdir -p "$BAD"
 printf '%s\n' '{"name":"bad","version":"1.0.0"}' > "$BAD/plugin.json"
