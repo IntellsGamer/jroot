@@ -4766,7 +4766,7 @@ PLUGIN_API_VERSION=1
 
 is_reserved_command() {
     case "$1" in
-        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -4834,7 +4834,7 @@ except Exception as exc:
     print(f"Invalid plugin.json: {exc}", file=sys.stderr)
     raise SystemExit(1)
 errors = []
-reserved = {"init","build","enter","exec","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
+reserved = {"init","build","enter","exec","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","clone","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
 
 name = manifest.get("name")
 if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
@@ -7552,6 +7552,120 @@ checkpoint_list() {
     done
 }
 
+clone_usage() {
+    printf '%bjroot clone%b - create an isolated jail from a saved state\n\n' "$H" "$N"
+    printf '    %bjroot clone checkpoint <source> <label> <new-name>%b\n' "$G" "$N"
+    printf '    %bjroot clone snapshot <source> <label> <new-name>%b\n\n' "$G" "$N"
+    printf '    Clones a saved checkpoint or snapshot without modifying the source jail.\n'
+    printf '    The clone receives a fresh jail identity: host mounts, custom mounts,\n'
+    printf '    public ports, loopback allocation, and SSH host keys are not inherited.\n'
+}
+
+# Rewrite a saved configuration for a cloned jail. External host-facing state is
+# deliberately removed: a test or recovery clone must not expose the source's
+# ports, bind the source's host directories, or reuse its loopback address.
+clone_write_config() {
+    local saved_cfg="$1" target_cfg="$2" source="$3" kind="$4" label="$5" newname="$6"
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$saved_cfg" "$target_cfg" "$source" "$kind" "$label" "$newname" <<'PY'
+import json, sys
+saved, target, source, kind, label, name = sys.argv[1:]
+with open(saved, encoding="utf-8") as f:
+    config = json.load(f)
+if not isinstance(config, dict):
+    raise ValueError("saved configuration is not a JSON object")
+config["name"] = name
+# These fields identify or expose the source on the host. A clone starts with
+# no host attachments and obtains its own loopback only when it is first run.
+config["mount_host"] = 0
+config["mount_home"] = 0
+config["mounts"] = []
+config["ports"] = []
+config.pop("loopback", None)
+config["clone_source"] = {"jail": source, "type": kind, "label": label}
+with open(target, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+PY
+}
+
+cmd_clone() {
+    [ $# -eq 4 ] || { clone_usage; err "Usage: jroot clone checkpoint|snapshot <source> <label> <new-name>"; }
+    local kind="$1" source="$2" label="$3" newname="$4"
+    case "$kind" in
+        checkpoint|snapshot) ;;
+        *) err "Clone type must be 'checkpoint' or 'snapshot'." ;;
+    esac
+    [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || err "Invalid saved-state label: '$label'"
+    jail_name_valid "$newname" || err "Invalid or reserved clone name: '$newname'"
+    [ -f "$CONFIGS_DIR/$source.json" ] || err "Source jail '$source' not found. Run 'jroot list' to see jails."
+    [ "$source" != "$newname" ] || err "Clone name must differ from the source jail."
+    [ ! -e "$CONFIGS_DIR/$newname.json" ] || err "Jail '$newname' already exists. Choose another clone name."
+    [ ! -e "$ROOTS_DIR/$newname" ] || err "Rootfs path '$ROOTS_DIR/$newname' already exists. Resolve it before cloning."
+
+    local saved_root saved_cfg stage stage_root stage_cfg extract_dir
+    case "$kind" in
+        checkpoint)
+            saved_root="$SNAPSHOTS_DIR/$source/checkpoints/$label"
+            saved_cfg="$SNAPSHOTS_DIR/$source/checkpoints/$label.json"
+            [ -d "$saved_root" ] || err "Checkpoint '$label' not found for '$source'. Run 'jroot checkpoints $source'."
+            [ -f "$saved_cfg" ] || err "Checkpoint config '$saved_cfg' is missing."
+            ;;
+        snapshot)
+            saved_root="$SNAPSHOTS_DIR/$source/$label.tar.gz"
+            saved_cfg="$SNAPSHOTS_DIR/$source/$label.json"
+            [ -f "$saved_root" ] || err "Snapshot '$label' not found for '$source'. Run 'jroot snapshots $source'."
+            [ -f "$saved_cfg" ] || err "Snapshot config '$saved_cfg' is missing."
+            ;;
+    esac
+
+    ensure_runtime
+    stage="$(mktemp -d "$ROOTS_DIR/.clone.${newname}.XXXXXX")" || err "Could not create a clone staging directory."
+    stage_root="$stage/rootfs"
+    stage_cfg="$stage/config.json"
+    cleanup_clone_stage() { rm -rf "$stage"; }
+
+    log "Cloning $kind '$source/$label' into '$newname'..."
+    if [ "$kind" = "checkpoint" ]; then
+        # A clone must never hard-link to its checkpoint. A normal write in the
+        # clone would otherwise corrupt the immutable saved state.
+        cp -a --reflink=auto "$saved_root" "$stage_root" || { cleanup_clone_stage; err "Could not copy checkpoint rootfs."; }
+    else
+        extract_dir="$stage/extract"
+        mkdir -p "$extract_dir"
+        if ! tar -xzf "$saved_root" -C "$extract_dir" 2>/dev/null || [ ! -d "$extract_dir/$source" ]; then
+            cleanup_clone_stage
+            err "Could not extract snapshot '$label'; it is incomplete or corrupt."
+        fi
+        mv "$extract_dir/$source" "$stage_root" || { cleanup_clone_stage; err "Could not stage snapshot rootfs."; }
+    fi
+    clone_write_config "$saved_cfg" "$stage_cfg" "$source" "$kind" "$label" "$newname" \
+        || { cleanup_clone_stage; err "Could not prepare clone configuration."; }
+
+    # SSH host keys identify a server. Reusing them makes two independently
+    # running jails impersonate the same SSH host, so let ssh start regenerate.
+    rm -f "$stage_root"/etc/ssh/ssh_host_* 2>/dev/null || true
+
+    if ! mv "$stage_root" "$ROOTS_DIR/$newname"; then
+        cleanup_clone_stage
+        err "Could not register cloned rootfs."
+    fi
+    if ! mv "$stage_cfg" "$CONFIGS_DIR/$newname.json"; then
+        rm -rf "$ROOTS_DIR/$newname"
+        cleanup_clone_stage
+        err "Could not register clone configuration."
+    fi
+    cleanup_clone_stage
+
+    write_rootfs_niceties "$newname"
+    if ! verify_jail "$newname"; then
+        rm -rf "$ROOTS_DIR/$newname" "$CONFIGS_DIR/$newname.json"
+        err "Clone validation failed; the partial clone was removed."
+    fi
+    record_event "$newname" "clone" "from $kind '$source/$label'"
+    log "Clone '$newname' is ready (from $kind '$source/$label')."
+}
+
 cmd_snapshot() {
     [ $# -ge 1 ] || err "Usage: jroot snapshot <name> [label]"
     local name="$1" label="${2:-}"
@@ -7719,11 +7833,31 @@ cmd_checkpoint() {
     # Later checkpoints use rsync's link-dest mode, which links only files
     # whose content *and attributes* still match the prior immutable checkpoint.
     # A changed file receives a new inode in the new checkpoint.
-    if [ -n "$previous" ] && command -v rsync >/dev/null 2>&1; then
+    local shim shim_rel="" checkpoint_excludes=()
+    shim="$(jail_local_shim "$name")"
+    # The bind shim can be an intentionally unreadable zero-byte mountpoint in a
+    # live rootfs. It is recreated by the launcher, not user data, and must not
+    # make an otherwise valid checkpoint impossible to save.
+    if [ -f "$shim" ] && [ ! -r "$shim" ] && [ ! -s "$shim" ]; then
+        shim_rel="/usr/local/lib/libjroot.so"
+        checkpoint_excludes+=("--exclude=$shim_rel")
+    fi
+    if command -v rsync >/dev/null 2>&1; then
         mkdir -p "$target" || err "Checkpoint directory creation failed."
-        if ! rsync -a --delete --link-dest="$previous" "$ROOTS_DIR/$name/" "$target/"; then
+        local rsync_args=(-a --delete)
+        [ -n "$previous" ] && rsync_args+=("--link-dest=$previous")
+        rsync_args+=("${checkpoint_excludes[@]}")
+        if ! rsync "${rsync_args[@]}" "$ROOTS_DIR/$name/" "$target/"; then
             rm -rf "$target"
             err "Checkpoint update failed."
+        fi
+    elif [ -n "$shim_rel" ]; then
+        # cp has no exclusion switch. The tar fallback still keeps the saved
+        # rootfs private, while omitting only the launcher-owned placeholder.
+        mkdir -p "$target" || err "Checkpoint directory creation failed."
+        if ! tar --exclude=".${shim_rel}" -C "$ROOTS_DIR/$name" -cf - . 2>/dev/null | tar -C "$target" -xf - 2>/dev/null; then
+            rm -rf "$target"
+            err "Checkpoint failed while excluding the transient port shim."
         fi
     else
         cp -a --reflink=auto "$ROOTS_DIR/$name" "$target" || err "Checkpoint failed."
@@ -8041,6 +8175,9 @@ cmd_help_cmd() {
             printf '%bjroot snapshots%b - list saved snapshots for a jail\n\n' "$H" "$N"
             printf '    %bjroot snapshots <name>%b\n' "$G" "$N"
             ;;
+        clone)
+            clone_usage
+            ;;
         checkpoint)
             printf '%bjroot checkpoint%b - save an immutable incremental jail state\n\n' "$H" "$N"
             printf '    %bjroot checkpoint <name> [label]%b\n' "$G" "$N"
@@ -8171,6 +8308,7 @@ cmd_help() {
     printf '%bSNAPSHOTS%b\n' "$H" "$N"
     help_row "jroot snapshot" "<name> [label]"      "Save full jail rootfs (compressed)"
     help_row "jroot snapshots" "<name>"             "List saved snapshots"
+    help_row "jroot clone" "checkpoint|snapshot <source> <label> <new>" "Create an isolated jail from saved state"
     help_row "jroot checkpoint" "<name> [label]"    "Quick incremental jail state save"
     help_row "jroot checkpoint diff" "<name> <a> <b>" "Compare two checkpoint filesystems"
     help_row "jroot checkpoints" "<name>"           "List saved checkpoints"
@@ -8276,7 +8414,7 @@ _jroot_home() { printf '%s' "${JROOT_HOME:-$HOME/.jroot}"; }
 
 _jroot_reserved_name() {
     case "$1" in
-        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -8435,7 +8573,7 @@ _jroot() {
 
     local cmds="init build enter exec shell install config file sync limit bundle deploy monitor compose
         port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot
-        snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill
+        snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill
         stop ps rm delete completion completions help plugin"
 
     if [ "$idx" -le 1 ]; then
@@ -8623,6 +8761,16 @@ alpine:3.22 alpine:edge" -- "$cur"))
                 3) COMPREPLY=($(compgen -W "$(_jroot_checkpoints "${w[2]}")" -- "$cur")) ;;
             esac
             ;;
+        clone)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "checkpoint snapshot" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                4) case "${w[2]:-}" in
+                       checkpoint) COMPREPLY=($(compgen -W "$(_jroot_checkpoints "${w[3]}")" -- "$cur")) ;;
+                       snapshot) COMPREPLY=($(compgen -W "$(_jroot_snapshots "${w[3]}")" -- "$cur")) ;;
+                   esac ;;
+            esac
+            ;;
         checkpoint)
             case "$idx" in
                 2) COMPREPLY=($(compgen -W "diff $jails" -- "$cur")) ;;
@@ -8705,7 +8853,7 @@ _jroot_home() { print -r -- "${JROOT_HOME:-$HOME/.jroot}" }
 
 _jroot_reserved_name() {
     case "$1" in
-        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -8799,9 +8947,11 @@ _jroot_file_arg() {
         fi
     fi
     local -a names
-    local f
+    local f n
     for f in $(_jroot_home)/configs/*.json(N); do
-        names+=("${f:t:r}:")
+        n="${f:t:r}"
+        _jroot_reserved_name "$n" && continue
+        names+=("$n:")
     done
     (( ${#names} )) && compadd -S '' -- $names
     _files
@@ -8841,6 +8991,7 @@ _jroot() {
         'doctor:check the installation'
         'snapshot:save a snapshot'
         'snapshots:list snapshots'
+        'clone:create a jail from a saved checkpoint or snapshot'
         'checkpoint:save or compare incremental checkpoints'
         'checkpoints:list checkpoints'
         'revert:restore a snapshot or checkpoint'
@@ -9000,6 +9151,17 @@ _jroot() {
                 3) _jroot_checkpoints "${words[3]}" ;;
             esac
             ;;
+        clone)
+            case $pos in
+                2) compadd -- checkpoint snapshot ;;
+                3) _jroot_jails ;;
+                4) if [[ "${words[3]}" == checkpoint ]]; then
+                       _jroot_checkpoints "${words[4]}"
+                   elif [[ "${words[3]}" == snapshot ]]; then
+                       _jroot_snaps "${words[4]}"
+                   fi ;;
+            esac
+            ;;
         checkpoint)
             case $pos in
                 2) compadd -- diff; _jroot_jails ;;
@@ -9063,7 +9225,7 @@ end
 # 'ls' rather than a glob: an unmatched glob is an error in fish, and "no jails
 # yet" is a completely normal state.
 function __jroot_reserved_name -a name
-    contains -- $name init build enter exec shell install file sync limit bundle deploy monitor compose port net mnt mount config list ls info history compare diff which size update clean snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh completion completions plugin help data logs status registry
+    contains -- $name init build enter exec shell install file sync limit bundle deploy monitor compose port net mnt mount config list ls info history compare diff which size update clean snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh completion completions plugin help data logs status registry
 end
 
 function __jroot_jails
@@ -9233,6 +9395,7 @@ complete -c jroot -n '__jroot_at 1' -a which       -d 'Find a program across jai
 complete -c jroot -n '__jroot_at 1' -a doctor      -d 'Check the installation'
 complete -c jroot -n '__jroot_at 1' -a snapshot    -d 'Save a snapshot'
 complete -c jroot -n '__jroot_at 1' -a snapshots   -d 'List snapshots'
+complete -c jroot -n '__jroot_at 1' -a clone       -d 'Create a jail from saved state'
 complete -c jroot -n '__jroot_at 1' -a checkpoint  -d 'Save or compare incremental checkpoints'
 complete -c jroot -n '__jroot_at 1' -a checkpoints -d 'List checkpoints'
 complete -c jroot -n '__jroot_at 1' -a revert      -d 'Restore a snapshot or checkpoint'
@@ -9303,6 +9466,10 @@ complete -c jroot -n '__jroot_is ssh; and __jroot_at 3' -a 'start stop status pa
 complete -c jroot -n '__jroot_is ssh; and __jroot_arg_is 3 start' -a '--password-stdin --random-password --ask-password --no-password --permit-root --port= --user= --key= --password='
 
 # snapshots, checkpoints, and plugins
+complete -c jroot -n '__jroot_is clone; and __jroot_at 2' -a 'checkpoint snapshot'
+complete -c jroot -n '__jroot_is clone; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is clone; and __jroot_arg_is 2 checkpoint; and __jroot_at 4' -a '(__jroot_checkpoints (__jroot_arg 3))' -d checkpoint
+complete -c jroot -n '__jroot_is clone; and __jroot_arg_is 2 snapshot; and __jroot_at 4' -a '(__jroot_snapshots (__jroot_arg 3))' -d snapshot
 complete -c jroot -n '__jroot_is checkpoint; and __jroot_at 2' -a diff -d 'Compare two checkpoints'
 complete -c jroot -n '__jroot_is checkpoint; and __jroot_arg_is 2 diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is checkpoint; and __jroot_arg_is 2 diff; and __jroot_at 4' -a '(__jroot_checkpoints (__jroot_arg 3))' -d checkpoint
@@ -9323,7 +9490,7 @@ complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
 complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
 complete -c jroot -n '__jroot_is doctor' -a '--fix --mute=7d --mute=forever --mute=off'
 complete -c jroot -n '__jroot_is completion completions; and __jroot_at 2' -a 'bash zsh fish'
-complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec shell install config file sync limit bundle deploy monitor compose port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec shell install config file sync limit bundle deploy monitor compose port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
 complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
 FISH_COMPLETION_EOF
 }
@@ -9359,6 +9526,7 @@ jroot_cmd() {
         clean)         shift; cmd_clean "$@" ;;
         snapshot)      shift; cmd_snapshot "$@" ;;
         snapshots)     shift; cmd_snapshots "$@" ;;
+        clone)         shift; cmd_clone "$@" ;;
         checkpoint)    shift; cmd_checkpoint "$@" ;;
         checkpoints)   shift; cmd_checkpoints "$@" ;;
         revert)        shift; cmd_revert "$@" ;;

@@ -279,7 +279,7 @@ Plugin names become JRoot commands, so they cannot overlap core commands. The fo
 ```text
 init enter exec shell install file sync limit bundle deploy monitor compose
 port net mnt mount config list ls info history compare diff which size update
-clean snapshot snapshots checkpoint checkpoints revert rm-snapshot rm-checkpoint
+clean snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint
 doctor rm delete rename kill stop ps ssh completion completions plugin help
 data logs status registry
 ```

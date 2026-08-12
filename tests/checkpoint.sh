@@ -12,7 +12,7 @@ sed '$d' "$ROOT/jroot" > "$TMP/jroot-lib.sh"
 source "$TMP/jroot-lib.sh"
 
 name="demo"
-mkdir -p "$ROOTS_DIR/$name/etc" "$ROOTS_DIR/$name/var/cache" "$ROOTS_DIR/$name/usr/local/bin" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$HISTORY_DIR"
+mkdir -p "$ROOTS_DIR/$name/etc" "$ROOTS_DIR/$name/var/cache" "$ROOTS_DIR/$name/usr/local/bin" "$ROOTS_DIR/$name/usr/local/lib" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$HISTORY_DIR"
 printf '{"name":"demo","image":"ubuntu:22.04","user":"root","limit_mem":"256M"}\n' > "$CONFIGS_DIR/$name.json"
 printf 'original\n' > "$ROOTS_DIR/$name/etc/state.txt"
 printf 'obsolete\n' > "$ROOTS_DIR/$name/var/cache/old-index"
@@ -20,6 +20,15 @@ record_event() { :; }
 trigger_event_hooks() { :; }
 
 cmd_checkpoint "$name" baseline >/dev/null
+
+# The port shim may be an intentionally unreadable bind placeholder. It is
+# launcher-owned transient state and must not make a checkpoint fail.
+: > "$ROOTS_DIR/$name/usr/local/lib/libjroot.so"
+chmod 000 "$ROOTS_DIR/$name/usr/local/lib/libjroot.so"
+cmd_checkpoint "$name" shim-safe >/dev/null
+[ ! -e "$SNAPSHOTS_DIR/$name/checkpoints/shim-safe/usr/local/lib/libjroot.so" ]
+rm -f "$ROOTS_DIR/$name/usr/local/lib/libjroot.so"
+
 printf 'first-change\n' > "$ROOTS_DIR/$name/etc/state.txt"
 rm -f "$ROOTS_DIR/$name/var/cache/old-index"
 printf 'new tool\n' > "$ROOTS_DIR/$name/usr/local/bin/new-tool"

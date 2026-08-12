@@ -35,7 +35,7 @@ RESERVED_COMMANDS = {
     "init", "build", "enter", "exec", "shell", "install", "file", "sync", "limit",
     "bundle", "deploy", "monitor", "compose", "port", "net", "mnt", "mount",
     "config", "list", "ls", "info", "history", "compare", "diff", "which",
-    "size", "update", "clean", "snapshot", "snapshots", "checkpoint", "checkpoints",
+    "size", "update", "clean", "snapshot", "snapshots", "clone", "checkpoint", "checkpoints",
     "revert", "rm-snapshot", "rm-checkpoint", "doctor", "rm", "delete", "rename",
     "kill", "stop", "ps", "ssh", "completion", "completions", "plugin", "help",
 }

@@ -203,6 +203,7 @@ That's the core idea.
 | 📁 | File transfer (any direction) | **Yes** |
 |  📸 | Full rootfs snapshots       | **Yes** |
 |  ⚡ | Incremental checkpoints     | **Yes** |
+|  🧬 | Clone from saved state      | **Yes** |
 |  ↩️ | Snapshot/checkpoint restore | **Yes** |
 |  🧱 | Dockerfile-like JRoot builds | **Yes** |
 |  🔄 | Checkpointed package updates | **Yes** |
@@ -818,12 +819,26 @@ C   @config.limit_mem
 Summary: 1 added, 1 removed, 1 modified, 0 type changed, 1 config changed
 ```
 
+### Clone a saved state
+Use `jroot clone` when you need a writable, independent copy of a known checkpoint or snapshot without changing the source jail. This is useful for reproducing a bug, rehearsing an upgrade, or trying a risky change against a preserved state.
+
+```bash
+# Start a disposable investigation jail from a fast checkpoint
+jroot clone checkpoint dev pre-patch dev-investigation
+
+# Recreate a separate jail from a compressed snapshot
+jroot clone snapshot dev before-major-upgrade dev-archive-test
+```
+
+The clone receives the saved rootfs and configuration, but JRoot deliberately gives it a fresh host-facing identity. It clears public ports, host and custom mounts, and any assigned loopback address; it also removes inherited SSH host keys so `jroot ssh <clone> start` generates a distinct server identity. The source jail, checkpoint, and snapshot are not modified.
+
 ### Useful commands
 
 | Command | Description |
 |---|---|
 | `jroot snapshot <name> [label]` | Create a compressed full backup |
 | `jroot checkpoint <name> [label]` | Create a fast, incremental save point |
+| `jroot clone checkpoint|snapshot <source> <label> <new-name>` | Create an isolated writable jail from a saved state |
 | `jroot checkpoint diff <name> <a> <b>` | Compare filesystem and configuration changes between checkpoints |
 | `jroot revert snapshot <name> <label>` | Restore from a compressed snapshot |
 | `jroot revert checkpoint <name> <label>` | Restore from a fast checkpoint |
@@ -1387,6 +1402,7 @@ SNAPSHOTS
 
   jroot snapshot <name> [label]    Save a full snapshot (compressed)
   jroot snapshots <name>           List snapshots
+  jroot clone checkpoint|snapshot <source> <label> <new-name>  Clone a saved state
   jroot checkpoint <name> [label]  Save an incremental checkpoint
   jroot checkpoint diff <name> <a> <b>  Compare two checkpoint filesystems
   jroot checkpoints <name>         List checkpoints
