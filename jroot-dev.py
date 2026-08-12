@@ -35,9 +35,9 @@ RESERVED_COMMANDS = {
     "init", "enter", "exec", "shell", "install", "file", "sync", "limit",
     "bundle", "deploy", "monitor", "compose", "port", "net", "mnt", "mount",
     "config", "list", "ls", "info", "history", "compare", "diff", "which",
-    "size", "update", "clean", "snapshot", "snapshots", "revert", "rm-snapshot",
-    "doctor", "rm", "delete", "rename", "kill", "stop", "ps", "ssh",
-    "completion", "completions", "plugin", "help",
+    "size", "update", "clean", "snapshot", "snapshots", "checkpoint", "checkpoints",
+    "revert", "rm-snapshot", "rm-checkpoint", "doctor", "rm", "delete", "rename",
+    "kill", "stop", "ps", "ssh", "completion", "completions", "plugin", "help",
 }
 HOOK_FIXTURES = {
     "on_init": ["sample-jail", "ubuntu:22.04"],

@@ -167,7 +167,7 @@ JRoot passes an event selector as argument one and the documented payload after 
 | `on_stop` | `jroot kill` terminates a tracked jail. | `hook:on_stop <jail> user-request` | Clear external leases or record shutdown. |
 | `on_remove` | Removal is confirmed, before the rootfs is deleted. | `hook:on_remove <jail>` | Archive external metadata; do not expect the rootfs to survive. |
 | `on_sync` | `jroot sync` completes. | `hook:on_sync <source> <destination>` | Start a build, index a workspace, or record deployment input. |
-| `on_snapshot` | A snapshot is created or restored. | `hook:on_snapshot <jail> create:<label>` or `restore:<label>` | Track restore points or inform an external inventory. |
+| `on_snapshot` | A snapshot or checkpoint is created or restored. | `hook:on_snapshot <jail> create:<label>`, `restore:<label>`, `checkpoint-create:<label>`, or `restore-checkpoint:<label>` | Track restore points or inform an external inventory. |
 | `on_limit` | Resource settings are saved. | `hook:on_limit <jail> mem=<value>,cpu=<value>,nofile=<value>` | Store governance changes or notify an operator. |
 | Custom `on_*` | You start it as a plugin service. | `hook:on_monitor <arguments...>` | Run an explicit long-lived worker. |
 
