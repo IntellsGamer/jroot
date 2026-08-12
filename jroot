@@ -4222,11 +4222,22 @@ plugin_usage() {
     printf '    %bjroot plugin install <dir|file>%b    install a plugin or packaged bundle\n' "$G" "$N"
     printf '    %bjroot plugin remove <name>%b         uninstall a plugin\n' "$G" "$N"
     printf '    %bjroot plugin init-sdk%b              generate a starter Python plugin template\n\n' "$G" "$N"
-    printf '    %bSupported Lifecycle Hooks:%b\n' "$H" "$N"
-    printf '        on_init       triggered when a new jail is created\n'
-    printf '        on_enter      triggered when entering or executing inside a jail\n'
-    printf '        on_stop       triggered when stopping/killing a jail or its SSH daemon\n'
-    printf '        on_remove     triggered when a jail is deleted\n'
+    printf '    %bSupported Lifecycle Hooks (Discord.py Grade):%b
+' "$H" "$N"
+    printf '        on_init       triggered when a new jail is created
+'
+    printf '        on_enter      triggered when entering or executing inside a jail
+'
+    printf '        on_stop       triggered when stopping/killing a jail
+'
+    printf '        on_remove     triggered when a jail is deleted
+'
+    printf '        on_sync       triggered when synchronizing files via jroot sync
+'
+    printf '        on_snapshot   triggered when a snapshot is created or restored
+'
+    printf '        on_limit      triggered when resource limits are updated
+'
 }
 
 cmd_plugin() {
