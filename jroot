@@ -1997,8 +1997,8 @@ get_ubuntu() {
             || err "Failed to download Ubuntu ${version} rootfs"
     fi
     log "Extracting rootfs..."
-    tar -xzf "$tarball" -C "$rootfs"
-    [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ] || err "Rootfs extraction failed - /bin/sh not found"
+    tar -xzf "$tarball" -C "$rootfs" || { rm -rf "$rootfs"; err "Rootfs extraction failed; the incomplete rootfs was removed."; }
+    [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ] || { rm -rf "$rootfs"; err "Rootfs extraction failed - /bin/sh not found; the incomplete rootfs was removed."; }
     log "Rootfs extracted to $rootfs"
 }
 
@@ -2032,7 +2032,7 @@ get_alpine() {
                 || err "Failed to download Alpine edge rootfs"
         fi
         log "Extracting rootfs..."
-        tar -xzf "$tarball" -C "$rootfs"
+        tar -xzf "$tarball" -C "$rootfs" || { rm -rf "$rootfs"; err "Alpine rootfs extraction failed; the incomplete rootfs was removed."; }
     else
         # Alpine tarballs include patch version (e.g., 3.20.3, 3.20.8, 3.20.9)
         # Try to discover the latest patch version by listing the directory
@@ -2062,9 +2062,9 @@ get_alpine() {
                 || err "Failed to download Alpine ${version} rootfs"
         fi
         log "Extracting rootfs..."
-        tar -xzf "$tarball" -C "$rootfs"
+        tar -xzf "$tarball" -C "$rootfs" || { rm -rf "$rootfs"; err "Alpine rootfs extraction failed; the incomplete rootfs was removed."; }
     fi
-    [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ] || err "Rootfs extraction failed - /bin/sh not found"
+    [ -e "$rootfs/bin/sh" ] || [ -L "$rootfs/bin/sh" ] || { rm -rf "$rootfs"; err "Rootfs extraction failed - /bin/sh not found; the incomplete rootfs was removed."; }
     log "Rootfs extracted to $rootfs"
 }
 
@@ -3171,6 +3171,11 @@ cmd_init() {
     repo="${image%%:*}"
     tag="${image#*:}"
     [ -n "$tag" ] || tag="latest"
+    distro="$repo"
+    case "$distro" in
+        ubuntu|alpine) ;;
+        *) err "Unsupported image repository '$repo'. Use an Ubuntu or Alpine image from 'jroot init --list'." ;;
+    esac
 
     # Version parsing
     if [ "$distro" = "ubuntu" ]; then
@@ -3259,6 +3264,11 @@ cmd_init() {
     elif [ "$distro" = "alpine" ]; then
         get_alpine "$name" "$version"
         config_apk "$name" "$version"
+    fi
+
+    if [ ! -f "$ROOTS_DIR/$name/etc/os-release" ] || { [ ! -e "$ROOTS_DIR/$name/bin/sh" ] && [ ! -L "$ROOTS_DIR/$name/bin/sh" ]; }; then
+        rm -rf "$ROOTS_DIR/$name"
+        err "Jail '$name' rootfs preparation failed; the incomplete rootfs was removed. Check network access and retry 'jroot init $image'."
     fi
 
     write_rootfs_niceties "$name"

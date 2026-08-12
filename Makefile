@@ -363,6 +363,8 @@ test: check
 	@bash tests/completion.sh
 	@printf '$(CYAN)==>$(NC) tests/plugins.sh\n'
 	@bash tests/plugins.sh
+	@printf '$(CYAN)==>$(NC) tests/init.sh\n'
+	@bash tests/init.sh
 	@printf '$(GRN)==> test passed$(NC)\n'
 
 # -----------------------------------------------------------------------------
