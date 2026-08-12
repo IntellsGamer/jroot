@@ -100,7 +100,7 @@ no 'relative jail path'      'must be absolute'        J file cp "$work/src.txt"
 no 'source directory absent' 'No such directory'       J file cp dev:/nope/x "$work/y"
 no 'too many arguments'      'needs <src> <dst>'       J file cp a b c d
 no 'no operation'            'Missing operation'       J file
-no 'unknown operation'       'Unknown file op'         J file sync a b
+no 'unknown operation'       'Unknown file op'         J file frobnicate a b
 
 echo "symlinks that leave the rootfs"
 setup
@@ -114,7 +114,7 @@ if ln -s "$outside" "$JROOT_HOME/roots/dev/lib" 2>/dev/null && [ -L "$JROOT_HOME
     no 'write through an escaping symlink' 'leaves the rootfs' \
         J file cp "$work/src.txt" dev:/lib/planted.txt
     ln -s "$outside/secret.txt" "$JROOT_HOME/roots/dev/root/leak" 2>/dev/null
-    no 'read through an escaping symlink'  'points outside' \
+    no 'read through an escaping symlink'  'pointing outside' \
         J file cp dev:/root/leak "$work/leak.txt"
 else
     printf '  SKIP  this host cannot create symlinks (run these on Linux)\n'

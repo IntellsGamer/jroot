@@ -355,6 +355,8 @@ test: check
 	@rm -rf "$(BUILDDIR)/home" "$(BUILDDIR)/jroot-lib.sh"
 	@printf '$(CYAN)==>$(NC) tests/file.sh\n'
 	@bash tests/file.sh
+	@printf '$(CYAN)==>$(NC) tests/sync.sh\n'
+	@bash tests/sync.sh
 	@printf '$(CYAN)==>$(NC) tests/completion.sh\n'
 	@bash tests/completion.sh
 	@printf '$(GRN)==> test passed$(NC)\n'
