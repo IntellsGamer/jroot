@@ -1652,3 +1652,23 @@ jroot compose down
 `jroot` includes a secure, production-grade event-driven plugin extension system with full SDK support. 
 
 👉 **Read the complete [Plugin Development Guide & Documentation Hub](./docs/PLUGINS.md)** for details on lifecycle hooks (`on_init`, `on_enter`, `on_remove`), plugin manifests (`plugin.json`), and the `jroot_sdk` Python library.
+
+
+---
+
+# 🪟 Windows Plugin Development (`jroot-dev.py`)
+
+Because `jroot` runs on Linux userspace via PRoot, Windows hosts cannot execute `jroot` directly. However, developers on Windows can bootstrap, validate, and simulate `jroot` plugins locally using the cross-platform development helper:
+
+```bash
+# Initialize a new plugin template
+python jroot-dev.py init my-plugin
+
+# Validate plugin manifest and entry point syntax
+python jroot-dev.py validate my-plugin
+
+# Simulate lifecycle hook execution locally
+python jroot-dev.py simulate on_init myjail ubuntu:22.04 --path my-plugin
+```
+
+For full details, see [docs/WINDOWS_DEV.md](docs/WINDOWS_DEV.md).
