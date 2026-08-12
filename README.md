@@ -749,6 +749,23 @@ jroot file cp dev ~/app.tar.gz :/root/app.tar.gz
 
 Copies into a jail are recorded in `jroot history`, since they change it.
 
+
+### Workspace synchronization
+
+`jroot sync` mirrors a directory between the host and a jail, or in the reverse direction. It uses `rsync`, so repeated transfers are incremental; `--delete` removes destination files absent from the source, `--dry-run` previews changes, and `--watch` repeats a transfer after local filesystem changes.
+
+```bash
+# Host to jail
+jroot sync ./my-app dev:/root/my-app
+
+# Jail to host
+jroot sync dev:/root/my-app ./my-app-backup
+
+# Preview or continuously synchronize a workspace
+jroot sync --dry-run ./my-app dev:/root/my-app
+jroot sync --watch ./my-app dev:/root/my-app
+```
+
 ---
 
 # 📸 Snapshots
@@ -785,6 +802,16 @@ jroot snapshots ubuntu
 jroot snapshot ubuntu clean
 jroot revert ubuntu clean
 jroot rm-snapshot ubuntu clean
+```
+
+
+### Portability with `bundle` and `deploy`
+
+Use `jroot bundle` to package a jail rootfs and its configuration into a compressed archive. `jroot deploy` restores that bundle on another JRoot host and may assign a new jail name during deployment.
+
+```bash
+jroot bundle dev my-dev-jail.tar.gz
+jroot deploy my-dev-jail.tar.gz production-jail
 ```
 
 ---
@@ -845,6 +872,33 @@ jroot kill dev --force
 The jail's rootfs and configuration are left intact — you can restart it with `jroot enter dev` later.
 
 Note that `jroot kill` targets the interactive shell. To stop an SSH daemon, use `jroot ssh <name> stop`.
+
+
+### Monitoring active jails
+
+`jroot monitor` presents a live terminal dashboard for active jails, including process state, rootfs size, observed memory use, and active commands.
+
+```bash
+jroot monitor
+```
+
+### Multi-jail stacks with `compose`
+
+`jroot compose` creates, inspects, and stops a group of jails declared in `jroot-compose.yml`. The command uses Python with PyYAML to parse the file.
+
+```yaml
+jails:
+  web:
+    image: ubuntu:22.04
+  db:
+    image: ubuntu:22.04
+```
+
+```bash
+jroot compose up
+jroot compose status
+jroot compose down
+```
 
 ---
 
@@ -1553,103 +1607,8 @@ something is making a decision.
 
 And that's usually where the fun starts.
 
----
 
-<div align="center">
-
-# JRoot
-
-### **Rootless Linux, built from userspace.**
-
-**No host root.**
-**No VM.**
-**No privileged `chroot`.**
-
-Just a Linux userspace running somewhere it technically shouldn't be this easy to run.
-
-</div>
-
-
----
-
-# 🔄 `jroot sync` – Bidirectional Workspace Mirroring
-
-Moving code between host and jails during development is streamlined with `jroot sync`. Powered by `rsync`, it supports incremental synchronization, deletion flags, dry runs, and a real-time watch mode (`--watch`) using `inotify` or automated polling.
-
-```bash
-# Host to jail
-jroot sync ./my-app dev:/root/my-app
-
-# Jail to host backup
-jroot sync dev:/root/my-app ./my-app-backup
-
-# Continuous watch mode (syncs on every local change)
-jroot sync --watch ./my-app dev:/root/my-app
-
-# Sync with deletion of extraneous destination files
-jroot sync --delete ./my-app dev:/root/my-app
-```
-
----
-
-# 📦 `jroot bundle` & `jroot deploy` – Portability
-
-Jails can be packaged into portable, compressed archives and deployed across different machines or environments without losing configuration or state.
-
-```bash
-# Bundle a jail into a single tarball
-jroot bundle dev my-dev-jail.tar.gz
-
-# Deploy a bundled jail on another host (optionally renaming it)
-jroot deploy my-dev-jail.tar.gz production-jail
-```
-
----
-
-# 📊 `jroot monitor` – Real-Time Telemetry TUI
-
-Monitor active resource usage across all running jails in real time. `jroot monitor` provides a live telemetry dashboard displaying process IDs, status, rootfs disk size, memory consumption, and active commands.
-
-```bash
-jroot monitor
-```
-
----
-
-# 🎼 `jroot compose` – Multi-Jail Stack Orchestration
-
-Define and orchestrate multi-jail development stacks using declarative configuration files (`jroot-compose.yml`), mirroring container-orchestration workflows in an entirely rootless environment.
-
-```yaml
-# jroot-compose.yml example
-jails:
-  web:
-    image: ubuntu:22.04
-  db:
-    image: ubuntu:22.04
-```
-
-```bash
-# Start the stack
-jroot compose up
-
-# Check status
-jroot compose status
-
-# Stop and terminate the stack
-jroot compose down
-```
-
-
----
-
-
-
----
-
----
-
-# Plugin development
+## Plugin development
 
 JRoot supports packaged, event-driven host-side plugins with manifest validation, private state, captured logs, service lifecycle controls, and an importable Python SDK. Packaged plugins declare the API version, entry point, lifecycle hooks, optional host dependencies, and human-readable access expectations before installation.
 
@@ -1657,9 +1616,7 @@ JRoot supports packaged, event-driven host-side plugins with manifest validation
 
 Read the [Plugin Development Guide](./docs/PLUGINS.md) for the stable manifest contract, hook payloads, SDK, services, and validation workflow.
 
----
-
-# Windows plugin development
+### Windows plugin development
 
 Windows cannot run JRoot’s PRoot runtime, but contributors can create, strictly validate, simulate, and fixture-test plugins before transferring them to a Linux host:
 
