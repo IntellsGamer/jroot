@@ -4222,7 +4222,7 @@ plugin_usage() {
     printf '    %bjroot plugin install <dir|file>%b    install a plugin or packaged bundle\n' "$G" "$N"
     printf '    %bjroot plugin remove <name>%b         uninstall a plugin\n' "$G" "$N"
     printf '    %bjroot plugin init-sdk%b              generate a starter Python plugin template\n\n' "$G" "$N"
-    printf '    %bSupported Lifecycle Hooks (Discord.py Grade):%b
+    printf '    %bSupported Lifecycle Hooks (Event-Driven):%b
 ' "$H" "$N"
     printf '        on_init       triggered when a new jail is created
 '

@@ -1,48 +1,54 @@
-# 🔌 JRoot Production-Grade Plugin System (`discord.py` Grade)
+# JRoot Plugin System
 
-JRoot features an enterprise-grade, event-driven plugin extension architecture. Inspired by robust event-driven frameworks like `discord.py`, plugins can intercept deep lifecycle hooks, manage private persistent state, query jail metadata, and register custom subcommands without risking core command collisions.
+JRoot provides an event-driven extension architecture designed for enterprise userspace container management. The plugin subsystem enables modular integration through lifecycle hook interception, isolated state persistence, and custom command registration without conflicting with core runtime operations.
 
 ---
 
-## Quickstart: Generating a Plugin SDK Template
+## Architecture Overview
 
-Generate a starter Python plugin bundle instantly:
+Plugins interface with JRoot via executable scripts or packages placed in the plugin search path. The runtime dispatches events to registered plugin handlers, passing relevant execution context and state parameters as command-line arguments.
+
+---
+
+## Quickstart: SDK Template Generation
+
+To bootstrap a new plugin conforming to standard structure and SDK practices:
 
 ```bash
 jroot plugin init-sdk
 ```
 
-This creates a `./jroot-plugin-template/` directory containing:
-1. **`plugin.json`**: Manifest declaring plugin metadata, version, and author.
-2. **`main.py`**: Event-driven entry point handling hook dispatches and custom arguments.
+This generates a local `./jroot-plugin-template/` directory containing:
+1. **`plugin.json`**: Manifest declaring plugin metadata, versioning, and author information.
+2. **`main.py`**: Event-handling entry point demonstrating hook dispatches and SDK utilities.
 
 ---
 
-## Lifecycle Hooks & Events (`discord.py` Style)
+## Lifecycle Hooks & Event Dispatch
 
-Plugins listen to core JRoot lifecycle events by reacting to `hook:<event_name>` arguments:
+Plugins subscribe to core runtime events using standard hook arguments (`hook:<event_name>`):
 
-| Event Hook | Trigger Condition | Arguments Passed |
+| Lifecycle Event | Trigger Condition | Parameter Payload |
 | :--- | :--- | :--- |
-| **`on_init`** | Fired immediately after a new jail is created. | `[jail_name, image]` |
-| **`on_enter`** | Fired whenever a shell or command is launched inside a jail. | `[jail_name]` |
-| **`on_stop`** | Fired when stopping/killing a jail. | `[jail_name]` |
-| **`on_remove`** | Fired when a jail is permanently deleted. | `[jail_name]` |
-| **`on_sync`** | Fired when synchronizing files via `jroot sync`. | `[src, dst]` |
-| **`on_snapshot`** | Fired when a snapshot is created or restored. | `[jail_name, action:label]` |
-| **`on_limit`** | Fired when resource limits are updated. | `[jail_name]` |
+| **`on_init`** | Executed immediately after a new jail instance is provisioned. | `[jail_name, image]` |
+| **`on_enter`** | Executed when attaching a shell or running a command inside a jail. | `[jail_name]` |
+| **`on_stop`** | Executed upon stopping or terminating a jail container. | `[jail_name]` |
+| **`on_remove`** | Executed when a jail instance is permanently purged. | `[jail_name]` |
+| **`on_sync`** | Executed during bidirectional filesystem synchronization (`jroot sync`). | `[src, dst]` |
+| **`on_snapshot`** | Executed when creating or restoring container snapshots. | `[jail_name, action:label]` |
+| **`on_limit`** | Executed when updating resource governance limits. | `[jail_name]` |
 
 ---
 
-## Private Plugin Data Stores
+## Private Plugin Data Persistence
 
-Every plugin is automatically assigned a private persistent storage directory (`$JROOT_PLUGIN_DATA`), enabling plugins to save configuration files, caches, or state databases without conflicting with other extensions.
+Each plugin is provisioned with a dedicated persistent storage directory (`$JROOT_PLUGIN_DATA`), isolating local state, configuration files, and caches to prevent state pollution across distinct plugins.
 
 ---
 
-## Python SDK (`JRootContext`)
+## Python SDK Reference (`JRootContext`)
 
-Import `JRootContext` to interact cleanly with JRoot storage and execute commands inside jails:
+The `JRootContext` library provides helper utilities for programmatic jail inspection, command execution, and state persistence:
 
 ```python
 #!/usr/bin/env python3
@@ -52,14 +58,14 @@ from jroot_sdk import JRootContext
 def main():
     ctx = JRootContext()
     
-    # Read/write private persistent state
-    state = ctx.read_plugin_state("counter.json", {"runs": 0})
-    state["runs"] += 1
-    ctx.write_plugin_state(state, "counter.json")
+    # Manage isolated persistent plugin state
+    state = ctx.read_plugin_state("state.json", {"executions": 0})
+    state["executions"] += 1
+    ctx.write_plugin_state(state, "state.json")
 
-    print(f"Plugin run count: {state['runs']}")
+    print(f"Total executions: {state['executions']}")
     for jail in ctx.list_jails():
-        print(f"Jail: {jail['name']} ({jail['image']})")
+        print(f"Container: {jail['name']} ({jail['image']})")
 
 if __name__ == "__main__":
     main()
