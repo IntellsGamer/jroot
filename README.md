@@ -416,6 +416,44 @@ jroot mnt dev rm project
 
 **Read-only mounts are enforced at the syscall level** via an LD_PRELOAD shim that intercepts `open()`, `creat()`, `mkdir()`, `unlink()`, `rename()`, `chmod()`, `chown()`, and every other write syscall, returning `EROFS`.
 
+### Managed volumes with `jroot volume`
+
+A custom mount exposes a directory you already own elsewhere on the host. A **volume** is different: JRoot creates and owns its storage directory under `~/.jroot/volumes/<jail>/<volume>`, then makes it available inside the jail at `/mnt/<volume>`. It is useful for state that should survive a rootfs rebuild or package change—application uploads, a database data directory, a cache, or generated assets—without choosing and managing a host path yourself.
+
+```bash
+# Create JRoot-owned storage and attach it read-write (the default).
+jroot volume dev create appdata
+
+# The data is available inside the jail at /mnt/appdata.
+jroot enter dev sh -c 'printf hello > /mnt/appdata/message'
+
+# See real disk use and whether it is currently attached.
+jroot volume dev list
+jroot volume dev info appdata
+
+# Temporarily make the data inaccessible to new jail entries, without deleting it.
+jroot volume dev detach appdata
+
+# Bring the same data back, optionally read-only.
+jroot volume dev attach appdata ro
+jroot volume dev set appdata rw
+
+# Permanently remove the owned directory and its contents.
+jroot volume dev rm appdata
+```
+
+| Operation | Effect on data | Effect inside the jail |
+|---|---|---|
+| `create` | Creates a new empty volume | Attaches it at `/mnt/<volume>` as `rw` unless `ro` is supplied |
+| `detach` | Keeps every file | Removes the attachment on the next jail entry |
+| `attach` | Keeps every file | Restores the attachment as `rw` or `ro` |
+| `set` | Keeps every file | Changes the next entry’s access mode |
+| `rm` | **Deletes the volume directory and its contents** | Removes its attachment as part of deletion |
+
+Volume attachment and `ro`/`rw` behavior use the same mount path as `jroot mnt`, so read-only protection has the same kernel and shim enforcement. The `volume` command owns only the storage directory and its lifecycle; it does not introduce a second mount implementation.
+
+Volumes are intentionally **outside the rootfs**. Snapshots and bundles do not copy their data. A snapshot of the same jail retains its attachment configuration and can use the existing local volume again; a deployed bundle drops JRoot-managed volume attachments because the corresponding storage was not packaged. Renaming a jail moves its managed volumes with it, while a clone starts without any volume attachment.
+
 A jail shouldn't accidentally become:
 
 > "Ubuntu, except surprise, here's your entire host."
@@ -1146,6 +1184,7 @@ jroot revert snapshot dev <TAB>  →  before-upgrade  clean        (this jail's 
 jroot revert checkpoint dev <TAB>  →  pre-patch       debug        (this jail's checkpoints)
 jroot port dev rm <TAB>          →  3000  8080                   (this jail's public ports)
 jroot mnt dev set <TAB>          →  work  secrets                (this jail's mounts)
+jroot volume dev detach <TAB>     →  appdata  cache               (this jail's volumes)
 jroot ssh dev start --<TAB>      →  --port=  --key=  --random-password  ...
 jroot build --<TAB>              →  --file=  --tag=  --build-arg=  --no-cache
 jroot doctor --<TAB>             →  --fix  --mute=7d  --mute=forever  ...
@@ -1540,6 +1579,12 @@ FILE & PORT MANAGEMENT
   jroot mnt <name> <label> <dir> ro Mount read-only
   jroot mnt <name> set <label> rw|ro Change mount mode
   jroot mnt <name> rm <label>      Unmount /mnt/<label>
+  jroot volume <name> list         Show JRoot-managed storage
+  jroot volume <name> create <v>   Create and attach a volume (rw)
+  jroot volume <name> attach <v> [rw|ro]  Attach retained storage
+  jroot volume <name> detach <v>   Remove attachment but keep data
+  jroot volume <name> info <v>     Show size and attachment state
+  jroot volume <name> rm <v>       Delete a volume and its data
 
 
 INSPECTION

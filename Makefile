@@ -320,7 +320,7 @@ test: check
 	@rm -rf "$(BUILDDIR)/home"
 	@set -e; export JROOT_HOME="$(CURDIR)/$(BUILDDIR)/home" NONINTERACTIVE=1; \
 	printf '$(DIM)    should succeed with no jails:$(NC)\n'; \
-	for args in "help" "help ssh" "help init" "help net" "help mnt" "list" "list --json" \
+	for args in "help" "help ssh" "help init" "help net" "help mnt" "help volume" "list" "list --json" \
 	            "init --list" "history" "doctor"; do \
 		if bash "$(SCRIPT)" $$args >/dev/null 2>&1; then \
 			printf '      jroot %-16s ok\n' "$$args"; \
@@ -379,6 +379,8 @@ test: check
 	@bash tests/build.sh
 	@printf '$(CYAN)==>$(NC) tests/maintenance.sh\n'
 	@bash tests/maintenance.sh
+	@printf '$(CYAN)==>$(NC) tests/volume.sh\n'
+	@bash tests/volume.sh
 	@printf '$(CYAN)==>$(NC) tests/checkpoint.sh\n'
 	@bash tests/checkpoint.sh
 	@printf '$(CYAN)==>$(NC) tests/bundle.sh\n'

@@ -16,7 +16,7 @@ rm -rf "$JROOT_HOME"
 mkdir -p "$JROOT_HOME/configs" "$JROOT_HOME/snapshots/dev/checkpoints/baseline" "$JROOT_HOME/snapshots/dev/checkpoints/changed" \
          "$JROOT_HOME/roots/dev/etc/nginx" "$JROOT_HOME/roots/dev/usr/local/bin" \
          "$JROOT_HOME/roots/dev/root" "$JROOT_HOME/roots/web/etc" \
-         "$JROOT_HOME/plugins/ledger" "$JROOT_HOME/services/dev"
+         "$JROOT_HOME/plugins/ledger" "$JROOT_HOME/services/dev" "$JROOT_HOME/volumes/dev/appdata"
 printf '%s\n' '{"name":"dev","image":"ubuntu:22.04","user":"root","ports":[3000,8080],"mounts":[["work","/tmp/w","ro"],["src","/tmp/s","rw"]]}' \
     > "$JROOT_HOME/configs/dev.json"
 printf '%s\n' '{"name":"web","image":"ubuntu:24.04","user":"unroot","ports":[],"mounts":[]}' \
@@ -69,6 +69,7 @@ try 'jroot bui'                       'build'
 try 'jroot clo'                       'clone'
 try 'jroot pers'                      'persist'
 try 'jroot serv'                      'service'
+try 'jroot vol'                       'volume'
 echo "jail names"
 try 'jroot enter '                    'dev'
 try 'jroot enter d'                   'dev'
@@ -128,6 +129,9 @@ try 'jroot limit dev --'              '--mem='
 try 'jroot persist dev '              'start'
 try 'jroot service dev '              'add'
 try 'jroot service dev status '       'web'
+try 'jroot volume dev '               'create'
+try 'jroot volume dev detach '        'appdata'
+try 'jroot volume dev set appdata '   'ro'
 echo "flags"
 try 'jroot ssh dev '                  'status'
 try 'jroot ssh dev start --'          '--random-password'
@@ -152,6 +156,7 @@ try 'jroot help '                     'ssh'
 try 'jroot help '                     'clone'
 try 'jroot help '                     'persist'
 try 'jroot help '                     'service'
+try 'jroot help '                     'volume'
 try 'jroot help lo'                     'logs'
 try 'jroot help file '                'cp'
 

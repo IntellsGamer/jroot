@@ -15,6 +15,7 @@
 #   jroot port list|add|rm <name> [port]  Ports allowed to bind publicly
 #   jroot net [set <name> auto|off|addr]  Per-jail loopback address
 #   jroot mnt <name> [label dir [rw|ro]]  Bind a host dir at /mnt/<label>
+#   jroot volume <name> ...   Create and manage JRoot-owned persistent storage
 #   jroot ssh <name> start|stop|status [port]  SSH into a jail (persistent daemon)
 #   jroot config <name>         Show / change a jail's settings
 #   jroot list [--json]         List all jails (machine-readable with --json)
@@ -110,6 +111,7 @@ ROOTS_DIR="$JROOT_HOME/roots"
 CONFIGS_DIR="$JROOT_HOME/configs"
 SNAPSHOTS_DIR="$JROOT_HOME/snapshots"
 HISTORY_DIR="$JROOT_HOME/history"
+VOLUMES_DIR="$JROOT_HOME/volumes"
 BIN_DIR="$JROOT_HOME/bin"
 CACHE_DIR="$JROOT_HOME/.cache"
 PROOT_BIN="$BIN_DIR/proot"
@@ -585,7 +587,7 @@ PYEOF
 }
 
 ensure_runtime() {
-    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR" "$JROOT_HOME/pids" "$JROOT_HOME/logs" "$JROOT_HOME/services"
+    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR" "$VOLUMES_DIR" "$JROOT_HOME/pids" "$JROOT_HOME/logs" "$JROOT_HOME/services"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
     if [ ! -x "$(service_watchdog_path)" ] || ! grep -q "jroot-service-watchdog-v1" "$(service_watchdog_path)" 2>/dev/null; then
         write_service_watchdog
@@ -3431,7 +3433,9 @@ mount_rm() {
     if ! echo "$cur" | cut -f1 | grep -qx "$label"; then
         err "No mount '/mnt/$label' for '$name'. Run 'jroot mnt $name list' to see mounts."
     fi
-    pairs="$(echo "$cur" | sed 's/\t/=/g' | grep -v "^$label=" | tr '\n' ' ')"
+    # awk intentionally returns success even when this was the final entry;
+    # grep -v would return 1 for an empty result under callers using pipefail.
+    pairs="$(printf '%s\n' "$cur" | sed 's/\t/=/g' | awk -F= -v label="$label" '$1 != label' | tr '\n' ' ')"
     set_config_mounts "$cfg" $pairs
     log "Removed /mnt/$label from '$name'."
     record_event "$name" "mnt" "removed /mnt/$label"
@@ -3474,6 +3478,166 @@ cmd_mnt() {
             [ $# -ge 3 ] || { mnt_usage "$name"; err "Usage: jroot mnt $name <label> <hostdir> [ro]"; }
             mount_add "$name" "$2" "$3" "$4"
             ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# JRoot-managed volumes
+#
+# A volume is simply a JRoot-owned host directory under volumes/<jail>/<name>.
+# Attachment deliberately delegates to mount_add/mount_set/mount_rm so volumes
+# inherit the exact same PRoot binding and ro/rw enforcement as `jroot mnt`.
+# ---------------------------------------------------------------------------
+volume_root() { printf '%s/%s\n' "$VOLUMES_DIR" "$1"; }
+volume_path() { printf '%s/%s\n' "$(volume_root "$1")" "$2"; }
+
+volume_valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || return 1
+    case "$1" in host|home) return 1 ;; esac
+    return 0
+}
+
+volume_attached_mode() {
+    local name="$1" volume="$2" path label hpath mode
+    path="$(volume_path "$name" "$volume")"
+    while IFS=$'\t' read -r label hpath mode; do
+        [ "$label" = "$volume" ] || continue
+        [ "$hpath" = "$path" ] || continue
+        printf '%s\n' "${mode:-rw}"
+        return 0
+    done < <(config_mounts "$CONFIGS_DIR/$name.json")
+    return 1
+}
+
+volume_list() {
+    local name="$1" root path volume mode size
+    root="$(volume_root "$name")"
+    if [ ! -d "$root" ] || ! find "$root" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .; then
+        log "No managed volumes for '$name'."
+        return 0
+    fi
+    printf '%-20s %-12s %-10s %s\n' "VOLUME" "SIZE" "MODE" "MOUNT"
+    for path in "$root"/*; do
+        [ -d "$path" ] || continue
+        volume="$(basename "$path")"
+        size="$(du -sh "$path" 2>/dev/null | awk '{print $1}')"
+        mode="$(volume_attached_mode "$name" "$volume" 2>/dev/null || true)"
+        if [ -n "$mode" ]; then
+            printf '%-20s %-12s %-10s /mnt/%s\n' "$volume" "${size:-0}" "$mode" "$volume"
+        else
+            printf '%-20s %-12s %-10s %s\n' "$volume" "${size:-0}" "detached" "-"
+        fi
+    done
+}
+
+volume_info() {
+    local name="$1" volume="$2" path mode size files
+    path="$(volume_path "$name" "$volume")"
+    [ -d "$path" ] || err "Volume '$volume' does not exist for '$name'. Run 'jroot volume $name list'."
+    mode="$(volume_attached_mode "$name" "$volume" 2>/dev/null || true)"
+    size="$(du -sh "$path" 2>/dev/null | awk '{print $1}')"
+    files="$(find "$path" -xdev -type f 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'Volume:     %s\n' "$volume"
+    printf 'Jail:       %s\n' "$name"
+    printf 'Size:       %s\n' "${size:-0}"
+    printf 'Files:      %s\n' "${files:-0}"
+    if [ -n "$mode" ]; then
+        printf 'Attached:   yes (%s at /mnt/%s)\n' "$mode" "$volume"
+    else
+        printf 'Attached:   no\n'
+    fi
+}
+
+volume_create() {
+    local name="$1" volume="$2" mode="${3:-rw}" path
+    [ -n "$volume" ] || volume="$(ask "Volume name: " "")"
+    volume_valid_name "$volume" || err "Invalid volume name '$volume'. Use letters, digits, dots, underscores, or dashes; 'host' and 'home' are reserved."
+    case "$mode" in rw|ro) ;; *) err "Volume mode must be 'rw' or 'ro'." ;; esac
+    path="$(volume_path "$name" "$volume")"
+    [ ! -e "$path" ] || err "Volume '$volume' already exists for '$name'. Use 'jroot volume $name attach $volume' or 'jroot volume $name info $volume'."
+    mkdir -p "$path" || err "Could not create volume '$volume'."
+    if ! mount_add "$name" "$volume" "$path" "$mode"; then
+        rm -rf "$path"
+        err "Could not attach newly created volume '$volume'."
+    fi
+    log "Volume '$volume' created and attached at /mnt/$volume ($mode)."
+    record_event "$name" "volume" "created $volume mode=$mode"
+}
+
+volume_attach() {
+    local name="$1" volume="$2" mode="${3:-rw}" path existing
+    volume_valid_name "$volume" || err "Invalid volume name '$volume'."
+    case "$mode" in rw|ro) ;; *) err "Volume mode must be 'rw' or 'ro'." ;; esac
+    path="$(volume_path "$name" "$volume")"
+    [ -d "$path" ] || err "Volume '$volume' does not exist for '$name'. Create it first: jroot volume $name create $volume"
+    existing="$(volume_attached_mode "$name" "$volume" 2>/dev/null || true)"
+    [ -z "$existing" ] || err "Volume '$volume' is already attached at /mnt/$volume ($existing)."
+    mount_add "$name" "$volume" "$path" "$mode"
+    log "Volume '$volume' attached at /mnt/$volume ($mode)."
+    record_event "$name" "volume" "attached $volume mode=$mode"
+}
+
+volume_detach() {
+    local name="$1" volume="$2" mode
+    mode="$(volume_attached_mode "$name" "$volume" 2>/dev/null || true)"
+    [ -n "$mode" ] || err "Volume '$volume' is already detached from '$name'."
+    mount_rm "$name" "$volume"
+    log "Volume '$volume' detached. Its data was kept."
+    record_event "$name" "volume" "detached $volume"
+}
+
+volume_set() {
+    local name="$1" volume="$2" mode="$3"
+    [ -n "$(volume_attached_mode "$name" "$volume" 2>/dev/null || true)" ] || err "Volume '$volume' is detached. Attach it before changing mode: jroot volume $name attach $volume $mode"
+    mount_set "$name" "$volume" "$mode"
+    log "Volume '$volume' is now $mode."
+    record_event "$name" "volume" "set $volume mode=$mode"
+}
+
+volume_rm() {
+    local name="$1" volume="$2" path
+    volume_valid_name "$volume" || err "Invalid volume name '$volume'."
+    path="$(volume_path "$name" "$volume")"
+    [ -d "$path" ] || err "Volume '$volume' does not exist for '$name'."
+    if ! confirm_destructive "volume deletion" "Delete volume '$volume' and all of its data? [y/N]: "; then
+        log "Aborted."
+        return 0
+    fi
+    if volume_attached_mode "$name" "$volume" >/dev/null 2>&1; then
+        mount_rm "$name" "$volume"
+    fi
+    rm -rf "$path" || err "Could not delete volume '$volume'."
+    rmdir "$(volume_root "$name")" 2>/dev/null || true
+    log "Volume '$volume' deleted."
+    record_event "$name" "volume" "deleted $volume"
+}
+
+volume_usage() {
+    printf '%bjroot volume%b - manage persistent storage for one jail\n\n' "$H" "$N"
+    printf '    %bjroot volume <name> list%b\n' "$G" "$N"
+    printf '    %bjroot volume <name> create [volume] [rw|ro]%b\n' "$G" "$N"
+    printf '    %bjroot volume <name> attach <volume> [rw|ro]%b\n' "$G" "$N"
+    printf '    %bjroot volume <name> detach <volume>%b\n' "$G" "$N"
+    printf '    %bjroot volume <name> set <volume> rw|ro%b\n' "$G" "$N"
+    printf '    %bjroot volume <name> info <volume>%b\n' "$G" "$N"
+    printf '    %bjroot volume <name> rm <volume>%b\n' "$G" "$N"
+    printf '\n    Volumes attach at %b/mnt/<volume>%b. New volumes are read-write by default.\n' "$G" "$N"
+}
+
+cmd_volume() {
+    [ $# -ge 2 ] || { volume_usage; err "Usage: jroot volume <name> list|create|attach|detach|set|info|rm ..."; }
+    local name="$1" op="$2" volume="${3:-}" mode="${4:-}" cfg="$CONFIGS_DIR/$1.json"
+    [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    case "$op" in
+        list|ls) volume_list "$name" ;;
+        create) volume_create "$name" "$volume" "$mode" ;;
+        attach) [ -n "$volume" ] || err "Usage: jroot volume $name attach <volume> [rw|ro]"; volume_attach "$name" "$volume" "$mode" ;;
+        detach) [ -n "$volume" ] || err "Usage: jroot volume $name detach <volume>"; volume_detach "$name" "$volume" ;;
+        set) [ -n "$volume" ] && [ -n "$mode" ] || err "Usage: jroot volume $name set <volume> rw|ro"; volume_set "$name" "$volume" "$mode" ;;
+        info|inspect) [ -n "$volume" ] || err "Usage: jroot volume $name info <volume>"; volume_info "$name" "$volume" ;;
+        rm|remove|delete) [ -n "$volume" ] || err "Usage: jroot volume $name rm <volume>"; volume_rm "$name" "$volume" ;;
+        -h|--help|help) volume_usage ;;
+        *) err "Usage: jroot volume <name> list|create|attach|detach|set|info|rm ..." ;;
     esac
 }
 
@@ -6057,10 +6221,22 @@ cmd_deploy() {
         { rm -rf "$tmp"; err "Invalid bundle: rootfs missing for '$orig_name'."; }
     fi
 
-    # Update name in json if renamed
-    if [ "$target_name" != "$orig_name" ]; then
-        python3 -c "import json; p='$CONFIGS_DIR/$target_name.json'; d=json.load(open(p)); d['name']='$target_name'; json.dump(d,open(p,'w'))" 2>/dev/null || true
-    fi
+    # Managed volume data is deliberately outside the rootfs/config archive.
+    # Drop only their generated mount entries; ordinary user-specified mounts
+    # retain the existing bundle behavior.
+    python3 - "$CONFIGS_DIR/$target_name.json" "$target_name" "$VOLUMES_DIR" <<'PY' 2>/dev/null || true
+import json, sys
+path, name, volumes = sys.argv[1:]
+with open(path, encoding="utf-8") as fh:
+    config = json.load(fh)
+config["name"] = name
+prefix = volumes.rstrip("/") + "/"
+config["mounts"] = [m for m in config.get("mounts", [])
+                    if not (isinstance(m, list) and len(m) > 1 and isinstance(m[1], str) and m[1].startswith(prefix))]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2)
+    fh.write("\n")
+PY
 
     rm -rf "$tmp"
     log "Jail '$target_name' successfully deployed."
@@ -6682,7 +6858,7 @@ PLUGIN_API_VERSION=1
 
 is_reserved_command() {
     case "$1" in
-        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -6750,7 +6926,7 @@ except Exception as exc:
     print(f"Invalid plugin.json: {exc}", file=sys.stderr)
     raise SystemExit(1)
 errors = []
-reserved = {"init","build","enter","exec","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","clone","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
+reserved = {"init","build","enter","exec","persist","service","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","volume","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","clone","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
 
 name = manifest.get("name")
 if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
@@ -7431,7 +7607,7 @@ cmd_rm() {
     fi
     # A removal handler runs after confirmation but before rootfs deletion.
     trigger_event_hooks "on_remove" "$name"
-    rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json" "$JROOT_HOME/services/$name"
+    rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json" "$JROOT_HOME/services/$name" "$VOLUMES_DIR/$name"
     rm -f "$(history_file "$name")"
     rm -f "$JROOT_HOME/pids/$name.pid" 2>/dev/null || true
     rm -f "$JROOT_HOME/pids/$name.sshd" "$JROOT_HOME/pids/$name.sshport" \
@@ -7639,6 +7815,13 @@ cmd_rename() {
     mounts_pairs="$(config_mounts "$cfg" 2>/dev/null | sed 's/\t/=/g' | tr '\n' ' ')"
     mv "$cfg" "$newcfg" 2>/dev/null || true
     write_config "$newname" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
+    # Managed volume directories belong to the jail name. Move them with the
+    # rootfs and retarget their existing mount entries before saving config.
+    if [ -d "$VOLUMES_DIR/$name" ]; then
+        [ ! -e "$VOLUMES_DIR/$newname" ] || err "Managed volumes already exist for '$newname'."
+        mv "$VOLUMES_DIR/$name" "$VOLUMES_DIR/$newname" || err "Could not rename managed volumes."
+        mounts_pairs="${mounts_pairs//"$VOLUMES_DIR/$name/"/"$VOLUMES_DIR/$newname/"}"
+    fi
     # Belt and braces for hosts without python3, where write_config cannot merge.
     if [ -n "$ports" ]; then
         set_config_ports "$newcfg" $(echo "$ports" | tr ',' ' ') >/dev/null 2>&1
@@ -7680,7 +7863,7 @@ PY
     fi
     record_event "$newname" "rename" "was '$name'"
 
-    log "Renamed '$name' -> '$newname' (hostname, prompt, snapshots, services updated)."
+    log "Renamed '$name' -> '$newname' (hostname, prompt, snapshots, services, volumes updated)."
 }
 
 # Read-only probe of the two kernel features jroot depends on. Prints
@@ -10125,6 +10308,9 @@ cmd_help_cmd() {
         mnt)
             mnt_usage "<name>"
             ;;
+        volume)
+            volume_usage
+            ;;
         persist)
             persist_usage
             ;;
@@ -10326,6 +10512,7 @@ cmd_help() {
     help_row "jroot port" "list|add|rm <name>"    "Control which jailed ports may bind publicly"
     help_row "jroot net" "[set <name> auto|off]"  "Per-jail loopback address (no port collisions)"
     help_row "jroot mnt" "<name> <label> <dir>"   "Bind-mount a host directory at /mnt/<label>"
+    help_row "jroot volume" "<name> create|attach|detach|..." "Manage JRoot-owned storage"
     help_row "jroot ssh" "<name> start|stop|status" "SSH access into a jail (persistent daemon)"
     help_row "jroot install" "<name> <pkg...>"     "Install packages inside a jail (apt/apk)"
     help_row "jroot config" "<name>"               "View or change a jail's settings (including persistence)"
@@ -10448,7 +10635,7 @@ _jroot_home() { printf '%s' "${JROOT_HOME:-$HOME/.jroot}"; }
 
 _jroot_reserved_name() {
     case "$1" in
-        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -10492,6 +10679,16 @@ _jroot_services() {
         [ -f "$f" ] || continue
         case "$f" in *.state.json) continue ;; esac
         n="${f##*/}"; n="${n%.json}"
+        printf '%s\n' "$n"
+    done
+}
+
+_jroot_volumes() {
+    local f n
+    [ -n "$1" ] || return 0
+    for f in "$(_jroot_home)"/volumes/"$1"/*; do
+        [ -d "$f" ] || continue
+        n="${f##*/}"
         printf '%s\n' "$n"
     done
 }
@@ -10617,7 +10814,7 @@ _jroot() {
     COMPREPLY=()
 
     local cmds="init build enter exec persist service shell install config file sync limit bundle deploy monitor compose
-        port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot
+        port net mnt mount volume ssh list ls info size history logs compare diff which doctor snapshot
         snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill
         stop ps rm delete completion completions help plugin"
 
@@ -10794,6 +10991,16 @@ alpine:3.22 alpine:edge" -- "$cur"))
                 5) COMPREPLY=($(compgen -W "rw ro" -- "$cur")) ;;
             esac
             ;;
+        volume)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "list create attach detach set info rm $(_jroot_volumes "${w[2]}")" -- "$cur")) ;;
+                4) case "${w[3]:-}" in
+                       attach|detach|set|info|rm) COMPREPLY=($(compgen -W "$(_jroot_volumes "${w[2]}")" -- "$cur")) ;;
+                   esac ;;
+                5) case "${w[3]:-}" in create|attach|set) COMPREPLY=($(compgen -W "rw ro" -- "$cur")) ;; esac ;;
+            esac
+            ;;
         ssh)
             case "$idx" in
                 2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
@@ -10919,7 +11126,7 @@ _jroot_home() { print -r -- "${JROOT_HOME:-$HOME/.jroot}" }
 
 _jroot_reserved_name() {
     case "$1" in
-        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -10969,6 +11176,17 @@ _jroot_services() {
     done
     (( ${#names} )) || return 1
     _describe -t services 'service' names
+}
+
+_jroot_volumes() {
+    local -a names
+    local f
+    [[ -n "$1" ]] || return 1
+    for f in $(_jroot_home)/volumes/$1/*(N/); do
+        names+=("${f:t}")
+    done
+    (( ${#names} )) || return 1
+    _describe -t volumes 'volume' names
 }
 
 _jroot_plugins() {
@@ -11058,6 +11276,7 @@ _jroot() {
         'net:per-jail loopback address'
         'mnt:bind-mount a host directory into a jail'
         'mount:alias for mnt'
+        'volume:managed persistent storage for a jail'
         'ssh:SSH access into a jail'
         'list:list all jails'
         'ls:alias for list'
@@ -11209,6 +11428,17 @@ _jroot() {
                 5) compadd -- rw ro ;;
             esac
             ;;
+        volume)
+            case $pos in
+                2) _jroot_jails ;;
+                3) compadd -- list create attach detach set info rm
+                   _jroot_volumes "${words[3]}" ;;
+                4) case "${words[4]}" in
+                       attach|detach|set|info|rm) _jroot_volumes "${words[3]}" ;;
+                   esac ;;
+                5) case "${words[4]}" in create|attach|set) compadd -- rw ro ;; esac ;;
+            esac
+            ;;
         ssh)
             case $pos in
                 2) _jroot_jails ;;
@@ -11317,7 +11547,7 @@ end
 # 'ls' rather than a glob: an unmatched glob is an error in fish, and "no jails
 # yet" is a completely normal state.
 function __jroot_reserved_name -a name
-    contains -- $name init build enter exec shell install file sync limit bundle deploy monitor compose port net mnt mount config list ls info history compare diff which size update clean snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh completion completions plugin help data logs status registry
+    contains -- $name init build enter exec persist service shell install file sync limit bundle deploy monitor compose port net mnt mount volume config list ls info history compare diff which size update clean snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh completion completions plugin help data logs status registry
 end
 
 function __jroot_jails
@@ -11356,6 +11586,15 @@ function __jroot_services -a jail
     for f in (command ls $dir 2>/dev/null)
         string match -q '*.state.json' -- $f; and continue
         string match -q '*.json' -- $f; and string replace -r '\.json$' '' -- $f
+    end
+end
+
+function __jroot_volumes -a jail
+    test -n "$jail"; or return
+    set -l dir (__jroot_home)/volumes/$jail
+    test -d $dir; or return
+    for f in (command ls $dir 2>/dev/null)
+        test -d $dir/$f; and echo $f
     end
 end
 
@@ -11486,6 +11725,7 @@ complete -c jroot -n '__jroot_at 1' -a port        -d 'Ports allowed to bind pub
 complete -c jroot -n '__jroot_at 1' -a net         -d 'Per-jail loopback address'
 complete -c jroot -n '__jroot_at 1' -a mnt         -d 'Bind-mount a host directory'
 complete -c jroot -n '__jroot_at 1' -a mount       -d 'Alias for mnt'
+complete -c jroot -n '__jroot_at 1' -a volume      -d 'Managed persistent storage'
 complete -c jroot -n '__jroot_at 1' -a ssh         -d 'SSH access into a jail'
 complete -c jroot -n '__jroot_at 1' -a list        -d 'List all jails'
 complete -c jroot -n '__jroot_at 1' -a ls          -d 'Alias for list'
@@ -11521,7 +11761,7 @@ complete -c jroot -n '__jroot_at 1' -a help        -d 'Show help'
 # A jail name as the first argument. One long line per rule on purpose: fish
 # splits an -a list on whitespace and a backslash inside single quotes stays a
 # literal backslash, so there is no safe way to wrap these.
-complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec persist service install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount ssh which history logs compare kill stop rm-snapshot rm-checkpoint limit bundle' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec persist service install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount volume ssh which history logs compare kill stop rm-snapshot rm-checkpoint limit bundle' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is clean; and __jroot_from 2' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is compare diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is revert; and __jroot_at 2' -a 'snapshot checkpoint'
@@ -11568,6 +11808,9 @@ complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 3' -a '(__jroot_cfg_l
 complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 4; and __jroot_arg_is 3 set rm' -a '(__jroot_cfg_list (__jroot_arg 2) labels)' -d 'mount label'
 complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 4; and not __jroot_arg_is 3 set rm list' -F
 complete -c jroot -n '__jroot_is mnt mount; and __jroot_at 5' -a 'rw ro'
+complete -c jroot -n '__jroot_is volume; and __jroot_at 3' -a 'list create attach detach set info rm'
+complete -c jroot -n '__jroot_is volume; and __jroot_arg_is 3 attach detach set info rm; and __jroot_at 4' -a '(__jroot_volumes (__jroot_arg 2))' -d volume
+complete -c jroot -n '__jroot_is volume; and __jroot_arg_is 3 create attach set; and __jroot_at 5' -a 'rw ro'
 
 # ssh. Value-taking flags keep the '=' attached, because jroot accepts
 # --port=22001 and not --port 22001.
@@ -11599,7 +11842,7 @@ complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
 complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
 complete -c jroot -n '__jroot_is doctor' -a '--fix --mute=7d --mute=forever --mute=off'
 complete -c jroot -n '__jroot_is completion completions; and __jroot_at 2' -a 'bash zsh fish'
-complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec persist service shell install config file sync limit bundle deploy monitor compose port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec persist service shell install config file sync limit bundle deploy monitor compose port net mnt mount volume ssh list ls info size history logs compare diff which doctor snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
 complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
 FISH_COMPLETION_EOF
 }
@@ -11625,6 +11868,7 @@ jroot_cmd() {
         net)           shift; cmd_net "$@" ;;
         mnt)           shift; cmd_mnt "$@" ;;
         mount)         shift; cmd_mnt "$@" ;;
+        volume)        shift; cmd_volume "$@" ;;
         install)       shift; cmd_install "$@" ;;
         config)        shift; cmd_config "$@" ;;
         list|ls)       shift; cmd_list "$@" ;;
