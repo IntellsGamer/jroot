@@ -883,12 +883,47 @@ The clone receives the saved rootfs and configuration, but JRoot deliberately gi
 
 ### Portability with `bundle` and `deploy`
 
-Use `jroot bundle` to package a jail rootfs and its configuration into a compressed archive. `jroot deploy` restores that bundle on another JRoot host and may assign a new jail name during deployment.
+Use `jroot bundle` to package a jail rootfs and its configuration into a compressed archive. `jroot deploy` restores that bundle on another JRoot host and may assign a new jail name during deployment. Plain bundles remain ordinary `.tar.gz` archives, so they are convenient for local transfers and inspection.
 
 ```bash
 jroot bundle dev my-dev-jail.tar.gz
 jroot deploy my-dev-jail.tar.gz production-jail
 ```
+
+#### Password-encrypted bundles
+
+Pass `--encrypt` when a bundle may leave the machine or contain material that should not be readable by whoever stores it. JRoot encrypts the completed archive with **AES-256-GCM** and derives its encryption key from the password with **Argon2id**. The archive contents and encryption metadata are authenticated: a wrong password or any modification makes deployment fail before JRoot extracts a rootfs.[1] [2]
+
+```bash
+# Prompts twice for a new password. The result need not use a .tar.gz extension.
+jroot bundle dev dev-2026-08.jrootbundle --encrypt
+
+# Deploy detects the encrypted envelope automatically and asks once for the password.
+jroot deploy dev-2026-08.jrootbundle production-jail
+```
+
+Encryption is streamed, so archive size is not limited by available RAM. The password derivation step deliberately spends memory to slow down offline password guessing; the archive encryption pass itself remains fast. Encrypted bundles require Python 3 and `cryptography` version 44 or later, because that is where the required Argon2id interface is available.
+
+For scripts and CI, use standard input rather than putting a secret in the command line:
+
+```bash
+printf '%s\n' "$JROOT_BUNDLE_PASSWORD" \
+  | jroot bundle dev dev.jrootbundle --encrypt --password-stdin
+
+printf '%s\n' "$JROOT_BUNDLE_PASSWORD" \
+  | jroot deploy dev.jrootbundle production-jail --password-stdin
+```
+
+`--password=<password>` is also supported for automation, but it is intentionally noisy because command-line values may end up in shell history or be visible to other local processes. Prefer `--password-stdin` or the interactive prompt.
+
+| Bundle type | `deploy` behavior |
+|---|---|
+| Plain `.tar.gz` | Extracts exactly as previous JRoot releases did; no password is requested. |
+| JRoot encrypted bundle | Detects the envelope before extraction and requests a password unless one was supplied with `--password-stdin` or `--password=…`. |
+| Wrong password or modified encrypted file | Rejects the bundle without registering or extracting a jail. |
+
+[1]: https://cryptography.io/en/latest/hazmat/primitives/ciphers/aead/
+[2]: https://www.rfc-editor.org/rfc/rfc9106.html
 
 ---
 
@@ -1113,9 +1148,10 @@ jroot update dev
 # Validates the rootfs after the package manager exits
 ```
 
-A failed package-manager command does not automatically discard the jail if the rootfs remains healthy; the retained checkpoint gives you a deliberate rollback option. JRoot asks whether to restore the checkpoint only after a failed post-update rootfs health check. In non-interactive use it prints the restore command rather than performing a destructive rollback.
+When the package upgrade and the post-update health check both succeed, JRoot removes the temporary `pre-update-…` checkpoint automatically. A failed package-manager command or failed health check retains that checkpoint, so there is still a deliberate rollback path. JRoot asks whether to restore only after a failed post-update rootfs health check. In non-interactive use it prints the restore command rather than performing a destructive rollback.
 
 ```bash
+# Available only when an update did not complete successfully.
 jroot checkpoints dev
 jroot revert checkpoint dev pre-update-20260812-120000
 ```

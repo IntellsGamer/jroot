@@ -4397,41 +4397,325 @@ jail_archive_exclude_options() {
     fi
 }
 
+# Encrypted bundles are a separate binary envelope around the existing tar.gz
+# payload. Keeping the archive unchanged inside the envelope preserves plain
+# bundle compatibility and makes deployment atomic: decrypt first, extract only
+# after AES-GCM authentication succeeds.
+BUNDLE_ENCRYPTED_MAGIC="JROOTBND1"
+
+bundle_crypto_available() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - <<'PY' >/dev/null 2>&1
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+PY
+}
+
+bundle_is_encrypted() {
+    [ -f "$1" ] || return 1
+    # cmp avoids pulling binary envelope bytes through Bash command substitution.
+    printf '%s' "$BUNDLE_ENCRYPTED_MAGIC" | cmp -s -n "${#BUNDLE_ENCRYPTED_MAGIC}" - "$1"
+}
+
+bundle_password() {
+    # $1 action (create|decrypt), $2 mode (ask|arg|stdin), $3 supplied value
+    local action="$1" mode="$2" supplied="$3" password confirm
+    case "$mode" in
+        arg)
+            password="$supplied"
+            warn "--password exposes the bundle password to shell history and local process inspection; prefer --password-stdin or the prompt."
+            ;;
+        stdin)
+            IFS= read -r password || err "Could not read bundle password from standard input."
+            ;;
+        ask|"")
+            [ -t 0 ] || err "Encrypted bundles need a password. Use --password-stdin or --password=<value> when stdin is not a terminal."
+            read -r -s -p "Bundle password: " password; printf '\n' >&2
+            if [ "$action" = "create" ]; then
+                read -r -s -p "Confirm bundle password: " confirm; printf '\n' >&2
+                [ "$password" = "$confirm" ] || err "Bundle passwords did not match."
+            fi
+            ;;
+        *) err "Invalid bundle password mode '$mode'." ;;
+    esac
+    [ -n "$password" ] || err "Bundle password must not be empty."
+    printf '%s' "$password"
+}
+
+bundle_crypt_file() {
+    # $1 encrypt|decrypt, $2 input, $3 output, $4 password. The password is
+    # supplied on a private file descriptor, never in the Python argv list.
+    local action="$1" input="$2" output="$3" password="$4"
+    python3 - "$action" "$input" "$output" 3<<< "$password" <<'PY'
+import base64
+import json
+import os
+import struct
+import sys
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+
+MAGIC = b"JROOTBND1"
+VERSION = 1
+MAX_HEADER = 8192
+CHUNK = 1024 * 1024
+KDF_MEMORY_KIB = 64 * 1024
+KDF_ITERATIONS = 3
+KDF_LANES = 4
+
+
+def fail(message):
+    sys.stderr.write("jroot: encrypted bundle: %s\\n" % message)
+    raise SystemExit(1)
+
+
+def derive(password, salt, params):
+    if params != {"name": "Argon2id", "memory_kib": KDF_MEMORY_KIB,
+                  "iterations": KDF_ITERATIONS, "lanes": KDF_LANES}:
+        fail("unsupported password-derivation parameters")
+    try:
+        return Argon2id(salt=salt, length=32, iterations=KDF_ITERATIONS,
+                        lanes=KDF_LANES, memory_cost=KDF_MEMORY_KIB,
+                        ad=MAGIC).derive(password)
+    except Exception as exc:
+        fail("could not derive encryption key (%s)" % exc)
+
+
+def header_bytes(header):
+    raw = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("ascii")
+    if not raw or len(raw) > MAX_HEADER:
+        fail("invalid envelope header")
+    return raw
+
+
+def encrypt(source, destination, password):
+    salt = os.urandom(16)
+    nonce = os.urandom(12)
+    params = {"name": "Argon2id", "memory_kib": KDF_MEMORY_KIB,
+              "iterations": KDF_ITERATIONS, "lanes": KDF_LANES}
+    header = {"format": "jroot-encrypted-bundle", "version": VERSION,
+              "cipher": "AES-256-GCM", "kdf": dict(params, salt=base64.b64encode(salt).decode("ascii")),
+              "nonce": base64.b64encode(nonce).decode("ascii")}
+    raw = header_bytes(header)
+    aad = MAGIC + struct.pack(">I", len(raw)) + raw
+    key = derive(password, salt, params)
+    try:
+        encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+        encryptor.authenticate_additional_data(aad)
+        with open(source, "rb") as src, open(destination, "xb") as dst:
+            dst.write(aad)
+            while True:
+                chunk = src.read(CHUNK)
+                if not chunk:
+                    break
+                dst.write(encryptor.update(chunk))
+            dst.write(encryptor.finalize())
+            dst.write(encryptor.tag)
+    except Exception as exc:
+        fail("encryption failed (%s)" % exc)
+
+
+def decrypt(source, destination, password):
+    try:
+        with open(source, "rb") as src:
+            magic = src.read(len(MAGIC))
+            if magic != MAGIC:
+                fail("not an encrypted JRoot bundle")
+            raw_len = src.read(4)
+            if len(raw_len) != 4:
+                fail("truncated envelope header")
+            length = struct.unpack(">I", raw_len)[0]
+            if length == 0 or length > MAX_HEADER:
+                fail("invalid envelope header length")
+            raw = src.read(length)
+            if len(raw) != length:
+                fail("truncated envelope header")
+            try:
+                header = json.loads(raw.decode("ascii"))
+                salt = base64.b64decode(header["kdf"].pop("salt"), validate=True)
+                nonce = base64.b64decode(header["nonce"], validate=True)
+            except Exception:
+                fail("malformed envelope header")
+            if header.get("format") != "jroot-encrypted-bundle" or header.get("version") != VERSION or header.get("cipher") != "AES-256-GCM":
+                fail("unsupported encrypted bundle format")
+            if len(salt) != 16 or len(nonce) != 12:
+                fail("invalid encryption salt or nonce")
+            params = header.get("kdf")
+            key = derive(password, salt, params)
+            total = os.fstat(src.fileno()).st_size
+            body_start = len(MAGIC) + 4 + length
+            if total < body_start + 16:
+                fail("truncated encrypted payload")
+            tag_offset = total - 16
+            src.seek(tag_offset)
+            tag = src.read(16)
+            src.seek(body_start)
+            decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+            decryptor.authenticate_additional_data(MAGIC + struct.pack(">I", length) + raw)
+            remaining = tag_offset - body_start
+            with open(destination, "xb") as dst:
+                while remaining:
+                    chunk = src.read(min(CHUNK, remaining))
+                    if not chunk:
+                        fail("truncated encrypted payload")
+                    remaining -= len(chunk)
+                    dst.write(decryptor.update(chunk))
+                dst.write(decryptor.finalize())
+    except InvalidTag:
+        try:
+            os.unlink(destination)
+        except FileNotFoundError:
+            pass
+        fail("wrong password or bundle authentication failed")
+    except SystemExit:
+        try:
+            os.unlink(destination)
+        except FileNotFoundError:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            os.unlink(destination)
+        except FileNotFoundError:
+            pass
+        fail("decryption failed (%s)" % exc)
+
+
+if len(sys.argv) != 4:
+    fail("internal invocation error")
+action, source, destination = sys.argv[1:]
+password = os.fdopen(3, "rb").read().rstrip(b"\\n")
+if not password:
+    fail("password must not be empty")
+if action == "encrypt":
+    encrypt(source, destination, password)
+elif action == "decrypt":
+    decrypt(source, destination, password)
+else:
+    fail("unknown action")
+PY
+}
+
 bundle_usage() {
     printf '%bjroot bundle%b - package a jail into a portable archive\n\n' "$H" "$N"
-    printf '    %bjroot bundle <name> <output.tar.gz>%b\n\n' "$G" "$N"
-    printf '    Bundles the jail rootfs and configuration into a single compressed archive.\n'
+    printf '    %bjroot bundle <name> <output.tar.gz> [--encrypt] [password option]%b\n\n' "$G" "$N"
+    printf '    Bundles the jail rootfs and configuration into a compressed archive.\n'
+    printf '    --encrypt                 encrypt with AES-256-GCM and an Argon2id-derived key\n'
+    printf '    --password=<password>     automate encryption (visible in shell history/process lists)\n'
+    printf '    --password-stdin          read one password line from standard input\n'
+}
+
+bundle_parse_password_option() {
+    # Shared parser fragment. It sets BUNDLE_PASSWORD_MODE and BUNDLE_PASSWORD_VALUE.
+    case "$1" in
+        --password=*)
+            [ -z "${BUNDLE_PASSWORD_MODE:-}" ] || err "Pick only one of --password or --password-stdin."
+            BUNDLE_PASSWORD_MODE="arg"; BUNDLE_PASSWORD_VALUE="${1#*=}"
+            ;;
+        --password-stdin)
+            [ -z "${BUNDLE_PASSWORD_MODE:-}" ] || err "Pick only one of --password or --password-stdin."
+            BUNDLE_PASSWORD_MODE="stdin"
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
 }
 
 cmd_bundle() {
-    [ $# -eq 2 ] || { bundle_usage; err "${CMD_HINT}bundle needs <name> <output.tar.gz>."; }
-    local name="$1" out="$2"
+    local name="" out="" encrypt=0 arg password tmp cipher_tmp
+    BUNDLE_PASSWORD_MODE=""; BUNDLE_PASSWORD_VALUE=""
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --encrypt) encrypt=1 ;;
+            --password=*|--password-stdin)
+                bundle_parse_password_option "$arg"
+                encrypt=1
+                ;;
+            -h|--help) bundle_usage; return 0 ;;
+            --*) err "Unknown bundle option: $arg" ;;
+            *)
+                if [ -z "$name" ]; then name="$arg"
+                elif [ -z "$out" ]; then out="$arg"
+                else err "${CMD_HINT}bundle needs <name> <output.tar.gz>."; fi
+                ;;
+        esac
+        shift
+    done
+    [ -n "$name" ] && [ -n "$out" ] || { bundle_usage; err "${CMD_HINT}bundle needs <name> <output.tar.gz>."; }
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found."
     local rootfs="$ROOTS_DIR/$name"
     [ -d "$rootfs" ] || err "Rootfs for '$name' is missing."
 
-    log "Bundling jail '$name' into '$out'..."
-    jail_archive_exclude_options "$name"
-    tar -czf "$out" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
-    log "Jail '$name' successfully bundled to '$out'."
-    record_event "$name" bundle "bundled to $out"
+    if [ "$encrypt" = "1" ]; then
+        bundle_crypto_available || err "Encrypted bundles need Python 3 with cryptography >= 44 (Argon2id support)."
+        password="$(bundle_password create "${BUNDLE_PASSWORD_MODE:-ask}" "$BUNDLE_PASSWORD_VALUE")"
+        tmp="$(mktemp "$JROOT_HOME/.bundle.XXXXXX.tar.gz")"
+        cipher_tmp="$(mktemp "${out}.jroot-encrypted.XXXXXX")"
+        rm -f "$cipher_tmp"
+        trap 'rm -f "$tmp" "$cipher_tmp"' RETURN
+        log "Bundling and encrypting jail '$name' into '$out'..."
+        jail_archive_exclude_options "$name"
+        tar -czf "$tmp" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+        bundle_crypt_file encrypt "$tmp" "$cipher_tmp" "$password" || err "Bundle encryption failed."
+        mv -f "$cipher_tmp" "$out" || err "Could not save encrypted bundle to '$out'."
+        rm -f "$tmp"
+        trap - RETURN
+        log "Jail '$name' successfully encrypted and bundled to '$out'."
+        record_event "$name" bundle "encrypted bundle to $out"
+    else
+        log "Bundling jail '$name' into '$out'..."
+        jail_archive_exclude_options "$name"
+        tar -czf "$out" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+        log "Jail '$name' successfully bundled to '$out'."
+        record_event "$name" bundle "bundled to $out"
+    fi
 }
 
 deploy_usage() {
     printf '%bjroot deploy%b - deploy a bundled jail archive\n\n' "$H" "$N"
-    printf '    %bjroot deploy <archive.tar.gz> [newname]%b\n\n' "$G" "$N"
-    printf '    Extracts and registers a bundled jail archive into ~/.jroot.\n'
+    printf '    %bjroot deploy <archive> [newname] [password option]%b\n\n' "$G" "$N"
+    printf '    Extracts and registers a bundle into ~/.jroot. Encrypted bundles are detected automatically.\n'
+    printf '    --password=<password>     automate decryption (visible in shell history/process lists)\n'
+    printf '    --password-stdin          read one password line from standard input\n'
 }
 
 cmd_deploy() {
-    [ $# -ge 1 ] || { deploy_usage; err "${CMD_HINT}deploy needs <archive.tar.gz>."; }
-    local archive="$1" newname="${2:-}"
+    local archive="" newname="" arg password decrypted="" archive_to_extract
+    BUNDLE_PASSWORD_MODE=""; BUNDLE_PASSWORD_VALUE=""
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --password=*|--password-stdin) bundle_parse_password_option "$arg" ;;
+            -h|--help) deploy_usage; return 0 ;;
+            --*) err "Unknown deploy option: $arg" ;;
+            *)
+                if [ -z "$archive" ]; then archive="$arg"
+                elif [ -z "$newname" ]; then newname="$arg"
+                else err "${CMD_HINT}deploy accepts <archive> and an optional [newname]."; fi
+                ;;
+        esac
+        shift
+    done
+    [ -n "$archive" ] || { deploy_usage; err "${CMD_HINT}deploy needs <archive>."; }
     [ -f "$archive" ] || err "Archive '$archive' not found."
 
     log "Deploying jail from '$archive'..."
     local tmp
     tmp="$(mktemp -d "$JROOT_HOME/.deploy.XXXXXX")"
-    extract_tar_compat "$archive" "$tmp" "Bundle deployment extraction" || { rm -rf "$tmp"; err "Failed to extract archive."; }
+    archive_to_extract="$archive"
+    if bundle_is_encrypted "$archive"; then
+        bundle_crypto_available || { rm -rf "$tmp"; err "Encrypted bundles need Python 3 with cryptography >= 44 (Argon2id support)."; }
+        password="$(bundle_password decrypt "${BUNDLE_PASSWORD_MODE:-ask}" "$BUNDLE_PASSWORD_VALUE")"
+        decrypted="$tmp/bundle.tar.gz"
+        bundle_crypt_file decrypt "$archive" "$decrypted" "$password" || { rm -rf "$tmp"; err "Could not decrypt bundle; check the password and file integrity."; }
+        archive_to_extract="$decrypted"
+    elif [ -n "$BUNDLE_PASSWORD_MODE" ]; then
+        warn "Password option ignored: '$archive' is not an encrypted JRoot bundle."
+    fi
+    extract_tar_compat "$archive_to_extract" "$tmp" "Bundle deployment extraction" || { rm -rf "$tmp"; err "Failed to extract archive."; }
 
     # Find config file in tmp/configs/
     local cfg_file
@@ -6379,8 +6663,19 @@ cmd_update() {
             record_event "$name" "update" "package manager failed ($distro exit=$update_rc), health check passed; checkpoint=$checkpoint_label"
             return 1
         fi
-        log "Jail '$name' is up to date and passed its post-update health check."
-        record_event "$name" "update" "packages upgraded ($distro $version), checkpoint=$checkpoint_label"
+        # This checkpoint belongs only to this update attempt. Once both the
+        # package manager and post-update rootfs check have succeeded, keeping
+        # it wastes space and obscures checkpoints the user created deliberately.
+        # Any failed package operation or health check returned above and keeps
+        # its recovery checkpoint intact.
+        if rm -rf "$SNAPSHOTS_DIR/$name/checkpoints/$checkpoint_label" "$SNAPSHOTS_DIR/$name/checkpoints/$checkpoint_label.json"; then
+            log "Jail '$name' is up to date and passed its post-update health check."
+            log "Removed temporary safety checkpoint '$checkpoint_label'."
+            record_event "$name" "update" "packages upgraded ($distro $version); temporary checkpoint removed=$checkpoint_label"
+        else
+            warn "Update succeeded, but temporary safety checkpoint '$checkpoint_label' could not be removed."
+            record_event "$name" "update" "packages upgraded ($distro $version); checkpoint retained=$checkpoint_label (cleanup failed)"
+        fi
         return 0
     fi
 
@@ -8570,7 +8865,8 @@ cmd_help_cmd() {
             printf '%bjroot update%b - checkpoint, update, and health-check a jail\n\n' "$H" "$N"
             printf '    %bjroot update [name]%b   (no name = all jails)\n' "$G" "$N"
             printf '\n    An incremental safety checkpoint is created before every jail package update. JRoot\n'
-            printf '    validates that the rootfs still launches after the package manager exits.\n'
+            printf '    validates that the rootfs still launches after the package manager exits. A successful\n'
+            printf '    update removes only its temporary pre-update checkpoint; failed updates retain it for recovery.\n'
             printf '    Only a failed rootfs health check offers an interactive rollback prompt.\n'
             ;;
         doctor)
@@ -9020,15 +9316,20 @@ alpine:3.22 alpine:edge" -- "$cur"))
         bundle)
             if [ "$idx" -eq 2 ]; then
                 COMPREPLY=($(compgen -W "$jails" -- "$cur"))
-            elif [ "$idx" -eq 3 ]; then
-                COMPREPLY=($(compgen -f -- "$cur"))
-                compopt -o filenames 2>/dev/null
+            else
+                COMPREPLY=($(compgen -W "--encrypt --password= --password-stdin" -- "$cur"))
+                if [ "$idx" -eq 3 ]; then
+                    COMPREPLY+=( $(compgen -f -- "$cur") )
+                    compopt -o filenames 2>/dev/null
+                fi
             fi
             ;;
         deploy)
             if [ "$idx" -eq 2 ]; then
                 COMPREPLY=($(compgen -f -- "$cur"))
                 compopt -o filenames 2>/dev/null
+            else
+                COMPREPLY=($(compgen -W "--password= --password-stdin" -- "$cur"))
             fi
             ;;
         monitor)
@@ -9426,10 +9727,12 @@ _jroot() {
             if (( pos == 2 )); then _jroot_jails; else compadd -S '' -- --mem= --cpu= --nofile=; fi
             ;;
         bundle)
-            if (( pos == 2 )); then _jroot_jails; elif (( pos == 3 )); then _files; fi
+            if (( pos == 2 )); then _jroot_jails
+            elif (( pos == 3 )); then _files; compadd -S '' -- --encrypt --password= --password-stdin
+            else compadd -S '' -- --encrypt --password= --password-stdin; fi
             ;;
         deploy)
-            (( pos == 2 )) && _files
+            if (( pos == 2 )); then _files; else compadd -S '' -- --password= --password-stdin; fi
             ;;
         compose)
             if (( pos == 2 )); then compadd -- up down status; elif (( pos == 3 )); then _files; fi
@@ -9803,7 +10106,9 @@ complete -c jroot -n '__jroot_is sync; and __jroot_from 2' -a '--watch --delete 
 # limits, archives, and compose
 complete -c jroot -n '__jroot_is limit; and __jroot_from 3' -a '--mem= --cpu= --nofile='
 complete -c jroot -n '__jroot_is bundle; and __jroot_at 3' -F
+complete -c jroot -n '__jroot_is bundle; and __jroot_from 3' -a '--encrypt --password= --password-stdin'
 complete -c jroot -n '__jroot_is deploy; and __jroot_at 2' -F
+complete -c jroot -n '__jroot_is deploy; and __jroot_from 3' -a '--password= --password-stdin'
 complete -c jroot -n '__jroot_is compose; and __jroot_at 2' -a 'up down status'
 complete -c jroot -n '__jroot_is compose; and __jroot_at 3' -F
 

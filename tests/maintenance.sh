@@ -66,9 +66,12 @@ run_in_jail() {
     return "$UPDATE_PACKAGE_RC"
 }
 
-# Successful update has a checkpoint and health pass.
+# Successful update has a checkpoint and health pass, then removes only its
+# temporary pre-update save point rather than accumulating hidden backups.
 cmd_update "$name" >/dev/null
 [ "$CHECKPOINTS" -eq 1 ]
+! find "$SNAPSHOTS_DIR/$name/checkpoints" -mindepth 1 -maxdepth 1 -type d -name 'pre-update-*' -print -quit | grep -q .
+! find "$SNAPSHOTS_DIR/$name/checkpoints" -mindepth 1 -maxdepth 1 -type f -name 'pre-update-*.json' -print -quit | grep -q .
 
 # A package-manager failure with a healthy rootfs returns non-zero but never
 # offers rollback; rollback prompts are reserved for failed rootfs health checks.
@@ -80,6 +83,7 @@ if update_output="$(cmd_update "$name" 2>&1)"; then
 fi
 [[ "$update_output" == *'health check'* ]]
 [[ "$update_output" != *'Restore checkpoint'* ]]
+find "$SNAPSHOTS_DIR/$name/checkpoints" -mindepth 1 -maxdepth 1 -type d -name 'pre-update-*' -print -quit | grep -q .
 
 # A failed health check follows the catastrophic path. NONINTERACTIVE prevents
 # an unattended test from accepting a rollback prompt.

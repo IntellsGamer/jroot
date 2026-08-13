@@ -381,6 +381,8 @@ test: check
 	@bash tests/maintenance.sh
 	@printf '$(CYAN)==>$(NC) tests/checkpoint.sh\n'
 	@bash tests/checkpoint.sh
+	@printf '$(CYAN)==>$(NC) tests/bundle.sh\n'
+	@bash tests/bundle.sh
 	@printf '$(CYAN)==>$(NC) tests/clone.sh\n'
 	@bash tests/clone.sh
 	@printf '$(CYAN)==>$(NC) tests/logs.sh\n'
