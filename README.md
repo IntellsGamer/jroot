@@ -902,7 +902,16 @@ jroot bundle dev dev-2026-08.jrootbundle --encrypt
 jroot deploy dev-2026-08.jrootbundle production-jail
 ```
 
-Encryption is streamed, so archive size is not limited by available RAM. The password derivation step deliberately spends memory to slow down offline password guessing; the archive encryption pass itself remains fast. Encrypted bundles require Python 3 and `cryptography` version 44 or later, because that is where the required Argon2id interface is available.
+Encryption is streamed, so archive size is not limited by available RAM. The password derivation step deliberately spends memory to slow down offline password guessing; the archive encryption pass itself remains fast. Encrypted bundles require Python 3 and `cryptography` version 44 or later, because that is where the required Argon2id interface is available. Install it for the current account with:
+
+```bash
+python3 -m pip install --user --upgrade 'cryptography>=44'
+
+# Only if pip reports an externally managed Python environment:
+python3 -m pip install --user --break-system-packages --upgrade 'cryptography>=44'
+```
+
+If `pip` itself is missing, install `python3-pip` on Debian/Ubuntu or run `pkg install python` on Termux first.
 
 For scripts and CI, use standard input rather than putting a secret in the command line:
 

@@ -4411,6 +4411,21 @@ from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 PY
 }
 
+bundle_crypto_install_help() {
+    cat >&2 <<'EOF'
+[!] Encrypted bundles require Python 3 with cryptography >= 44 (Argon2id support).
+    Install it for your account:
+      python3 -m pip install --user --upgrade 'cryptography>=44'
+
+    If pip reports an externally managed Python environment:
+      python3 -m pip install --user --break-system-packages --upgrade 'cryptography>=44'
+
+    If pip is not installed:
+      Debian/Ubuntu: sudo apt-get install -y python3-pip
+      Termux:         pkg install python
+EOF
+}
+
 bundle_is_encrypted() {
     [ -f "$1" ] || return 1
     # cmp avoids pulling binary envelope bytes through Bash command substitution.
@@ -4650,7 +4665,7 @@ cmd_bundle() {
     [ -d "$rootfs" ] || err "Rootfs for '$name' is missing."
 
     if [ "$encrypt" = "1" ]; then
-        bundle_crypto_available || err "Encrypted bundles need Python 3 with cryptography >= 44 (Argon2id support)."
+        bundle_crypto_available || { bundle_crypto_install_help; err "Encrypted-bundle cryptography backend is unavailable."; }
         password="$(bundle_password create "${BUNDLE_PASSWORD_MODE:-ask}" "$BUNDLE_PASSWORD_VALUE")"
         tmp="$(mktemp "$JROOT_HOME/.bundle.XXXXXX.tar.gz")"
         cipher_tmp="$(mktemp "${out}.jroot-encrypted.XXXXXX")"
@@ -4707,7 +4722,7 @@ cmd_deploy() {
     tmp="$(mktemp -d "$JROOT_HOME/.deploy.XXXXXX")"
     archive_to_extract="$archive"
     if bundle_is_encrypted "$archive"; then
-        bundle_crypto_available || { rm -rf "$tmp"; err "Encrypted bundles need Python 3 with cryptography >= 44 (Argon2id support)."; }
+        bundle_crypto_available || { rm -rf "$tmp"; bundle_crypto_install_help; err "Encrypted-bundle cryptography backend is unavailable."; }
         password="$(bundle_password decrypt "${BUNDLE_PASSWORD_MODE:-ask}" "$BUNDLE_PASSWORD_VALUE")"
         decrypted="$tmp/bundle.tar.gz"
         bundle_crypt_file decrypt "$archive" "$decrypted" "$password" || { rm -rf "$tmp"; err "Could not decrypt bundle; check the password and file integrity."; }
