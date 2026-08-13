@@ -288,11 +288,11 @@ JRoot supports an unrooted jail mode where the environment is prepared with root
        normal use       administration
 ```
 
-The root password is locked while the normal environment runs as the inner unprivileged user. For a protected unroot session, JRoot requires a host kernel with **Landlock** and host Python 3. It starts the session with the jail user's explicit virtual UID/GID, makes the jail `/etc` tree kernel read-only for that session, and refuses credential-changing syscalls such as `setuid`, `setresuid`, `setgroups`, and `capset`.
+The root password is locked while the normal environment runs as the inner unprivileged user. For a protected unroot session, JRoot requires a host kernel with **Landlock** and host Python 3. It starts the session with the jail user's explicit virtual UID/GID, makes the saved system image read-only, and refuses credential-changing syscalls such as `setuid`, `setresuid`, `setgroups`, and `capset`.
 
-This means an ordinary unroot process cannot unlock `/etc/shadow`, append a UID-0 account to `/etc/passwd`, or use `su` to obtain virtual root. The same protection is applied to unroot login shells served through `jroot ssh`: the SSH daemon authenticates as root, then JRoot installs a post-login credential guard before it runs the user command or shell.
+An ordinary unroot session may write only to `/home/jail` and private transient `/tmp` and `/run` overlays. It cannot rewrite `/etc/shadow`, append a UID-0 account to `/etc/passwd`, replace `/usr/bin/sudo` or `/usr/bin/su`, modify libraries, or use `su` to obtain virtual root. The same protection is applied to unroot login shells served through `jroot ssh`: the SSH daemon authenticates as root, then JRoot installs a post-login credential guard before it runs the user command or shell.
 
-Use the deliberate maintenance path whenever an administrator needs to change system accounts, install packages, or edit `/etc`:
+Use the deliberate maintenance path whenever an administrator needs to change system accounts, install packages, edit `/etc`, or otherwise modify the system image. **Explicit root mode is unrestricted**:
 
 ```bash
 jroot enter dev --root /bin/bash

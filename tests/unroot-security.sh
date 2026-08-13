@@ -64,12 +64,16 @@ grep -qx '1000:1000' "$WORK/args"
 grep -qx '1' "$WORK/strict"
 grep -qx '1' "$WORK/unroot"
 grep -qF "$rootfs"$'\t'"$LANDLOCK_RX" "$WORK/rules"
-grep -qF "$rootfs/etc"$'\t'"$LANDLOCK_RX" "$WORK/rules"
-grep -qF "$rootfs/home"$'\t'"$LANDLOCK_FULL" "$WORK/rules"
-if grep -qF "$rootfs"$'\t'"$LANDLOCK_FULL" "$WORK/rules"; then
-    printf 'unroot policy grants full access to rootfs parent\n' >&2
-    exit 1
-fi
+grep -qF "$rootfs/home/jail"$'\t'"$LANDLOCK_FULL" "$WORK/rules"
+grep -qF "$rootfs"$'\t'"$LANDLOCK_RX" "$WORK/rules"
+grep -q '/\.unroot-dev\.' "$WORK/rules"
+grep -qE '/\.unroot-dev\..*/tmp:/tmp' "$WORK/args"
+for protected in "$rootfs/etc" "$rootfs/usr" "$rootfs/usr/bin" "$rootfs/usr/bin/sudo" "$rootfs/usr/bin/su" "$rootfs/bin" "$rootfs/lib"; do
+    if grep -qF "$protected"$'\t'"$LANDLOCK_FULL" "$WORK/rules"; then
+        printf 'unroot policy grants write access to protected system path: %s\n' "$protected" >&2
+        exit 1
+    fi
+done
 
 # Explicit maintenance remains virtual root and is intentionally outside the
 # auth protection policy.
@@ -83,19 +87,24 @@ if grep -qF "$rootfs/etc"$'\t'"$LANDLOCK_RX" "$WORK/rules"; then
     exit 1
 fi
 
-# sshd itself must be virtual root, but every descendant login is still guarded
-# from replacing the jail auth database.
-JROOT_PROTECT_UNROOT_AUTH=1 run_in_jail --root dev /bin/true
+# sshd itself stays virtual root and unrestricted; its post-login wrapper is
+# where the unroot-only guard is installed before executing the remote command.
+JROOT_SSH_UNROOT_RUNTIME=1 run_in_jail --root dev /bin/true
 grep -qx -- '-0' "$WORK/args"
-grep -qx '1' "$WORK/strict"
+[ ! -s "$WORK/strict" ]
 grep -qx '0' "$WORK/unroot"
-grep -qF "$rootfs/etc"$'\t'"$LANDLOCK_RX" "$WORK/rules"
-grep -qx "$SECCOMP_LAUNCHER:/run/jroot-unroot-guard" "$WORK/args"
+grep -qF "$rootfs"$'\t'"$LANDLOCK_FULL" "$WORK/rules"
+grep -qx "$SECCOMP_LAUNCHER:/usr/local/lib/jroot-unroot-guard" "$WORK/args"
+grep -qE '/\.unroot-dev\..*/tmp:/tmp' "$WORK/args"
 write_ssh_session_wrapper dev
 wrapper="$rootfs/usr/local/bin/jroot-session"
 sh -n "$wrapper"
 grep -q "JROOT_UNROOT_GUARD='1'" "$wrapper"
-grep -q 'JROOT_UNROOT=1 python3 /run/jroot-unroot-guard' "$wrapper"
+grep -q "JROOT_UNROOT_LANDLOCK='" "$wrapper"
+grep -q '/home/jail' "$wrapper"
+grep -q 'JROOT_UNROOT=1' "$wrapper"
+grep -q 'python3 /usr/local/lib/jroot-unroot-guard' "$wrapper"
+grep -q '\$(id -u)' "$wrapper"
 
 # A host that cannot enforce Landlock must not offer a protected unroot session.
 if ( unroot_protection_available() { return 1; }; run_in_jail dev /bin/true ) >/dev/null 2>&1; then
@@ -107,6 +116,6 @@ fi
 # families for direct unroot sessions.
 grep -q 'DENY_CREDENTIAL_CHANGE' "$ROOT/jroot"
 grep -q 'JROOT_UNROOT' "$ROOT/jroot"
-grep -q 'JROOT_PROTECT_UNROOT_AUTH=1' "$ROOT/jroot"
-printf '  ok    protected unroot direct and SSH policy is strict, read-only in /etc, and preserves explicit root maintenance\n'
+grep -q 'JROOT_SSH_UNROOT_RUNTIME=1' "$ROOT/jroot"
+printf '  ok    protected unroot direct and SSH policy keeps the system image immutable and preserves explicit root maintenance\n'
 BASH

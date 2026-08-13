@@ -2902,7 +2902,7 @@ run_in_jail() {
     local cfg="$CONFIGS_DIR/$name.json"
     local rootfs="$ROOTS_DIR/$name"
     local real_home="$REAL_HOME"
-    local user_mode mount_host mount_home image unroot_session=0 auth_protected_session=0 jail_identity=""
+    local user_mode mount_host mount_home image unroot_session=0 ssh_unroot_runtime=0 protected_runtime=0 jail_identity=""
     user_mode="$(config_field "$cfg" user)";      [ -n "$user_mode" ]  || user_mode="root"
     mount_host="$(config_field "$cfg" mount_host)"; [ -n "$mount_host" ] || mount_host=0
     mount_home="$(config_field "$cfg" mount_home)"; [ -n "$mount_home" ] || mount_home=0
@@ -2920,13 +2920,18 @@ run_in_jail() {
 
     local proot_args=(-k "$PROOT_KERNEL_RELEASE")
     HOSTNAME="$name"
-    # An SSH daemon must start as virtual root, yet unroot login sessions inherit
-    # it. Mark that daemon tree as auth-protected so its children cannot rewrite
-    # the jail database before attempting su/setuid escalation.
-    if [ "$user_mode" = "unroot" ] && { [ "$force_root" != 1 ] || [ "${JROOT_PROTECT_UNROOT_AUTH:-0}" = "1" ]; }; then
+    # Only the ordinary unroot user is constrained here. Explicit --root
+    # maintenance remains fully writable. SSH needs a private runtime overlay
+    # for its later post-login guard, but the daemon itself still starts as an
+    # unrestricted virtual root process.
+    if [ "$user_mode" = "unroot" ] && [ "$force_root" != 1 ]; then
         require_unroot_protection
-        auth_protected_session=1
+        unroot_session=1
+    elif [ "$user_mode" = "unroot" ] && [ "${JROOT_SSH_UNROOT_RUNTIME:-0}" = "1" ]; then
+        require_unroot_protection
+        ssh_unroot_runtime=1
     fi
+    [ "$unroot_session" = "1" ] || [ "$ssh_unroot_runtime" = "1" ] && protected_runtime=1
     if [ "$force_root" = 1 ] || [ "$user_mode" = "root" ]; then
         proot_args+=(-0 -w /root)
         HOME=/root USER=root LOGNAME=root SHELL=/bin/bash
@@ -2936,7 +2941,6 @@ run_in_jail() {
         # Landlock below is also required to protect its auth database.
         jail_identity="$(awk -F: '$1 == "jail" { print $3 ":" $4; exit }' "$rootfs/etc/passwd" 2>/dev/null || true)"
         [[ "$jail_identity" =~ ^[0-9]+:[0-9]+$ ]] || err "Unroot jail '$name' has no valid 'jail' account. Run: jroot config $name --user=unroot"
-        unroot_session=1
         proot_args+=(-i "$jail_identity" -w /home/jail)
         HOME=/home/jail USER=jail LOGNAME=jail SHELL=/bin/bash
     else
@@ -2973,13 +2977,22 @@ run_in_jail() {
 
     # Host temp dir proot uses for its glue rootfs (PROOT_TMP_DIR, else /tmp).
     local proot_tmp="${PROOT_TMP_DIR:-/tmp}"
+    local session_runtime=""
 
     local binds=(-b /dev -b /proc -b /sys)
-    if [ "$auth_protected_session" = "1" ]; then
-        # sshd has to start as virtual root, but its post-login ForceCommand
-        # applies this host-backed guard before exposing a shell to the jail user.
-        [ -x "$SECCOMP_LAUNCHER" ] || err "Protected unroot SSH guard is missing. Re-run jroot after installation repair."
-        binds+=( -b "$SECCOMP_LAUNCHER:/run/jroot-unroot-guard" )
+    if [ "$protected_runtime" = "1" ]; then
+        # An unroot process receives private, writable transient directories;
+        # the saved rootfs remains an immutable system image. In particular,
+        # /usr, /bin, /lib, and /etc must not be writable before a later explicit
+        # --root maintenance command could execute a planted replacement binary.
+        session_runtime="$(mktemp -d "$JROOT_HOME/.unroot-${name}.XXXXXX")" \
+            || err "Could not create protected unroot runtime directory."
+        mkdir -p "$session_runtime/tmp" "$session_runtime/run/sshd" "$session_runtime/run/user"
+        binds+=( -b "$session_runtime/tmp:/tmp" -b "$session_runtime/run:/run" )
+        # SSH's ForceCommand re-enters this host-backed launcher after sshd has
+        # dropped privileges. Keep it outside the writable jail image.
+        [ -x "$SECCOMP_LAUNCHER" ] || { rm -rf "$session_runtime"; err "Protected unroot SSH guard is missing. Re-run jroot after installation repair."; }
+        binds+=( -b "$SECCOMP_LAUNCHER:/usr/local/lib/jroot-unroot-guard" )
     fi
     if [ "$mount_host" = "1" ]; then
         binds+=(-b /:/mnt/host)
@@ -3100,21 +3113,15 @@ run_in_jail() {
     # cannot be loaded. Set JROOT_LANDLOCK_OFF=1 to skip it.
     LANDLOCK_RULES=""
     if [ -z "${JROOT_LANDLOCK_OFF:-}" ]; then
-        if [ "$auth_protected_session" = "1" ]; then
-            # Landlock grants compose up the path hierarchy, so a FULL rule on
-            # the rootfs would also hand write access back to /etc. Instead give
-            # the rootfs itself RX for traversal, grant FULL to every immediate
-            # top-level entry except /etc, and leave /etc RX-only. This protects
-            # passwd/shadow/group/gshadow and all their replacement/rename paths.
-            local root_entry
+        if [ "$unroot_session" = "1" ]; then
+            # A protected unroot session is deliberately restrictive: system
+            # image paths are read/execute only, while normal user work is
+            # confined to /home/jail and the private /tmp + /run overlays above.
+            # This blocks auth-file edits *and* binary/library replacement that
+            # could wait for a later --root maintenance command.
             landlock_allow "$rootfs" "$LANDLOCK_RX"
-            shopt -s nullglob dotglob
-            for root_entry in "$rootfs"/*; do
-                [ "$(basename "$root_entry")" = "etc" ] && continue
-                landlock_allow "$root_entry" "$LANDLOCK_FULL"
-            done
-            shopt -u nullglob dotglob
-            landlock_allow "$rootfs/etc" "$LANDLOCK_RX"
+            [ -d "$rootfs/home/jail" ] && landlock_allow "$rootfs/home/jail" "$LANDLOCK_FULL"
+            landlock_allow "$session_runtime" "$LANDLOCK_FULL"
         else
             landlock_allow "$rootfs" "$LANDLOCK_FULL"
         fi
@@ -3172,7 +3179,7 @@ run_in_jail() {
     # NOTE: proot must run as a CHILD (no `exec`) so jroot can keep going
     # after it exits - init/update/verify all call run_in_jail mid-script.
     local rc=0 landlock_strict=""
-    [ "$auth_protected_session" = "1" ] && landlock_strict=1
+    [ "$unroot_session" = "1" ] && landlock_strict=1
     if command -v python3 >/dev/null 2>&1 && [ -x "$SECCOMP_LAUNCHER" ]; then
         JROOT_LANDLOCK="$LANDLOCK_RULES" \
         JROOT_LANDLOCK_STRICT="$landlock_strict" \
@@ -3185,6 +3192,7 @@ run_in_jail() {
             -r "$rootfs" "${binds[@]}" "$@"
         rc=$?
     fi
+    [ -z "$session_runtime" ] || rm -rf "$session_runtime"
     return "$rc"
 }
 
@@ -7450,7 +7458,7 @@ SSHEOF
     set -m
     (
         JROOT_FAKE_PRIVSEP=1
-        JROOT_PROTECT_UNROOT_AUTH=1
+        JROOT_SSH_UNROOT_RUNTIME=1
         run_in_jail --root "$name" /usr/sbin/sshd -D -e >>"$logfile" 2>&1
     ) &
     local daemon_pid=$!
@@ -7558,11 +7566,18 @@ write_ssh_session_wrapper() {
     local cfg="$CONFIGS_DIR/$name.json"
     local dest="$rootfs/usr/local/bin/jroot-session"
     local jail_ports jail_lb ro_mounts="" m_label m_hostpath m_mode
-    local lim_mem lim_cpu lim_nofile mem_kb="" user_mode unroot_guard=0
+    local lim_mem lim_cpu lim_nofile mem_kb="" user_mode unroot_guard=0 ssh_unroot_landlock=""
 
     jail_ports="$(config_ports "$cfg")"
     user_mode="$(config_field "$cfg" user)"
-    [ "$user_mode" = "unroot" ] && unroot_guard=1
+    if [ "$user_mode" = "unroot" ]; then
+        unroot_guard=1
+        # These are guest paths: the guard runs after PRoot has established the
+        # jail root and private /tmp + /run overlays, so Landlock resolves them
+        # to the same confined files the SSH login process sees.
+        ssh_unroot_landlock="$(printf '/\t%s\n/home/jail\t%s\n/tmp\t%s\n/run\t%s' \
+            "$LANDLOCK_RX" "$LANDLOCK_FULL" "$LANDLOCK_FULL" "$LANDLOCK_FULL")"
+    fi
     jail_lb="$(config_field "$cfg" loopback)"
     case "$jail_lb" in off|shared|disabled) jail_lb="" ;; esac
     while IFS=$'\t' read -r m_label m_hostpath m_mode; do
@@ -7597,6 +7612,7 @@ JROOT_LIMIT_MEM_KB='$mem_kb'
 JROOT_LIMIT_CPU='$lim_cpu'
 JROOT_LIMIT_NOFILE='$lim_nofile'
 JROOT_UNROOT_GUARD='$unroot_guard'
+JROOT_UNROOT_LANDLOCK='$ssh_unroot_landlock'
 
 # sshd inherits limits at daemon start. Reapply them for all interactive,
 # command, SCP, and SFTP paths handled by this ForceCommand wrapper.
@@ -7626,14 +7642,19 @@ export SHELL
 # sshd starts as fake root so it can authenticate and drop privileges. Once it
 # reaches this ForceCommand wrapper, install the no-credential-change guard
 # before exposing any command to an unroot login. The guard is host-backed and
-# bind-mounted into /run, not stored in the writable jail rootfs.
+# bind-mounted into /usr/local/lib, not stored in the writable jail rootfs.
 jroot_session_exec() {
-    if [ "\$JROOT_UNROOT_GUARD" = "1" ]; then
-        [ -x /run/jroot-unroot-guard ] || {
+    # A permitted root SSH login is an explicit maintenance path and remains
+    # unrestricted. Every non-root login in an unroot jail receives the guard.
+    if [ "\$JROOT_UNROOT_GUARD" = "1" ] && [ "\$(id -u)" != "0" ]; then
+        [ -x /usr/local/lib/jroot-unroot-guard ] || {
             echo "jroot: protected unroot SSH guard is unavailable" >&2
             exit 126
         }
-        exec env JROOT_UNROOT=1 python3 /run/jroot-unroot-guard "\$@"
+        exec env JROOT_UNROOT=1 \
+            JROOT_LANDLOCK="\$JROOT_UNROOT_LANDLOCK" \
+            JROOT_LANDLOCK_STRICT=1 \
+            python3 /usr/local/lib/jroot-unroot-guard "\$@"
     fi
     exec "\$@"
 }
