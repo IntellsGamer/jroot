@@ -100,13 +100,10 @@ write_ssh_session_wrapper dev
 wrapper="$rootfs/usr/local/bin/jroot-session"
 sh -n "$wrapper"
 grep -q "JROOT_UNROOT_GUARD='1'" "$wrapper"
-grep -q "JROOT_UNROOT_LANDLOCK='" "$wrapper"
-grep -qF "/"$'\t'"$LANDLOCK_RX" "$wrapper"
-grep -q '/home/jail' "$wrapper"
-grep -q '/tmp' "$wrapper"
-grep -q '/run' "$wrapper"
 grep -q 'JROOT_UNROOT=1' "$wrapper"
 grep -q 'python3 /usr/local/lib/jroot-unroot-guard' "$wrapper"
+! grep -q 'JROOT_UNROOT_LANDLOCK=' "$wrapper"
+! grep -q 'JROOT_LANDLOCK_STRICT=1' "$wrapper"
 grep -q '\$(id -u)' "$wrapper"
 
 # A host that cannot enforce Landlock must not offer a protected unroot session.

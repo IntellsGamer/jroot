@@ -2016,11 +2016,13 @@ private_copy_tree() {
     # $1 is a directory and $2 must not exist. On a normal filesystem cp keeps
     # metadata efficiently; on link-hostile storage Python copies each file so
     # it can never attempt to recreate a source hard-link relationship.
-    local source="$1" destination="$2" exclude_relative="${3:-}" parent
+    local source="$1" destination="$2" parent
+    shift 2
+    local exclude_relative=("$@")
     [ -d "$source" ] || return 1
     [ ! -e "$destination" ] || return 1
     parent="$(dirname "$destination")"
-    if [ -z "$exclude_relative" ] && filesystem_supports_hardlinks "$parent"; then
+    if [ "${#exclude_relative[@]}" -eq 0 ] && filesystem_supports_hardlinks "$parent"; then
         if cp -a --reflink=auto "$source" "$destination" 2>/dev/null; then
             return 0
         fi
@@ -2031,23 +2033,22 @@ private_copy_tree() {
         rm -rf "$destination"
     fi
     command -v python3 >/dev/null 2>&1 || return 1
-    python3 - "$source" "$destination" "$exclude_relative" <<'PY'
+    python3 - "$source" "$destination" "${exclude_relative[@]}" <<'PY'
 import shutil
 import sys
 from pathlib import Path
 
-source, destination, excluded = sys.argv[1:]
-source, destination = Path(source), Path(destination)
-excluded_path = Path(excluded.lstrip("/")) if excluded else None
+source, destination = map(Path, sys.argv[1:3])
+excluded_paths = {Path(item.lstrip("/")) for item in sys.argv[3:] if item}
 
 def ignore(directory, names):
-    if excluded_path is None:
+    if not excluded_paths:
         return set()
     try:
         relative = Path(directory).relative_to(source)
     except ValueError:
         return set()
-    return {name for name in names if relative / name == excluded_path}
+    return {name for name in names if relative / name in excluded_paths}
 
 # symlinks=True preserves the jail layout but copy2 creates private regular
 # files, intentionally expanding any hard-linked source files.
@@ -4350,7 +4351,10 @@ cmd_sync() {
 # snapshots and bundles complete without masking unrelated archive errors.
 jail_archive_exclude_options() {
     local name="$1" shim
-    JAIL_ARCHIVE_EXCLUDES=()
+    # The post-login guard is a host-side launcher bind-mounted only while a
+    # protected SSH daemon is running. It is regenerated on SSH start and is
+    # not part of a portable rootfs or any saved jail state.
+    JAIL_ARCHIVE_EXCLUDES=("--exclude=$name/usr/local/lib/jroot-unroot-guard")
     shim="$(jail_local_shim "$name")"
     if [ -f "$shim" ] && [ ! -r "$shim" ] && [ ! -s "$shim" ]; then
         JAIL_ARCHIVE_EXCLUDES+=("--exclude=$name/usr/local/lib/libjroot.so")
@@ -7566,23 +7570,12 @@ write_ssh_session_wrapper() {
     local cfg="$CONFIGS_DIR/$name.json"
     local dest="$rootfs/usr/local/bin/jroot-session"
     local jail_ports jail_lb ro_mounts="" m_label m_hostpath m_mode
-    local lim_mem lim_cpu lim_nofile mem_kb="" user_mode unroot_guard=0 ssh_unroot_landlock=""
+    local lim_mem lim_cpu lim_nofile mem_kb="" user_mode unroot_guard=0
 
     jail_ports="$(config_ports "$cfg")"
     user_mode="$(config_field "$cfg" user)"
     if [ "$user_mode" = "unroot" ]; then
         unroot_guard=1
-        # These are guest paths: the guard runs after PRoot has established the
-        # jail root and private /tmp + /run overlays, so Landlock resolves them
-        # to the same confined files the SSH login process sees.
-        # Landlock controls open/exec by path. The SSH guard must therefore
-        # grant RX to the whole immutable guest image so the shell, ELF loader,
-        # shared libraries, command binaries, and their read-only data can load.
-        # The only write grants are the ordinary user's home and per-session
-        # /tmp + /run overlays prepared by run_in_jail.
-        ssh_unroot_landlock="$(printf '/\t%s\n/home/jail\t%s\n/tmp\t%s\n/run\t%s\n/dev\t%s\n/proc\t%s\n/sys\t%s' \
-            "$LANDLOCK_RX" "$LANDLOCK_FULL" "$LANDLOCK_FULL" "$LANDLOCK_FULL" \
-            "$LANDLOCK_FULL" "$LANDLOCK_FULL" "$LANDLOCK_FULL")"
     fi
     jail_lb="$(config_field "$cfg" loopback)"
     case "$jail_lb" in off|shared|disabled) jail_lb="" ;; esac
@@ -7618,7 +7611,6 @@ JROOT_LIMIT_MEM_KB='$mem_kb'
 JROOT_LIMIT_CPU='$lim_cpu'
 JROOT_LIMIT_NOFILE='$lim_nofile'
 JROOT_UNROOT_GUARD='$unroot_guard'
-JROOT_UNROOT_LANDLOCK='$ssh_unroot_landlock'
 
 # sshd inherits limits at daemon start. Reapply them for all interactive,
 # command, SCP, and SFTP paths handled by this ForceCommand wrapper.
@@ -7657,9 +7649,12 @@ jroot_session_exec() {
             echo "jroot: protected unroot SSH guard is unavailable" >&2
             exit 126
         }
+        # This guard runs inside an already-launched PRoot session. The outer
+        # protected SSH daemon has already installed the real host-path Landlock
+        # policy for its whole process tree. Reapplying guest-path rules here
+        # addresses the wrong namespace and can deny the shell's execve().
+        # Keep only the inherited seccomp credential-change filter.
         exec env JROOT_UNROOT=1 \
-            JROOT_LANDLOCK="\$JROOT_UNROOT_LANDLOCK" \
-            JROOT_LANDLOCK_STRICT=1 \
             python3 /usr/local/lib/jroot-unroot-guard "\$@"
     fi
     exec "\$@"
@@ -8156,7 +8151,11 @@ cmd_checkpoint() {
     # Later checkpoints use rsync's link-dest mode, which links only files
     # whose content *and attributes* still match the prior immutable checkpoint.
     # A changed file receives a new inode in the new checkpoint.
-    local shim shim_rel="" checkpoint_excludes=()
+    local shim shim_rel="" guard_rel="/usr/local/lib/jroot-unroot-guard"
+    # The SSH post-login guard is a host-side seccomp launcher bind-mounted into
+    # a live protected daemon. It is deliberately never copied: checkpoints,
+    # snapshots, and bundles save jail data, not live host bind mounts.
+    local checkpoint_excludes=("--exclude=$guard_rel")
     shim="$(jail_local_shim "$name")"
     # The bind shim can be an intentionally unreadable zero-byte mountpoint in a
     # live rootfs. It is recreated by the launcher, not user data, and must not
@@ -8178,7 +8177,7 @@ cmd_checkpoint() {
         # Termux shared storage and other FUSE filesystems cannot link to a
         # previous checkpoint. A private copy costs more disk space but remains
         # immutable and lets normal init/checkpoint/clone workflows work.
-        private_copy_tree "$ROOTS_DIR/$name" "$target" "$shim_rel" || {
+        private_copy_tree "$ROOTS_DIR/$name" "$target" "$guard_rel" "$shim_rel" || {
             rm -rf "$target"
             err "Checkpoint failed. On Termux, install Python with: pkg install python"
         }

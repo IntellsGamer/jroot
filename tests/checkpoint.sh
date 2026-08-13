@@ -21,13 +21,16 @@ trigger_event_hooks() { :; }
 
 cmd_checkpoint "$name" baseline >/dev/null
 
-# The port shim may be an intentionally unreadable bind placeholder. It is
-# launcher-owned transient state and must not make a checkpoint fail.
+# The port shim and post-login guard may be unreadable host bind mounts while
+# a protected SSH daemon is live. They are launcher-owned transient state and
+# must not make a checkpoint fail or become part of saved jail data.
 : > "$ROOTS_DIR/$name/usr/local/lib/libjroot.so"
-chmod 000 "$ROOTS_DIR/$name/usr/local/lib/libjroot.so"
-cmd_checkpoint "$name" shim-safe >/dev/null
-[ ! -e "$SNAPSHOTS_DIR/$name/checkpoints/shim-safe/usr/local/lib/libjroot.so" ]
-rm -f "$ROOTS_DIR/$name/usr/local/lib/libjroot.so"
+: > "$ROOTS_DIR/$name/usr/local/lib/jroot-unroot-guard"
+chmod 000 "$ROOTS_DIR/$name/usr/local/lib/libjroot.so" "$ROOTS_DIR/$name/usr/local/lib/jroot-unroot-guard"
+cmd_checkpoint "$name" runtime-safe >/dev/null
+[ ! -e "$SNAPSHOTS_DIR/$name/checkpoints/runtime-safe/usr/local/lib/libjroot.so" ]
+[ ! -e "$SNAPSHOTS_DIR/$name/checkpoints/runtime-safe/usr/local/lib/jroot-unroot-guard" ]
+rm -f "$ROOTS_DIR/$name/usr/local/lib/libjroot.so" "$ROOTS_DIR/$name/usr/local/lib/jroot-unroot-guard"
 
 printf 'first-change\n' > "$ROOTS_DIR/$name/etc/state.txt"
 rm -f "$ROOTS_DIR/$name/var/cache/old-index"
