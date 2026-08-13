@@ -244,6 +244,17 @@ import ctypes, platform, sys, os
 
 libc = ctypes.CDLL(None, use_errno=True)
 
+# Used by the shell wrapper before it offers unroot mode. An unroot jail needs a
+# kernel-enforced policy because the backing rootfs is owned by the host user.
+if sys.argv[1:] == ["--landlock-abi"]:
+    LANDLOCK_CREATE_RULESET_VERSION = 1
+    ctypes.set_errno(0)
+    abi = libc.syscall(444, 0, 0, LANDLOCK_CREATE_RULESET_VERSION)
+    if abi < 1:
+        sys.exit(1)
+    print(abi)
+    sys.exit(0)
+
 PR_SET_NO_NEW_PRIVS = 38
 PR_SET_SECCOMP = 22
 SECCOMP_MODE_FILTER = 2
@@ -274,6 +285,7 @@ else:
     sys.exit(1)
 
 ENOSYS = 38
+EPERM = 1
 OPENAT2_NR = 437
 FACCESSAT2_NR = 439
 FCHMODAT2_NR = 452
@@ -295,7 +307,7 @@ PIDFD_GETFD_NR = 438
 OFFSET_ARCH = 4
 OFFSET_NR = 0
 
-# jroot-seccomp-v7
+# jroot-seccomp-v8
 # proot 5.3.0 does not trace the modern *at2 family (openat2/faccessat2/fchmodat2)
 # or the fs-tree family (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
 # mount_setattr), so a jailed worker could reach real host paths (e.g. ~/.jroot
@@ -353,6 +365,19 @@ DENY_ENOSYS = [
 for _nr, _why in DENY_ENOSYS:
     program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, _nr, 0, 1))
     program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS))
+
+# PRoot's -i identity mapping is virtual. In a protected unroot session, do not
+# let an altered account database, su, a setuid helper, or direct syscalls change
+# that virtual identity to uid 0. This filter is inherited by every guest child.
+# It is intentionally absent for explicit --root maintenance commands.
+if os.environ.pop("JROOT_UNROOT", "") == "1":
+    if machine in ("x86_64", "AMD64"):
+        DENY_CREDENTIAL_CHANGE = (105, 106, 113, 114, 116, 117, 119, 122, 123, 126)
+    else:  # aarch64 Linux syscall ABI
+        DENY_CREDENTIAL_CHANGE = (91, 143, 144, 145, 146, 147, 149, 151, 152, 159)
+    for _nr in DENY_CREDENTIAL_CHANGE:
+        program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, _nr, 0, 1))
+        program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM))
 
 # allow everything else
 program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW))
@@ -436,6 +461,9 @@ if os.environ.get("JROOT_LANDLOCK"):
                 break
         if handled == 0:
             sys.stderr.write("jroot: landlock: not supported by this kernel, skipping\n")
+            if strict:
+                sys.stderr.write("jroot: protected unroot session refused: Landlock is required.\n")
+                sys.exit(126)
         else:
             rejected = 0
             for path, mask in entries:
@@ -467,7 +495,11 @@ if os.environ.get("JROOT_LANDLOCK"):
                                          % (path, os.strerror(ctypes.get_errno())))
                 finally:
                     os.close(o)
-            if rejected and not strict:
+            if rejected:
+                if strict:
+                    sys.stderr.write("jroot: protected unroot session refused: %d Landlock rule(s) rejected.\n" % rejected)
+                    os.close(fd)
+                    sys.exit(126)
                 sys.stderr.write(
                     "jroot: landlock: %d rule(s) rejected by the kernel - "
                     "continuing WITHOUT the Landlock layer so the jail still "
@@ -475,8 +507,13 @@ if os.environ.get("JROOT_LANDLOCK"):
                     "JROOT_LANDLOCK_STRICT=1 to enforce it anyway.\n" % rejected)
                 os.close(fd)
             elif libc.syscall(446, fd, 0) < 0:  # restrict_self
-                sys.stderr.write("jroot: landlock: restrict_self: %s\n"
-                                 % os.strerror(ctypes.get_errno()))
+                msg = os.strerror(ctypes.get_errno())
+                sys.stderr.write("jroot: landlock: restrict_self: %s\n" % msg)
+                if strict:
+                    sys.stderr.write("jroot: protected unroot session refused: Landlock could not be enforced.\n")
+                    os.close(fd)
+                    sys.exit(126)
+                os.close(fd)
             else:
                 os.close(fd)
 else:
@@ -497,7 +534,7 @@ PYEOF
 ensure_runtime() {
     mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR" "$JROOT_HOME/pids"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
-    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v7" "$SECCOMP_LAUNCHER"; then
+    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v8" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
     fi
     if ! command -v python3 >/dev/null 2>&1; then
@@ -2865,7 +2902,7 @@ run_in_jail() {
     local cfg="$CONFIGS_DIR/$name.json"
     local rootfs="$ROOTS_DIR/$name"
     local real_home="$REAL_HOME"
-    local user_mode mount_host mount_home image
+    local user_mode mount_host mount_home image unroot_session=0 auth_protected_session=0 jail_identity=""
     user_mode="$(config_field "$cfg" user)";      [ -n "$user_mode" ]  || user_mode="root"
     mount_host="$(config_field "$cfg" mount_host)"; [ -n "$mount_host" ] || mount_host=0
     mount_home="$(config_field "$cfg" mount_home)"; [ -n "$mount_home" ] || mount_home=0
@@ -2883,14 +2920,24 @@ run_in_jail() {
 
     local proot_args=(-k "$PROOT_KERNEL_RELEASE")
     HOSTNAME="$name"
+    # An SSH daemon must start as virtual root, yet unroot login sessions inherit
+    # it. Mark that daemon tree as auth-protected so its children cannot rewrite
+    # the jail database before attempting su/setuid escalation.
+    if [ "$user_mode" = "unroot" ] && { [ "$force_root" != 1 ] || [ "${JROOT_PROTECT_UNROOT_AUTH:-0}" = "1" ]; }; then
+        require_unroot_protection
+        auth_protected_session=1
+    fi
     if [ "$force_root" = 1 ] || [ "$user_mode" = "root" ]; then
         proot_args+=(-0 -w /root)
         HOME=/root USER=root LOGNAME=root SHELL=/bin/bash
     elif [ -d "$rootfs/home/jail" ]; then
-        # unroot: install happened as root; daily use is the inner 'jail' user
-        # (host uid maps through proot). Falls back to old behaviour if the
-        # jail was created before this user existed.
-        proot_args+=(-w /home/jail)
+        # unroot: install happened as root; daily use gets the jail account's
+        # explicit virtual UID/GID. The backing rootfs remains host-owned, so
+        # Landlock below is also required to protect its auth database.
+        jail_identity="$(awk -F: '$1 == "jail" { print $3 ":" $4; exit }' "$rootfs/etc/passwd" 2>/dev/null || true)"
+        [[ "$jail_identity" =~ ^[0-9]+:[0-9]+$ ]] || err "Unroot jail '$name' has no valid 'jail' account. Run: jroot config $name --user=unroot"
+        unroot_session=1
+        proot_args+=(-i "$jail_identity" -w /home/jail)
         HOME=/home/jail USER=jail LOGNAME=jail SHELL=/bin/bash
     else
         proot_args+=(-w /)
@@ -2928,6 +2975,12 @@ run_in_jail() {
     local proot_tmp="${PROOT_TMP_DIR:-/tmp}"
 
     local binds=(-b /dev -b /proc -b /sys)
+    if [ "$auth_protected_session" = "1" ]; then
+        # sshd has to start as virtual root, but its post-login ForceCommand
+        # applies this host-backed guard before exposing a shell to the jail user.
+        [ -x "$SECCOMP_LAUNCHER" ] || err "Protected unroot SSH guard is missing. Re-run jroot after installation repair."
+        binds+=( -b "$SECCOMP_LAUNCHER:/run/jroot-unroot-guard" )
+    fi
     if [ "$mount_host" = "1" ]; then
         binds+=(-b /:/mnt/host)
     fi
@@ -3047,7 +3100,24 @@ run_in_jail() {
     # cannot be loaded. Set JROOT_LANDLOCK_OFF=1 to skip it.
     LANDLOCK_RULES=""
     if [ -z "${JROOT_LANDLOCK_OFF:-}" ]; then
-        landlock_allow "$rootfs" "$LANDLOCK_FULL"
+        if [ "$auth_protected_session" = "1" ]; then
+            # Landlock grants compose up the path hierarchy, so a FULL rule on
+            # the rootfs would also hand write access back to /etc. Instead give
+            # the rootfs itself RX for traversal, grant FULL to every immediate
+            # top-level entry except /etc, and leave /etc RX-only. This protects
+            # passwd/shadow/group/gshadow and all their replacement/rename paths.
+            local root_entry
+            landlock_allow "$rootfs" "$LANDLOCK_RX"
+            shopt -s nullglob dotglob
+            for root_entry in "$rootfs"/*; do
+                [ "$(basename "$root_entry")" = "etc" ] && continue
+                landlock_allow "$root_entry" "$LANDLOCK_FULL"
+            done
+            shopt -u nullglob dotglob
+            landlock_allow "$rootfs/etc" "$LANDLOCK_RX"
+        else
+            landlock_allow "$rootfs" "$LANDLOCK_FULL"
+        fi
         landlock_allow /dev "$LANDLOCK_FULL"
         landlock_allow /proc "$LANDLOCK_FULL"
         landlock_allow /sys "$LANDLOCK_FULL"
@@ -3101,9 +3171,12 @@ run_in_jail() {
     # inherits it on exec. Requires host python3, which also applies Landlock.
     # NOTE: proot must run as a CHILD (no `exec`) so jroot can keep going
     # after it exits - init/update/verify all call run_in_jail mid-script.
-    local rc=0
+    local rc=0 landlock_strict=""
+    [ "$auth_protected_session" = "1" ] && landlock_strict=1
     if command -v python3 >/dev/null 2>&1 && [ -x "$SECCOMP_LAUNCHER" ]; then
         JROOT_LANDLOCK="$LANDLOCK_RULES" \
+        JROOT_LANDLOCK_STRICT="$landlock_strict" \
+        JROOT_UNROOT="$unroot_session" \
             python3 "$SECCOMP_LAUNCHER" "$PROOT_BIN" "${proot_args[@]}" \
             -r "$rootfs" "${binds[@]}" "$@"
         rc=$?
@@ -3324,6 +3397,22 @@ EOFPROFILE
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+# PRoot maps identities but cannot make host-owned files genuinely inaccessible
+# by chmod/chown alone. Protected unroot sessions therefore require the kernel
+# Landlock layer, which makes the jail authentication database read-only to the
+# unroot process and all of its descendants.
+unroot_protection_available() {
+    [ -z "${JROOT_LANDLOCK_OFF:-}" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    [ -x "$SECCOMP_LAUNCHER" ] || return 1
+    python3 "$SECCOMP_LAUNCHER" --landlock-abi >/dev/null 2>&1
+}
+
+require_unroot_protection() {
+    unroot_protection_available && return 0
+    err "Protected unroot mode requires Linux Landlock and host Python 3. Use '--user=root' on this host, or run 'jroot doctor' for capability details."
+}
+
 cmd_init() {
     local image="" repo tag version codename name user_mode response distro=""
     local mount_host=0 mount_home=0 build_essential=1
@@ -3432,6 +3521,7 @@ cmd_init() {
 
     ensure_runtime
     install_proot
+    [ "$user_mode" != "unroot" ] || require_unroot_protection
 
     if [ "$distro" = "ubuntu" ]; then
         get_ubuntu "$name" "$version"
@@ -5641,6 +5731,10 @@ cmd_config() {
         done
     fi
 
+    if [ "$user_mode" = "unroot" ]; then
+        ensure_runtime
+        require_unroot_protection
+    fi
     write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
     if [ -n "$mounts_pairs" ]; then
         set_config_mounts "$cfg" $mounts_pairs >/dev/null 2>&1
@@ -6021,8 +6115,14 @@ cmd_doctor() {
     if command -v python3 >/dev/null 2>&1; then
         report "python3 (seccomp launcher): $(command -v python3)" ok
         [ -x "$SECCOMP_LAUNCHER" ] && report "seccomp launcher: $SECCOMP_LAUNCHER" ok || report "seccomp launcher missing: $SECCOMP_LAUNCHER" warn
+        if unroot_protection_available; then
+            report "protected unroot mode" ok "Landlock is available; unroot /etc and credential changes are guarded"
+        else
+            report "protected unroot mode unavailable" warn "Landlock is required; create jails with --user=root on this host"
+        fi
     else
         report "python3 not found" warn "seccomp filter and Landlock allowlist will both be disabled"
+        report "protected unroot mode unavailable" warn "install Python 3 and use a Landlock-capable kernel"
     fi
 
     # Kernel side of the sandbox: seccomp filter mode and Landlock ABI.
@@ -7350,6 +7450,7 @@ SSHEOF
     set -m
     (
         JROOT_FAKE_PRIVSEP=1
+        JROOT_PROTECT_UNROOT_AUTH=1
         run_in_jail --root "$name" /usr/sbin/sshd -D -e >>"$logfile" 2>&1
     ) &
     local daemon_pid=$!
@@ -7457,9 +7558,11 @@ write_ssh_session_wrapper() {
     local cfg="$CONFIGS_DIR/$name.json"
     local dest="$rootfs/usr/local/bin/jroot-session"
     local jail_ports jail_lb ro_mounts="" m_label m_hostpath m_mode
-    local lim_mem lim_cpu lim_nofile mem_kb=""
+    local lim_mem lim_cpu lim_nofile mem_kb="" user_mode unroot_guard=0
 
     jail_ports="$(config_ports "$cfg")"
+    user_mode="$(config_field "$cfg" user)"
+    [ "$user_mode" = "unroot" ] && unroot_guard=1
     jail_lb="$(config_field "$cfg" loopback)"
     case "$jail_lb" in off|shared|disabled) jail_lb="" ;; esac
     while IFS=$'\t' read -r m_label m_hostpath m_mode; do
@@ -7493,6 +7596,7 @@ JROOT_SHIM=/usr/local/lib/libjroot.so
 JROOT_LIMIT_MEM_KB='$mem_kb'
 JROOT_LIMIT_CPU='$lim_cpu'
 JROOT_LIMIT_NOFILE='$lim_nofile'
+JROOT_UNROOT_GUARD='$unroot_guard'
 
 # sshd inherits limits at daemon start. Reapply them for all interactive,
 # command, SCP, and SFTP paths handled by this ForceCommand wrapper.
@@ -7519,11 +7623,26 @@ fi
 [ -n "\$SHELL" ] && [ -x "\$SHELL" ] || SHELL=/bin/sh
 export SHELL
 
+# sshd starts as fake root so it can authenticate and drop privileges. Once it
+# reaches this ForceCommand wrapper, install the no-credential-change guard
+# before exposing any command to an unroot login. The guard is host-backed and
+# bind-mounted into /run, not stored in the writable jail rootfs.
+jroot_session_exec() {
+    if [ "\$JROOT_UNROOT_GUARD" = "1" ]; then
+        [ -x /run/jroot-unroot-guard ] || {
+            echo "jroot: protected unroot SSH guard is unavailable" >&2
+            exit 126
+        }
+        exec env JROOT_UNROOT=1 python3 /run/jroot-unroot-guard "\$@"
+    fi
+    exec "\$@"
+}
+
 # A subsystem request (sftp) arrives here as its bare name, which is not a
 # runnable command, so map it back to the server binary.
 if [ "\$SSH_ORIGINAL_COMMAND" = "sftp" ] || [ "\$SSH_ORIGINAL_COMMAND" = "internal-sftp" ]; then
     for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/sftp-server; do
-        [ -x "\$p" ] && exec "\$p"
+        [ -x "\$p" ] && jroot_session_exec "\$p"
     done
     echo "jroot: no sftp-server found in this jail" >&2
     exit 127
@@ -7531,11 +7650,11 @@ fi
 
 # 'ssh host <cmd>' and scp both arrive as SSH_ORIGINAL_COMMAND.
 if [ -n "\$SSH_ORIGINAL_COMMAND" ]; then
-    exec "\$SHELL" -c "\$SSH_ORIGINAL_COMMAND"
+    jroot_session_exec "\$SHELL" -c "\$SSH_ORIGINAL_COMMAND"
 fi
 
 # Interactive login: match what 'jroot enter' gives you.
-exec "\$SHELL" -l
+jroot_session_exec "\$SHELL" -l
 WRAPEOF
     chmod 755 "$dest" 2>/dev/null || true
     return 0

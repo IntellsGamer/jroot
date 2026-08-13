@@ -371,6 +371,8 @@ test: check
 	@bash tests/plugins.sh
 	@printf '$(CYAN)==>$(NC) tests/init.sh\n'
 	@bash tests/init.sh
+	@printf '$(CYAN)==>$(NC) tests/unroot-security.sh\n'
+	@bash tests/unroot-security.sh
 	@printf '$(CYAN)==>$(NC) tests/termux-filesystem.sh\n'
 	@bash tests/termux-filesystem.sh
 	@printf '$(CYAN)==>$(NC) tests/build.sh\n'
