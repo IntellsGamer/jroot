@@ -27,6 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes build-essential rsync shellcheck
+          python -m pip install --upgrade 'cryptography>=44'
 
       - name: Run complete Makefile test suite
         run: make test
