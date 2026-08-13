@@ -87,13 +87,21 @@ if grep -qF "$rootfs/etc"$'\t'"$LANDLOCK_RX" "$WORK/rules"; then
     exit 1
 fi
 
-# sshd itself stays virtual root and unrestricted; its post-login wrapper is
-# where the unroot-only guard is installed before executing the remote command.
+# sshd starts as virtual root only to authenticate and drop privileges. Its
+# persistent process tree must still inherit the immutable-system policy before
+# any unroot login begins, or account files remain writable after authentication.
 JROOT_SSH_UNROOT_RUNTIME=1 run_in_jail --root dev /bin/true
 grep -qx -- '-0' "$WORK/args"
 [ ! -s "$WORK/strict" ]
 grep -qx '0' "$WORK/unroot"
-grep -qF "$rootfs"$'\t'"$LANDLOCK_FULL" "$WORK/rules"
+grep -qF "$rootfs"$'\t'"$LANDLOCK_RX" "$WORK/rules"
+grep -qF "$rootfs/home/jail"$'\t'"$LANDLOCK_FULL" "$WORK/rules"
+! grep -qF "$rootfs"$'\t'"$LANDLOCK_FULL" "$WORK/rules"
+# These sensitive files have no more-specific writable Landlock rule, so the
+# read/execute rootfs rule above is their kernel-enforced effective policy.
+for account_db in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do
+    ! grep -qF "$rootfs$account_db"$'\t'"$LANDLOCK_FULL" "$WORK/rules"
+done
 grep -qx "$SECCOMP_LAUNCHER:/usr/local/lib/jroot-unroot-guard" "$WORK/args"
 grep -qE '/\.unroot-dev\..*/tmp:/tmp' "$WORK/args"
 write_ssh_session_wrapper dev
@@ -115,6 +123,7 @@ fi
 # The generated launcher must reject all uid/gid/capability mutation syscall
 # families for direct unroot sessions.
 grep -q 'DENY_CREDENTIAL_CHANGE' "$ROOT/jroot"
+grep -q 'PR_SET_NO_NEW_PRIVS' "$ROOT/jroot"
 grep -q 'JROOT_UNROOT' "$ROOT/jroot"
 grep -q 'JROOT_SSH_UNROOT_RUNTIME=1' "$ROOT/jroot"
 printf '  ok    protected unroot direct and SSH policy keeps the system image immutable and preserves explicit root maintenance\n'

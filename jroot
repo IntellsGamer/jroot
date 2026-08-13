@@ -3114,12 +3114,17 @@ run_in_jail() {
     # cannot be loaded. Set JROOT_LANDLOCK_OFF=1 to skip it.
     LANDLOCK_RULES=""
     if [ -z "${JROOT_LANDLOCK_OFF:-}" ]; then
-        if [ "$unroot_session" = "1" ]; then
+        if [ "$protected_runtime" = "1" ]; then
             # A protected unroot session is deliberately restrictive: system
             # image paths are read/execute only, while normal user work is
             # confined to /home/jail and the private /tmp + /run overlays above.
-            # This blocks auth-file edits *and* binary/library replacement that
-            # could wait for a later --root maintenance command.
+            # This includes the persistent SSH daemon: it starts as virtual root
+            # solely to authenticate and drop to the login account, then every
+            # post-authentication child inherits this immutable-system policy.
+            # Without applying it here, the daemon's rootfs-FULL rule survives
+            # authentication and leaves /etc writable despite the session guard.
+            # Explicit --root maintenance does not set protected_runtime and
+            # remains fully unrestricted.
             landlock_allow "$rootfs" "$LANDLOCK_RX"
             [ -d "$rootfs/home/jail" ] && landlock_allow "$rootfs/home/jail" "$LANDLOCK_FULL"
             landlock_allow "$session_runtime" "$LANDLOCK_FULL"
