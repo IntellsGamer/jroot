@@ -4809,7 +4809,7 @@ def clear_progress():
 
 def fail(message):
     clear_progress()
-    sys.stderr.write("jroot: encrypted bundle: %s\\n" % message)
+    sys.stderr.write("jroot: encrypted bundle: %s\n" % message)
     raise SystemExit(1)
 
 
