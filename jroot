@@ -187,9 +187,31 @@ list_images() {
     printf '  %bjroot init alpine:3.20%b\n' "$C_GRN" "$C_NC"
 }
 
+is_noninteractive_context() {
+    [ ! -t 0 ] || [ -n "${CI:-}" ] || [ "${NONINTERACTIVE:-0}" = "1" ]
+}
+
+# confirm_destructive <action> <prompt>
+# Interactive terminals require an explicit yes. CI, pipes, and explicitly
+# non-interactive calls are already deliberate automation, so they continue
+# without waiting for a read that can never arrive.
+confirm_destructive() {
+    local action="$1" prompt="$2" response
+    if is_noninteractive_context; then
+        log "Non-interactive $action confirmed automatically."
+        return 0
+    fi
+    printf '%s' "$prompt"
+    read -r response || response="N"
+    case "$response" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 ask() {
     local prompt="$1" default="$2" response
-    if [ -n "${NONINTERACTIVE:-}" ]; then
+    if is_noninteractive_context; then
         echo "$default"
         return 0
     fi
@@ -6766,17 +6788,10 @@ cmd_rm() {
     [ $# -eq 1 ] || err "Usage: jroot rm <name>"
     local name="$1" response
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
-    if [ -t 0 ] && [ -z "${CI:-}" ] && [ "${NONINTERACTIVE:-0}" != "1" ]; then
-        printf 'Delete jail "%s" and its rootfs (%s)? [y/N]: ' "$name" "$ROOTS_DIR/$name"
-        read -r response || response="N"
-    else
-        response="yes"
-        log "Non-interactive deletion confirmed automatically."
+    if ! confirm_destructive "deletion" "Delete jail \"$name\" and its rootfs ($ROOTS_DIR/$name)? [y/N]: "; then
+        log "Aborted."
+        return 0
     fi
-    case "$response" in
-        y|Y|yes|YES) ;;
-        *) log "Aborted."; return 0 ;;
-    esac
     # Stop SSH daemon if running
     if [ -f "$(ssh_pid_file "$name")" ]; then
         ssh_stop "$name" 2>/dev/null || true
@@ -7247,25 +7262,16 @@ update_offer_rollback() {
     warn "Update of '$name' failed: $reason"
     warn "The jail was checkpointed as '$checkpoint' before updating."
     record_event "$name" "update" "FAILED: $reason; checkpoint=$checkpoint"
-    if [ -t 0 ] && [ "${NONINTERACTIVE:-0}" != "1" ]; then
-        printf 'Restore checkpoint "%s" now? This discards the failed update. [y/N]: ' "$checkpoint"
-        read -r response || response="N"
-        case "$response" in
-            y|Y|yes|YES)
-                if restore_checkpoint_now "$name" "$checkpoint"; then
-                    record_event "$name" "update" "rolled back to checkpoint $checkpoint"
-                    trigger_event_hooks "on_snapshot" "$name" "restore-checkpoint:$checkpoint"
-                    log "Update rollback completed."
-                else
-                    warn "Automatic rollback failed. Restore manually: jroot revert checkpoint $name $checkpoint"
-                fi
-                ;;
-            *)
-                log "Rollback not selected. Restore later with: jroot revert checkpoint $name $checkpoint"
-                ;;
-        esac
+    if confirm_destructive "rollback" "Restore checkpoint \"$checkpoint\" now? This discards the failed update. [y/N]: "; then
+        if restore_checkpoint_now "$name" "$checkpoint"; then
+            record_event "$name" "update" "rolled back to checkpoint $checkpoint"
+            trigger_event_hooks "on_snapshot" "$name" "restore-checkpoint:$checkpoint"
+            log "Update rollback completed."
+        else
+            warn "Automatic rollback failed. Restore manually: jroot revert checkpoint $name $checkpoint"
+        fi
     else
-        warn "Non-interactive session: no rollback was attempted. Restore with: jroot revert checkpoint $name $checkpoint"
+        log "Rollback not selected. Restore later with: jroot revert checkpoint $name $checkpoint"
     fi
     return 1
 }
@@ -9262,13 +9268,10 @@ cmd_revert() {
         [ -f "$dir/$label.json" ] || err "Checkpoint config '$dir/$label.json' missing."
     fi
 
-    local response
-    printf 'Restore jail "%s" to %s "%s"? This replaces the current rootfs. [y/N]: ' "$name" "$type" "$label"
-    read -r response || response="N"
-    case "$response" in
-        y|Y|yes|YES) ;;
-        *) log "Aborted."; return 0 ;;
-    esac
+    if ! confirm_destructive "restore" "Restore jail \"$name\" to $type \"$label\"? This replaces the current rootfs. [y/N]: "; then
+        log "Aborted."
+        return 0
+    fi
 
     local rootfs="$ROOTS_DIR/$name" tmp
     if [ "$type" = "snapshot" ]; then
@@ -9297,13 +9300,10 @@ cmd_rm_snapshot() {
     local name="$1" label="$2"
     local dir="$SNAPSHOTS_DIR/$name"
     [ -f "$dir/$label.tar.gz" ] || err "Snapshot '$label' not found for '$name'. Run 'jroot snapshots $name'."
-    local response
-    printf 'Delete snapshot "%s/%s"? [y/N]: ' "$name" "$label"
-    read -r response || response="N"
-    case "$response" in
-        y|Y|yes|YES) ;;
-        *) log "Aborted."; return 0 ;;
-    esac
+    if ! confirm_destructive "snapshot deletion" "Delete snapshot \"$name/$label\"? [y/N]: "; then
+        log "Aborted."
+        return 0
+    fi
     rm -f "$dir/$label.tar.gz" "$dir/$label.json"
     log "Snapshot '$label' deleted."
     record_event "$name" "rm-snapshot" "$label"
@@ -9314,13 +9314,10 @@ cmd_rm_checkpoint() {
     local name="$1" label="$2"
     local dir="$SNAPSHOTS_DIR/$name/checkpoints"
     [ -d "$dir/$label" ] || err "Checkpoint '$label' not found for '$name'. Run 'jroot checkpoints $name'."
-    local response
-    printf 'Delete checkpoint "%s/%s"? [y/N]: ' "$name" "$label"
-    read -r response || response="N"
-    case "$response" in
-        y|Y|yes|YES) ;;
-        *) log "Aborted."; return 0 ;;
-    esac
+    if ! confirm_destructive "checkpoint deletion" "Delete checkpoint \"$name/$label\"? [y/N]: "; then
+        log "Aborted."
+        return 0
+    fi
     rm -rf "$dir/$label" "$dir/$label.json"
     log "Checkpoint '$label' deleted."
     record_event "$name" "rm-checkpoint" "$label"
@@ -9564,6 +9561,7 @@ cmd_help_cmd() {
             printf '    %bjroot rm <name>%b\n' "$G" "$N"
             printf '\n    Deletes the rootfs, config, and all snapshots for the jail.\n'
             printf '    CI and non-interactive use confirm deletion automatically.\n'
+            printf '    Snapshot/checkpoint deletion, revert, and failed-update rollback follow the same rule.\n'
             ;;
         rename)
             printf '%bjroot rename%b - rename a jail\n\n' "$H" "$N"

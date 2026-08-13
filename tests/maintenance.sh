@@ -56,6 +56,7 @@ setup_unroot_alpine() { :; }
 record_event() { :; }
 trigger_event_hooks() { :; }
 build_metadata_get() { return 1; }
+restore_checkpoint_now() { return 0; }
 UPDATE_PACKAGE_RC=0
 UPDATE_HEALTH_RC=0
 run_in_jail() {
@@ -85,8 +86,8 @@ fi
 [[ "$update_output" != *'Restore checkpoint'* ]]
 find "$SNAPSHOTS_DIR/$name/checkpoints" -mindepth 1 -maxdepth 1 -type d -name 'pre-update-*' -print -quit | grep -q .
 
-# A failed health check follows the catastrophic path. NONINTERACTIVE prevents
-# an unattended test from accepting a rollback prompt.
+# A failed health check follows the catastrophic path. NONINTERACTIVE confirms
+# the recovery instead of leaving an unattended update with a broken rootfs.
 UPDATE_PACKAGE_RC=0
 UPDATE_HEALTH_RC=1
 if catastrophic_output="$(cmd_update "$name" 2>&1)"; then
@@ -94,6 +95,7 @@ if catastrophic_output="$(cmd_update "$name" 2>&1)"; then
     exit 1
 fi
 [[ "$catastrophic_output" == *'post-update rootfs health check failed'* ]]
-[[ "$catastrophic_output" == *'Non-interactive session: no rollback was attempted'* ]]
+[[ "$catastrophic_output" == *'Non-interactive rollback confirmed automatically.'* ]]
+[[ "$catastrophic_output" == *'Update rollback completed.'* ]]
 
 printf '  ok    doctor repair advice and checkpoint-protected update flow\n'
