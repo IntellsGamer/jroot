@@ -2114,7 +2114,7 @@ def display(final=False):
     filled = int(width * percent / 100)
     bar = "#" * filled + "-" * (width - filled)
     suffix = "done" if final else (f"ETA {int(eta)}s" if rate else "starting")
-    sys.stderr.write(f"\r    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.write(f"\r\x1b[2K    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
     sys.stderr.flush()
 
 with open(source, "rb", buffering=0) as handle:
@@ -2167,7 +2167,7 @@ def display(final=False):
     filled = int(width * percent / 100)
     bar = "#" * filled + "-" * (width - filled)
     suffix = "done" if final else "writing"
-    sys.stderr.write(f"\r    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.write(f"\r\x1b[2K    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
     sys.stderr.flush()
 
 try:
@@ -2283,7 +2283,7 @@ def display(final=False):
     filled = int(width * percent / 100)
     bar = "#" * filled + "-" * (width - filled)
     suffix = "done" if final else "copying"
-    sys.stderr.write(f"\r    Filesystem copy [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.write(f"\r\x1b[2K    Filesystem copy [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
     sys.stderr.flush()
 
 def copy_file(src, dst, *, follow_symlinks=True):
@@ -2387,7 +2387,7 @@ def display(total, final=False):
     filled = int(width * percent / 100)
     bar = "#" * filled + "-" * (width - filled)
     suffix = "done" if final else "extracting"
-    sys.stderr.write(f"\r    Archive payload [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.write(f"\r\x1b[2K    Archive payload [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
     sys.stderr.flush()
 root = destination.resolve()
 force_no_links = os.environ.get("JROOT_FORCE_NO_HARDLINKS") == "1"
@@ -4790,7 +4790,7 @@ def progress(label, done, total, started, final=False):
     filled = int(width * percent / 100)
     bar = "#" * filled + "-" * (width - filled)
     suffix = "done" if final else "processing"
-    sys.stderr.write(f"\r    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.write(f"\r\x1b[2K    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
     sys.stderr.flush()
     if final:
         sys.stderr.write("\n")
