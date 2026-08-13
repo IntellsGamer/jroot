@@ -121,10 +121,33 @@ if ( unroot_protection_available() { return 1; }; run_in_jail dev /bin/true ) >/
 fi
 
 # The generated launcher must reject all uid/gid/capability mutation syscall
-# families for direct unroot sessions.
+# families for direct unroot sessions, including the user-namespace route to
+# namespace-local CAP_NET_ADMIN. Ordinary fork/clone behavior must remain.
 grep -q 'DENY_CREDENTIAL_CHANGE' "$ROOT/jroot"
+grep -q 'CLONE_NEWUSER' "$ROOT/jroot"
+grep -q 'AF_ALG' "$ROOT/jroot"
 grep -q 'PR_SET_NO_NEW_PRIVS' "$ROOT/jroot"
 grep -q 'JROOT_UNROOT' "$ROOT/jroot"
 grep -q 'JROOT_SSH_UNROOT_RUNTIME=1' "$ROOT/jroot"
+write_seccomp_launcher
+command python3 -m py_compile "$SECCOMP_LAUNCHER"
+JROOT_UNROOT=1 command python3 "$SECCOMP_LAUNCHER" /bin/sh -c '(exit 0) & wait'
+if JROOT_UNROOT=1 command python3 "$SECCOMP_LAUNCHER" /usr/bin/unshare --user /bin/true >/dev/null 2>&1; then
+    printf 'protected unroot launcher allowed user namespace creation\n' >&2
+    exit 1
+fi
+if command python3 -c 'import socket; raise SystemExit(0 if hasattr(socket, "AF_ALG") else 1)' >/dev/null 2>&1; then
+    cat > "$WORK/af_alg_probe.py" <<'PY'
+import errno
+import socket
+import sys
+try:
+    socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+except OSError as exc:
+    raise SystemExit(0 if exc.errno == errno.EPERM else 1)
+raise SystemExit(2)
+PY
+    JROOT_UNROOT=1 command python3 "$SECCOMP_LAUNCHER" /usr/bin/python3 "$WORK/af_alg_probe.py"
+fi
 printf '  ok    protected unroot direct and SSH policy keeps the system image immutable and preserves explicit root maintenance\n'
 BASH

@@ -267,6 +267,7 @@ class sock_fprog(ctypes.Structure):
     _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(sock_filter))]
 
 BPF_LD = 0x00; BPF_W = 0x00; BPF_ABS = 0x20
+BPF_ALU = 0x04; BPF_AND = 0x50
 BPF_JMP = 0x05; BPF_JEQ = 0x10; BPF_JGT = 0x20; BPF_RET = 0x06; BPF_K = 0x00
 BPF_STMT = lambda code, k: sock_filter(code, 0, 0, k)
 BPF_JUMP = lambda code, k, jt, jf: sock_filter(code, jt, jf, k)
@@ -304,10 +305,15 @@ IO_URING_REGISTER_NR = 427
 # pidfd_getfd steals a live file descriptor out of another process - including
 # proot itself, which holds descriptors outside the jail.
 PIDFD_GETFD_NR = 438
+# seccomp_data is: nr (0), arch (4), instruction pointer (8), args[0] (16).
+# The low word of clone's first argument contains every CLONE_NEW* flag.
 OFFSET_ARCH = 4
 OFFSET_NR = 0
+OFFSET_ARG0 = 16
+CLONE_NEWUSER = 0x10000000
+AF_ALG = 38
 
-# jroot-seccomp-v8
+# jroot-seccomp-v9
 # proot 5.3.0 does not trace the modern *at2 family (openat2/faccessat2/fchmodat2)
 # or the fs-tree family (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
 # mount_setattr), so a jailed worker could reach real host paths (e.g. ~/.jroot
@@ -373,11 +379,36 @@ for _nr, _why in DENY_ENOSYS:
 if os.environ.pop("JROOT_UNROOT", "") == "1":
     if machine in ("x86_64", "AMD64"):
         DENY_CREDENTIAL_CHANGE = (105, 106, 113, 114, 116, 117, 119, 122, 123, 126)
+        CLONE_NR, CLONE3_NR, UNSHARE_NR, SETNS_NR, SOCKET_NR = 56, 435, 272, 308, 41
     else:  # aarch64 Linux syscall ABI
         DENY_CREDENTIAL_CHANGE = (91, 143, 144, 145, 146, 147, 149, 151, 152, 159)
+        CLONE_NR, CLONE3_NR, UNSHARE_NR, SETNS_NR, SOCKET_NR = 220, 435, 97, 268, 198
     for _nr in DENY_CREDENTIAL_CHANGE:
         program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, _nr, 0, 1))
         program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM))
+
+    # CVE-2026-46331 containment: an ordinary unroot jail user must not create
+    # or enter a user namespace, because that grants namespace-local capability
+    # bits (including CAP_NET_ADMIN) that make vulnerable traffic-control paths
+    # reachable. Block the alternate clone3 path outright; preserve ordinary
+    # clone()/pthread use, but reject legacy clone calls carrying CLONE_NEWUSER.
+    # This is an application-level containment, not a substitute for a fixed
+    # kernel, and is intentionally absent for explicit --root maintenance.
+    for _nr in (UNSHARE_NR, SETNS_NR, CLONE3_NR):
+        program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, _nr, 0, 1))
+        program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM))
+    program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, CLONE_NR, 0, 4))
+    program.append(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARG0))
+    program.append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, CLONE_NEWUSER))
+    program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0))
+    program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM))
+
+    # AF_ALG exposes the kernel crypto API. It is not needed by ordinary jail
+    # workloads and is blocked as defense in depth alongside namespace creation.
+    program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCKET_NR, 0, 3))
+    program.append(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARG0))
+    program.append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_ALG, 0, 1))
+    program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM))
 
 # allow everything else
 program.append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW))
@@ -534,7 +565,7 @@ PYEOF
 ensure_runtime() {
     mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR" "$JROOT_HOME/pids"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
-    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v8" "$SECCOMP_LAUNCHER"; then
+    if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v9" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
     fi
     if ! command -v python3 >/dev/null 2>&1; then
