@@ -2194,18 +2194,238 @@ sys.stderr.write("\n")
 PY
 }
 
-progress_tar_gzip() {
-    # $1 output, $2 display label, remaining arguments form the tar command.
-    # The first pass has no side effects and gives a mathematically exact total
-    # for the actual tar stream, rather than an estimate from du(1).
-    local output="$1" label="$2" total
+bundle_codec_suffix() {
+    case "$1" in
+        gz) printf '.tar.gz' ;;
+        zst) printf '.tar.zst' ;;
+        xz) printf '.tar.xz' ;;
+        lz4) printf '.tar.lz4' ;;
+        *) return 1 ;;
+    esac
+}
+
+bundle_codec_from_path() {
+    case "$1" in
+        *.tar.gz) printf 'gz' ;;
+        *.tar.zst) printf 'zst' ;;
+        *.tar.xz) printf 'xz' ;;
+        *.tar.lz4) printf 'lz4' ;;
+        *) return 1 ;;
+    esac
+}
+
+bundle_zstd_path() {
+    [ "${JROOT_FORCE_NO_ZSTD:-0}" = "1" ] && return 1
+    if [ -x "$BIN_DIR/zstd" ]; then
+        printf '%s' "$BIN_DIR/zstd"
+    else
+        command -v zstd 2>/dev/null
+    fi
+}
+
+bundle_codec_available() {
+    case "$1" in
+        gz) command -v gzip >/dev/null 2>&1 ;;
+        zst) [ -n "$(bundle_zstd_path 2>/dev/null || true)" ] ;;
+        xz) command -v xz >/dev/null 2>&1 ;;
+        lz4) command -v lz4 >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+bundle_codec_install_help() {
+    case "$1" in
+        zst) cat >&2 <<EOF
+[!] Zstandard support is unavailable.
+    Interactive bare-name bundles can install a user-space backend automatically.
+    Otherwise install zstd with your package manager, or run:
+      python3 -m pip install --user --upgrade zstandard
+EOF
+            ;;
+        xz) err "XZ support requires the xz command (Debian/Ubuntu: sudo apt-get install xz-utils; Termux: pkg install xz-utils)." ;;
+        lz4) err "LZ4 support requires the lz4 command (Debian/Ubuntu: sudo apt-get install lz4; Termux: pkg install lz4)." ;;
+        gz) err "gzip is required for .tar.gz bundles." ;;
+    esac
+}
+
+bundle_install_zstd_userspace() {
+    # Python's zstandard wheel is a user-space backend. The tiny wrapper exposes
+    # precisely the streaming subset JRoot needs, without mutating the host.
+    [ -t 0 ] && [ -t 2 ] || return 1
+    local answer
+    printf 'Zstandard is unavailable. Install a user-space backend in %s? [Y/n]: ' "$BIN_DIR" >&2
+    IFS= read -r answer || return 1
+    case "${answer:-Y}" in
+        Y|y|yes|YES) ;;
+        *) return 1 ;;
+    esac
+    command -v python3 >/dev/null 2>&1 || { warn "Python 3 is required for user-space Zstandard installation."; return 1; }
+    log "Installing user-space Zstandard backend..."
+    if ! python3 -m pip install --user --upgrade zstandard; then
+        warn "Standard user installation failed; retrying the externally-managed Python fallback..."
+        if ! python3 -m pip install --user --break-system-packages --upgrade zstandard; then
+            warn "Could not install user-space Zstandard. Falling back to gzip."
+            return 1
+        fi
+    fi
+    mkdir -p "$BIN_DIR" || return 1
+    cat > "$BIN_DIR/zstd" <<'PY'
+#!/usr/bin/env python3
+# JRoot's user-space zstd compatibility wrapper. It accepts the streaming
+# -c/-d subset used by the bundle implementation; thread/quiet flags are inert.
+import sys
+try:
+    import zstandard as zstd
+except Exception as exc:
+    sys.stderr.write("jroot zstd wrapper: %s\\n" % exc)
+    raise SystemExit(1)
+args = sys.argv[1:]
+decompress = any(arg in ("-d", "--decompress") for arg in args)
+source = sys.stdin.buffer
+sink = sys.stdout.buffer
+try:
+    if decompress:
+        zstd.ZstdDecompressor().copy_stream(source, sink)
+    else:
+        zstd.ZstdCompressor(threads=0).copy_stream(source, sink)
+except Exception as exc:
+    sys.stderr.write("jroot zstd wrapper: %s\\n" % exc)
+    raise SystemExit(1)
+PY
+    chmod 755 "$BIN_DIR/zstd" || return 1
+    bundle_codec_available zst
+}
+
+bundle_codec_command() {
+    case "$1" in
+        gz) command -v gzip ;;
+        zst) bundle_zstd_path ;;
+        xz) command -v xz ;;
+        lz4) command -v lz4 ;;
+        *) return 1 ;;
+    esac
+}
+
+bundle_codec_compress() {
+    local codec="$1" command
+    command="$(bundle_codec_command "$codec")" || return 1
+    case "$codec" in
+        gz) "$command" -n -c ;;
+        zst) "$command" -q -T0 -c ;;
+        xz) "$command" -6 -c ;;
+        lz4) "$command" -q -z -c ;;
+    esac
+}
+
+bundle_codec_decompress() {
+    local codec="$1" command
+    command="$(bundle_codec_command "$codec")" || return 1
+    case "$codec" in
+        gz) "$command" -d -c ;;
+        zst) "$command" -q -d -c ;;
+        xz) "$command" -d -c ;;
+        lz4) "$command" -q -d -c ;;
+    esac
+}
+
+progress_codec_stream() {
+    # $1 output, $2 label, $3 exact tar bytes, $4 codec. Reads the tar stream
+    # from stdin and streams it into the requested compressor.
+    local output="$1" label="$2" total="$3" codec="$4" command
+    command="$(bundle_codec_command "$codec")" || return 1
+    JROOT_PROGRESS_CODEC="$codec" JROOT_PROGRESS_COMMAND="$command" python3 - "$output" "$label" "$total" 3<&0 <<'PY'
+import gzip
+import os
+import subprocess
+import sys
+import time
+
+output, label, total = sys.argv[1], sys.argv[2], int(sys.argv[3])
+codec, command = os.environ["JROOT_PROGRESS_CODEC"], os.environ["JROOT_PROGRESS_COMMAND"]
+source = os.fdopen(3, "rb", closefd=False)
+commands = {
+    "gz": [command, "-n", "-c"],
+    "zst": [command, "-q", "-T0", "-c"],
+    "xz": [command, "-6", "-c"],
+    "lz4": [command, "-q", "-z", "-c"],
+}
+
+def human(value):
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    n = float(value)
+    for unit in units:
+        if n < 1024 or unit == units[-1]:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+def display(done, started, final=False):
+    elapsed = max(time.monotonic() - started, 0.001)
+    rate = done / elapsed
+    percent = 100 if total == 0 else min(100, done * 100 / total)
+    width = 24
+    filled = int(width * percent / 100)
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = "done" if final else "writing"
+    sys.stderr.write(f"\r\x1b[2K    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.flush()
+
+started = last = time.monotonic()
+done = 0
+try:
+    with open(output, "xb") as destination:
+        process = subprocess.Popen(commands[codec], stdin=subprocess.PIPE, stdout=destination)
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            process.stdin.write(chunk)
+            done += len(chunk)
+            now = time.monotonic()
+            if now - last >= 0.15:
+                display(done, started)
+                last = now
+        process.stdin.close()
+        if process.wait() != 0:
+            raise RuntimeError(f"{codec} compressor exited with status {process.returncode}")
+    display(done, started, final=True)
+    sys.stderr.write("\n")
+except Exception as exc:
+    try:
+        os.unlink(output)
+    except FileNotFoundError:
+        pass
+    sys.stderr.write("jroot: archive compression failed: %s\n" % exc)
+    raise SystemExit(1)
+PY
+}
+
+bundle_write_archive() {
+    # $1 output, $2 codec, remaining arguments form a tar-create command.
+    local output="$1" codec="$2"
     shift 2
+    "$@" 2>/dev/null | bundle_codec_compress "$codec" > "$output"
+    local statuses=("${PIPESTATUS[@]}")
+    [ "${statuses[0]}" -eq 0 ] && [ "${statuses[1]}" -eq 0 ]
+}
+
+progress_tar_archive() {
+    # $1 output, $2 label, $3 codec, remaining arguments form a tar-create command.
+    local output="$1" label="$2" codec="$3" total
+    shift 3
     printf '    %s: calculating exact archive total...\n' "$label" >&2
     total="$("$@" 2>/dev/null | wc -c)" || return 1
     [[ "$total" =~ ^[0-9]+$ ]] || return 1
-    "$@" 2>/dev/null | progress_gzip_stream "$output" "$label" "$total"
+    "$@" 2>/dev/null | progress_codec_stream "$output" "$label" "$total" "$codec"
     local statuses=("${PIPESTATUS[@]}")
     [ "${statuses[0]}" -eq 0 ] && [ "${statuses[1]}" -eq 0 ]
+}
+
+# Snapshots remain gzip archives for compatibility; bundle creation calls the
+# generic format-aware helper above.
+progress_tar_gzip() {
+    local output="$1" label="$2"
+    shift 2
+    progress_tar_archive "$output" "$label" gz "$@"
 }
 
 private_copy_tree() {
@@ -2325,13 +2545,17 @@ PY
 
 extract_tar_native() {
     # $1 archive, $2 destination, $3 stderr capture path, $4 display label.
-    local archive="$1" destination="$2" tar_error="$3" label="$4"
+    local archive="$1" destination="$2" tar_error="$3" label="$4" codec
+    codec="$(bundle_codec_from_path "$archive")" || return 1
+    bundle_codec_available "$codec" || return 1
     if progress_enabled; then
-        progress_file_stream "$archive" "$label" | tar --no-same-owner -xzf - -C "$destination" 2>"$tar_error"
+        progress_file_stream "$archive" "$label" | bundle_codec_decompress "$codec" | tar --no-same-owner -xf - -C "$destination" 2>"$tar_error"
+        local statuses=("${PIPESTATUS[@]}")
+        [ "${statuses[0]}" -eq 0 ] && [ "${statuses[1]}" -eq 0 ] && [ "${statuses[2]}" -eq 0 ]
+    else
+        bundle_codec_decompress "$codec" < "$archive" | tar --no-same-owner -xf - -C "$destination" 2>"$tar_error"
         local statuses=("${PIPESTATUS[@]}")
         [ "${statuses[0]}" -eq 0 ] && [ "${statuses[1]}" -eq 0 ]
-    else
-        tar --no-same-owner -xzf "$archive" -C "$destination" 2>"$tar_error"
     fi
 }
 
@@ -2339,7 +2563,7 @@ extract_tar_compat() {
     # Prefer host tar. If it fails (commonly while creating a hard link on
     # Termux storage), restart in an empty directory with an extractor that
     # materializes tar hard links as independent regular files.
-    local archive="$1" destination="$2" context="$3" tar_error
+    local archive="$1" destination="$2" context="$3" tar_error codec fallback_archive generated_archive=""
     tar_error="$destination/.jroot-tar-error.$$"
     if [ "${JROOT_FORCE_LINK_SAFE_EXTRACT:-0}" != "1" ] && extract_tar_native "$archive" "$destination" "$tar_error" "$context"; then
         rm -f "$tar_error"
@@ -2353,9 +2577,20 @@ extract_tar_compat() {
         return 1
     }
     warn "$context: storage rejected archive links; extracting private file copies instead."
-    local show_progress=0
+    codec="$(bundle_codec_from_path "$archive")" || return 1
+    fallback_archive="$archive"
+    if [ "$codec" != "gz" ]; then
+        mkdir -p "$CACHE_DIR" || return 1
+        generated_archive="$(mktemp "$CACHE_DIR/.jroot-extract.XXXXXX.tar")"
+        if ! bundle_codec_decompress "$codec" < "$archive" > "$generated_archive"; then
+            rm -f "$generated_archive"
+            return 1
+        fi
+        fallback_archive="$generated_archive"
+    fi
+    local show_progress=0 extract_status
     progress_enabled && show_progress=1
-    JROOT_EXTRACT_PROGRESS="$show_progress" python3 - "$archive" "$destination" <<'PY'
+    JROOT_EXTRACT_PROGRESS="$show_progress" python3 - "$fallback_archive" "$destination" <<'PY'
 import os
 import shutil
 import stat
@@ -2482,6 +2717,9 @@ display(total, final=True)
 if show:
     sys.stderr.write("\n")
 PY
+    extract_status=$?
+    rm -f "$generated_archive"
+    return "$extract_status"
 }
 
 # 22.04 publishes "ubuntu-base-22.04-base-<arch>.tar.gz", but 24.04+ uses the
@@ -4684,9 +4922,9 @@ jail_archive_exclude_options() {
     fi
 }
 
-# Encrypted bundles are a separate binary envelope around the existing tar.gz
-# payload. Keeping the archive unchanged inside the envelope preserves plain
-# bundle compatibility and makes deployment atomic: decrypt first, extract only
+# Encrypted bundles are a separate binary envelope around a codec-tagged tar
+# payload. The authenticated codec metadata preserves plain bundle compatibility
+# and makes deployment atomic: decrypt first, extract only
 # after AES-GCM authentication succeeds.
 BUNDLE_ENCRYPTED_MAGIC="JROOTBND1"
 
@@ -4719,6 +4957,27 @@ bundle_is_encrypted() {
     printf '%s' "$BUNDLE_ENCRYPTED_MAGIC" | cmp -s -n "${#BUNDLE_ENCRYPTED_MAGIC}" - "$1"
 }
 
+bundle_encrypted_codec() {
+    # Old encrypted bundles predate codec metadata and always contained tar.gz.
+    python3 - "$1" <<'PY'
+import json, struct, sys
+path = sys.argv[1]
+magic = b"JROOTBND1"
+try:
+    with open(path, "rb") as src:
+        if src.read(len(magic)) != magic:
+            raise ValueError
+        length = struct.unpack(">I", src.read(4))[0]
+        header = json.loads(src.read(length).decode("ascii"))
+    codec = header.get("archive_codec", "gz")
+    if codec not in ("gz", "zst", "xz", "lz4"):
+        raise ValueError
+    print(codec)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 bundle_password() {
     # $1 action (create|decrypt), $2 mode (ask|arg|stdin), $3 supplied value
     local action="$1" mode="$2" supplied="$3" password confirm
@@ -4745,11 +5004,11 @@ bundle_password() {
 }
 
 bundle_crypt_file() {
-    # $1 encrypt|decrypt, $2 input, $3 output, $4 password. The password is
-    # supplied on a private file descriptor, never in the Python argv list.
-    local action="$1" input="$2" output="$3" password="$4" show_progress=0
+    # $1 encrypt|decrypt, $2 input, $3 output, $4 password, $5 archive codec.
+    # The password is supplied on a private file descriptor, never in Python argv.
+    local action="$1" input="$2" output="$3" password="$4" archive_codec="${5:-gz}" show_progress=0
     progress_enabled && show_progress=1
-    JROOT_BUNDLE_CRYPTO_PROGRESS="$show_progress" python3 - "$action" "$input" "$output" 3<<< "$password" <<'PY'
+    JROOT_BUNDLE_CRYPTO_PROGRESS="$show_progress" python3 - "$action" "$input" "$output" "$archive_codec" 3<<< "$password" <<'PY'
 import base64
 import json
 import os
@@ -4839,7 +5098,7 @@ def encrypt(source, destination, password):
               "iterations": KDF_ITERATIONS, "lanes": KDF_LANES}
     header = {"format": "jroot-encrypted-bundle", "version": VERSION,
               "cipher": "AES-256-GCM", "kdf": dict(params, salt=base64.b64encode(salt).decode("ascii")),
-              "nonce": base64.b64encode(nonce).decode("ascii")}
+              "nonce": base64.b64encode(nonce).decode("ascii"), "archive_codec": archive_codec}
     raw = header_bytes(header)
     aad = MAGIC + struct.pack(">I", len(raw)) + raw
     key = derive(password, salt, params)
@@ -4945,9 +5204,11 @@ def decrypt(source, destination, password):
         fail("decryption failed (%s)" % exc)
 
 
-if len(sys.argv) != 4:
+if len(sys.argv) != 5:
     fail("internal invocation error")
-action, source, destination = sys.argv[1:]
+action, source, destination, archive_codec = sys.argv[1:]
+if archive_codec not in ("gz", "zst", "xz", "lz4"):
+    fail("unsupported archive codec")
 password = os.fdopen(3, "rb").read().rstrip(b"\\n")
 if not password:
     fail("password must not be empty")
@@ -4960,10 +5221,38 @@ else:
 PY
 }
 
+bundle_resolve_output() {
+    # $1 requested output, $2 optional explicit codec. Sets BUNDLE_OUTPUT and
+    # BUNDLE_CODEC. A suffix is authoritative; a bare name is the convenient
+    # modern default and falls back safely when no prompt is possible.
+    local requested="$1" selected="${2:-}" suffix_codec
+    suffix_codec="$(bundle_codec_from_path "$requested" 2>/dev/null || true)"
+    if [ -n "$suffix_codec" ]; then
+        [ -z "$selected" ] || [ "$selected" = "$suffix_codec" ] || err "Output suffix selects $suffix_codec but --format selects $selected."
+        selected="$suffix_codec"
+    elif [ -z "$selected" ]; then
+        if bundle_codec_available zst; then
+            selected="zst"
+        elif [ -t 0 ] && [ -t 2 ] && bundle_install_zstd_userspace; then
+            selected="zst"
+        else
+            selected="gz"
+            [ -t 2 ] && warn "Zstandard unavailable; using .tar.gz. Use --format=zst after installing a backend."
+        fi
+    fi
+    bundle_codec_suffix "$selected" >/dev/null || err "Unsupported bundle format '$selected'. Use zst, gz, xz, or lz4."
+    bundle_codec_available "$selected" || { bundle_codec_install_help "$selected"; err "Requested .$selected bundle codec is unavailable."; }
+    BUNDLE_CODEC="$selected"
+    BUNDLE_OUTPUT="$requested"
+    [ -n "$suffix_codec" ] || BUNDLE_OUTPUT+="$(bundle_codec_suffix "$selected")"
+}
+
 bundle_usage() {
     printf '%bjroot bundle%b - package a jail into a portable archive\n\n' "$H" "$N"
-    printf '    %bjroot bundle <name> <output.tar.gz> [--encrypt] [password option]%b\n\n' "$G" "$N"
-    printf '    Bundles the jail rootfs and configuration into a compressed archive.\n'
+    printf '    %bjroot bundle <name> <output|output.tar.{zst,gz,xz,lz4}> [options]%b\n\n' "$G" "$N"
+    printf '    A bare output name uses .tar.zst when Zstandard is available; otherwise\n'
+    printf '    it falls back to .tar.gz without prompting in CI, pipes, and scripts.\n'
+    printf '    --format=<zst|gz|xz|lz4>  choose a codec when output has no suffix\n'
     printf '    --encrypt                 encrypt with AES-256-GCM and an Argon2id-derived key\n'
     printf '    --password=<password>     automate encryption (visible in shell history/process lists)\n'
     printf '    --password-stdin          read one password line from standard input\n'
@@ -4986,12 +5275,17 @@ bundle_parse_password_option() {
 }
 
 cmd_bundle() {
-    local name="" out="" encrypt=0 arg password tmp cipher_tmp
+    local name="" out="" encrypt=0 arg password tmp cipher_tmp format=""
     BUNDLE_PASSWORD_MODE=""; BUNDLE_PASSWORD_VALUE=""
     while [ $# -gt 0 ]; do
         arg="$1"
         case "$arg" in
             --encrypt) encrypt=1 ;;
+            --format=*)
+                [ -z "$format" ] || err "Choose only one bundle format."
+                format="${arg#*=}"
+                case "$format" in zst|gz|xz|lz4) ;; *) err "Unsupported bundle format '$format'. Use zst, gz, xz, or lz4." ;; esac
+                ;;
             --password=*|--password-stdin)
                 bundle_parse_password_option "$arg"
                 encrypt=1
@@ -5001,12 +5295,14 @@ cmd_bundle() {
             *)
                 if [ -z "$name" ]; then name="$arg"
                 elif [ -z "$out" ]; then out="$arg"
-                else err "${CMD_HINT}bundle needs <name> <output.tar.gz>."; fi
+                else err "${CMD_HINT}bundle needs <name> <output>."; fi
                 ;;
         esac
         shift
     done
-    [ -n "$name" ] && [ -n "$out" ] || { bundle_usage; err "${CMD_HINT}bundle needs <name> <output.tar.gz>."; }
+    [ -n "$name" ] && [ -n "$out" ] || { bundle_usage; err "${CMD_HINT}bundle needs <name> <output>."; }
+    bundle_resolve_output "$out" "$format"
+    out="$BUNDLE_OUTPUT"
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found."
     local rootfs="$ROOTS_DIR/$name"
     [ -d "$rootfs" ] || err "Rootfs for '$name' is missing."
@@ -5014,18 +5310,18 @@ cmd_bundle() {
     if [ "$encrypt" = "1" ]; then
         bundle_crypto_available || { bundle_crypto_install_help; err "Encrypted-bundle cryptography backend is unavailable."; }
         password="$(bundle_password create "${BUNDLE_PASSWORD_MODE:-ask}" "$BUNDLE_PASSWORD_VALUE")"
-        tmp="$(mktemp "$JROOT_HOME/.bundle.XXXXXX.tar.gz")"
+        tmp="$(mktemp "$JROOT_HOME/.bundle.XXXXXX$(bundle_codec_suffix "$BUNDLE_CODEC")")"
         cipher_tmp="$(mktemp "${out}.jroot-encrypted.XXXXXX")"
         rm -f "$tmp" "$cipher_tmp"
         trap 'rm -f "$tmp" "$cipher_tmp"' RETURN
         log "Bundling and encrypting jail '$name' into '$out'..."
         jail_archive_exclude_options "$name"
         if progress_enabled; then
-            progress_tar_gzip "$tmp" "Bundle archive" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" || err "Bundle failed."
+            progress_tar_archive "$tmp" "Bundle archive" "$BUNDLE_CODEC" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" || err "Bundle failed."
         else
-            tar -czf "$tmp" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+            bundle_write_archive "$tmp" "$BUNDLE_CODEC" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" || err "Bundle failed."
         fi
-        bundle_crypt_file encrypt "$tmp" "$cipher_tmp" "$password" || err "Bundle encryption failed."
+        bundle_crypt_file encrypt "$tmp" "$cipher_tmp" "$password" "$BUNDLE_CODEC" || err "Bundle encryption failed."
         mv -f "$cipher_tmp" "$out" || err "Could not save encrypted bundle to '$out'."
         rm -f "$tmp"
         trap - RETURN
@@ -5038,10 +5334,10 @@ cmd_bundle() {
         log "Bundling jail '$name' into '$out'..."
         jail_archive_exclude_options "$name"
         if progress_enabled; then
-            progress_tar_gzip "$archive_tmp" "Bundle archive" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" || { rm -f "$archive_tmp"; err "Bundle failed."; }
+            progress_tar_archive "$archive_tmp" "Bundle archive" "$BUNDLE_CODEC" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" || { rm -f "$archive_tmp"; err "Bundle failed."; }
             mv -f "$archive_tmp" "$out" || err "Could not save bundle to '$out'."
         else
-            tar -czf "$out" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+            bundle_write_archive "$out" "$BUNDLE_CODEC" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" || err "Bundle failed."
         fi
         log "Jail '$name' successfully bundled to '$out'."
         record_event "$name" bundle "bundled to $out"
@@ -5051,13 +5347,13 @@ cmd_bundle() {
 deploy_usage() {
     printf '%bjroot deploy%b - deploy a bundled jail archive\n\n' "$H" "$N"
     printf '    %bjroot deploy <archive> [newname] [password option]%b\n\n' "$G" "$N"
-    printf '    Extracts and registers a bundle into ~/.jroot. Encrypted bundles are detected automatically.\n'
+    printf '    Detects .tar.zst, .tar.gz, .tar.xz, .tar.lz4, and encrypted bundles automatically.\n'
     printf '    --password=<password>     automate decryption (visible in shell history/process lists)\n'
     printf '    --password-stdin          read one password line from standard input\n'
 }
 
 cmd_deploy() {
-    local archive="" newname="" arg password decrypted="" archive_to_extract
+    local archive="" newname="" arg password decrypted="" archive_to_extract archive_codec
     BUNDLE_PASSWORD_MODE=""; BUNDLE_PASSWORD_VALUE=""
     while [ $# -gt 0 ]; do
         arg="$1"
@@ -5082,12 +5378,16 @@ cmd_deploy() {
     archive_to_extract="$archive"
     if bundle_is_encrypted "$archive"; then
         bundle_crypto_available || { rm -rf "$tmp"; bundle_crypto_install_help; err "Encrypted-bundle cryptography backend is unavailable."; }
+        archive_codec="$(bundle_encrypted_codec "$archive")" || { rm -rf "$tmp"; err "Invalid encrypted bundle codec metadata."; }
+        bundle_codec_available "$archive_codec" || { rm -rf "$tmp"; bundle_codec_install_help "$archive_codec"; err "Bundle requires unavailable .$archive_codec compression support."; }
         password="$(bundle_password decrypt "${BUNDLE_PASSWORD_MODE:-ask}" "$BUNDLE_PASSWORD_VALUE")"
-        decrypted="$tmp/bundle.tar.gz"
-        bundle_crypt_file decrypt "$archive" "$decrypted" "$password" || { rm -rf "$tmp"; err "Could not decrypt bundle; check the password and file integrity."; }
+        decrypted="$tmp/bundle$(bundle_codec_suffix "$archive_codec")"
+        bundle_crypt_file decrypt "$archive" "$decrypted" "$password" "$archive_codec" || { rm -rf "$tmp"; err "Could not decrypt bundle; check the password and file integrity."; }
         archive_to_extract="$decrypted"
-    elif [ -n "$BUNDLE_PASSWORD_MODE" ]; then
-        warn "Password option ignored: '$archive' is not an encrypted JRoot bundle."
+    else
+        archive_codec="$(bundle_codec_from_path "$archive")" || { rm -rf "$tmp"; err "Unsupported bundle suffix. Use .tar.zst, .tar.gz, .tar.xz, or .tar.lz4."; }
+        bundle_codec_available "$archive_codec" || { rm -rf "$tmp"; bundle_codec_install_help "$archive_codec"; err "Bundle requires unavailable .$archive_codec compression support."; }
+        [ -n "$BUNDLE_PASSWORD_MODE" ] && warn "Password option ignored: '$archive' is not an encrypted JRoot bundle."
     fi
     extract_tar_compat "$archive_to_extract" "$tmp" "Bundle deployment extraction" || { rm -rf "$tmp"; err "Failed to extract archive."; }
 
@@ -9315,7 +9615,7 @@ cmd_help() {
     help_row "jroot file" "cp|mv <src> <dst>"      "Copy/move files between the host and jails"
     help_row "jroot sync" "[options] <src> <dst>"  "Synchronize directories between host and jails"
     help_row "jroot limit" "<name> [limits]"        "Set resource limits (mem, cpu, nofile)"
-    help_row "jroot bundle" "<name> <out.tar.gz>"  "Package a jail into a portable archive"
+    help_row "jroot bundle" "<name> <output>"      "Package a jail into a portable archive"
     help_row "jroot deploy" "<archive> [newname]"  "Deploy a bundled jail archive"
     help_row "jroot monitor" ""                    "Live telemetry and resource usage TUI"
     help_row "jroot compose" "up|down|status"      "Multi-jail stack orchestration"
@@ -9692,7 +9992,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
             if [ "$idx" -eq 2 ]; then
                 COMPREPLY=($(compgen -W "$jails" -- "$cur"))
             else
-                COMPREPLY=($(compgen -W "--encrypt --password= --password-stdin" -- "$cur"))
+                COMPREPLY=($(compgen -W "--format=zst --format=gz --format=xz --format=lz4 --encrypt --password= --password-stdin" -- "$cur"))
                 if [ "$idx" -eq 3 ]; then
                     COMPREPLY+=( $(compgen -f -- "$cur") )
                     compopt -o filenames 2>/dev/null
@@ -10103,8 +10403,8 @@ _jroot() {
             ;;
         bundle)
             if (( pos == 2 )); then _jroot_jails
-            elif (( pos == 3 )); then _files; compadd -S '' -- --encrypt --password= --password-stdin
-            else compadd -S '' -- --encrypt --password= --password-stdin; fi
+            elif (( pos == 3 )); then _files; compadd -S '' -- --format=zst --format=gz --format=xz --format=lz4 --encrypt --password= --password-stdin
+            else compadd -S '' -- --format=zst --format=gz --format=xz --format=lz4 --encrypt --password= --password-stdin; fi
             ;;
         deploy)
             if (( pos == 2 )); then _files; else compadd -S '' -- --password= --password-stdin; fi
@@ -10481,7 +10781,7 @@ complete -c jroot -n '__jroot_is sync; and __jroot_from 2' -a '--watch --delete 
 # limits, archives, and compose
 complete -c jroot -n '__jroot_is limit; and __jroot_from 3' -a '--mem= --cpu= --nofile='
 complete -c jroot -n '__jroot_is bundle; and __jroot_at 3' -F
-complete -c jroot -n '__jroot_is bundle; and __jroot_from 3' -a '--encrypt --password= --password-stdin'
+complete -c jroot -n '__jroot_is bundle; and __jroot_from 3' -a '--format=zst --format=gz --format=xz --format=lz4 --encrypt --password= --password-stdin'
 complete -c jroot -n '__jroot_is deploy; and __jroot_at 2' -F
 complete -c jroot -n '__jroot_is deploy; and __jroot_from 3' -a '--password= --password-stdin'
 complete -c jroot -n '__jroot_is compose; and __jroot_at 2' -a 'up down status'

@@ -18,15 +18,41 @@ printf '{"name":"demo","image":"ubuntu:22.04","user":"root"}\n' > "$CONFIGS_DIR/
 printf 'bundle-payload\n' > "$ROOTS_DIR/$name/etc/bundle-state"
 record_event() { :; }
 
-plain="$TMP/plain.tar.gz"
-cmd_bundle "$name" "$plain" >/dev/null
-tar -tzf "$plain" | grep -qx "configs/$name.json"
-cmd_deploy "$plain" plain-restored >/dev/null
-[ "$(cat "$ROOTS_DIR/plain-restored/etc/bundle-state")" = "bundle-payload" ]
+# Bare names choose Zstandard when it is available.
+default_bundle="$TMP/default"
+cmd_bundle "$name" "$default_bundle" >/dev/null
+default_bundle+=".tar.zst"
+[ -f "$default_bundle" ]
+cmd_deploy "$default_bundle" default-restored >/dev/null
+[ "$(cat "$ROOTS_DIR/default-restored/etc/bundle-state")" = "bundle-payload" ]
+
+# Explicit suffixes remain portable and select their exact compressor.
+for codec in gz zst xz lz4; do
+    plain="$TMP/plain.tar.$codec"
+    cmd_bundle "$name" "$plain" >/dev/null
+    cmd_deploy "$plain" "${codec}-restored" >/dev/null
+    [ "$(cat "$ROOTS_DIR/${codec}-restored/etc/bundle-state")" = "bundle-payload" ]
+done
+
+# --format is the deterministic override when callers do not want suffixes.
+format_bundle="$TMP/format-selected"
+cmd_bundle "$name" "$format_bundle" --format=xz >/dev/null
+[ -f "$format_bundle.tar.xz" ]
+cmd_deploy "$format_bundle.tar.xz" format-restored >/dev/null
+[ "$(cat "$ROOTS_DIR/format-restored/etc/bundle-state")" = "bundle-payload" ]
+
+# No TTY and no Zstandard must never block for a question: bare output falls
+# back deterministically to gzip unless --format explicitly overrides it.
+fallback="$TMP/noninteractive"
+JROOT_FORCE_NO_ZSTD=1 cmd_bundle "$name" "$fallback" </dev/null >/dev/null
+[ -f "$fallback.tar.gz" ]
+cmd_deploy "$fallback.tar.gz" fallback-restored >/dev/null
+[ "$(cat "$ROOTS_DIR/fallback-restored/etc/bundle-state")" = "bundle-payload" ]
 
 password='correct horse battery staple'
-encrypted="$TMP/encrypted.jrootbundle"
+encrypted="$TMP/encrypted.tar.zst"
 cmd_bundle "$name" "$encrypted" --encrypt "--password=$password" >/dev/null
+[ "$(bundle_encrypted_codec "$encrypted")" = "zst" ]
 [ "$(head -c 9 "$encrypted")" = "JROOTBND1" ]
 ! tar -tzf "$encrypted" >/dev/null 2>&1
 cmd_deploy "$encrypted" encrypted-restored "--password=$password" >/dev/null
@@ -53,9 +79,10 @@ fi
 [ ! -e "$CONFIGS_DIR/tampered-rejected.json" ]
 [ ! -e "$ROOTS_DIR/tampered-rejected" ]
 
-stdin_bundle="$TMP/stdin-encrypted.jrootbundle"
+stdin_bundle="$TMP/stdin-encrypted.tar.xz"
 printf '%s\n' "$password" | cmd_bundle "$name" "$stdin_bundle" --encrypt --password-stdin >/dev/null
+[ "$(bundle_encrypted_codec "$stdin_bundle")" = "xz" ]
 printf '%s\n' "$password" | cmd_deploy "$stdin_bundle" stdin-restored --password-stdin >/dev/null
 [ "$(cat "$ROOTS_DIR/stdin-restored/etc/bundle-state")" = "bundle-payload" ]
 
-printf '  ok    plain and authenticated encrypted bundle deployment round trips safely\n'
+printf '  ok    multi-codec plain and authenticated encrypted bundle deployment round trips safely\n'

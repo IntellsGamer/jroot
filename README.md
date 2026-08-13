@@ -883,11 +883,22 @@ The clone receives the saved rootfs and configuration, but JRoot deliberately gi
 
 ### Portability with `bundle` and `deploy`
 
-Use `jroot bundle` to package a jail rootfs and its configuration into a compressed archive. `jroot deploy` restores that bundle on another JRoot host and may assign a new jail name during deployment. Plain bundles remain ordinary `.tar.gz` archives, so they are convenient for local transfers and inspection.
+Use `jroot bundle` to package a jail rootfs and its configuration into a portable compressed archive. `jroot deploy` detects the archive codec, restores it on another JRoot host, and may assign a new jail name during deployment.
+
+A **bare output name** prefers Zstandard and gains a `.tar.zst` suffix automatically. If Zstandard is absent in an interactive terminal, JRoot offers a user-space backend under `~/.jroot/bin`; declining that offer uses `.tar.gz`. In CI, pipes, and other non-interactive contexts, bare names never pause for input and automatically use `.tar.gz` when Zstandard is unavailable.
 
 ```bash
-jroot bundle dev my-dev-jail.tar.gz
-jroot deploy my-dev-jail.tar.gz production-jail
+# Creates my-dev-jail.tar.zst when Zstandard is available.
+jroot bundle dev my-dev-jail
+jroot deploy my-dev-jail.tar.zst production-jail
+
+# Explicit suffixes are preserved and select the matching codec.
+jroot bundle dev portable.tar.gz
+jroot bundle dev smallest.tar.xz
+jroot bundle dev fastest.tar.lz4
+
+# --format selects a codec for a bare output name.
+jroot bundle dev release --format=zst
 ```
 
 #### Password-encrypted bundles
@@ -895,11 +906,12 @@ jroot deploy my-dev-jail.tar.gz production-jail
 Pass `--encrypt` when a bundle may leave the machine or contain material that should not be readable by whoever stores it. JRoot encrypts the completed archive with **AES-256-GCM** and derives its encryption key from the password with **Argon2id**. The archive contents and encryption metadata are authenticated: a wrong password or any modification makes deployment fail before JRoot extracts a rootfs.[1] [2]
 
 ```bash
-# Prompts twice for a new password. The result need not use a .tar.gz extension.
-jroot bundle dev dev-2026-08.jrootbundle --encrypt
+# Prompts twice for a new password. A bare name still records the selected
+# inner archive codec, so deploy restores the correct format automatically.
+jroot bundle dev dev-2026-08 --encrypt
 
 # Deploy detects the encrypted envelope automatically and asks once for the password.
-jroot deploy dev-2026-08.jrootbundle production-jail
+jroot deploy dev-2026-08.tar.zst production-jail
 ```
 
 Encryption is streamed, so archive size is not limited by available RAM. The password derivation step deliberately spends memory to slow down offline password guessing; the archive encryption pass itself remains fast. Encrypted bundles require Python 3 and `cryptography` version 44 or later, because that is where the required Argon2id interface is available. Install it for the current account with:
@@ -927,8 +939,8 @@ printf '%s\n' "$JROOT_BUNDLE_PASSWORD" \
 
 | Bundle type | `deploy` behavior |
 |---|---|
-| Plain `.tar.gz` | Extracts exactly as previous JRoot releases did; no password is requested. |
-| JRoot encrypted bundle | Detects the envelope before extraction and requests a password unless one was supplied with `--password-stdin` or `--password=…`. |
+| Plain `.tar.zst`, `.tar.gz`, `.tar.xz`, or `.tar.lz4` | Detects the suffix and streams the matching decompressor; no password is requested. |
+| JRoot encrypted bundle | Detects the envelope before extraction, uses its authenticated inner-codec metadata, and requests a password unless one was supplied with `--password-stdin` or `--password=…`. |
 | Wrong password or modified encrypted file | Rejects the bundle without registering or extracting a jail. |
 
 [1]: https://cryptography.io/en/latest/hazmat/primitives/ciphers/aead/
@@ -947,7 +959,7 @@ Progress is automatically quiet when stderr is not a terminal, so scripts and CI
 JROOT_PROGRESS=off jroot snapshot dev before-migration
 
 # Force the display through a wrapper that hides the terminal.
-JROOT_PROGRESS=force jroot bundle dev dev-backup.tar.gz
+JROOT_PROGRESS=force jroot bundle dev dev-backup
 ```
 
 ---
