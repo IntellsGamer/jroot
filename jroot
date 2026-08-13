@@ -7575,8 +7575,14 @@ write_ssh_session_wrapper() {
         # These are guest paths: the guard runs after PRoot has established the
         # jail root and private /tmp + /run overlays, so Landlock resolves them
         # to the same confined files the SSH login process sees.
-        ssh_unroot_landlock="$(printf '/\t%s\n/home/jail\t%s\n/tmp\t%s\n/run\t%s' \
-            "$LANDLOCK_RX" "$LANDLOCK_FULL" "$LANDLOCK_FULL" "$LANDLOCK_FULL")"
+        # Landlock controls open/exec by path. The SSH guard must therefore
+        # grant RX to the whole immutable guest image so the shell, ELF loader,
+        # shared libraries, command binaries, and their read-only data can load.
+        # The only write grants are the ordinary user's home and per-session
+        # /tmp + /run overlays prepared by run_in_jail.
+        ssh_unroot_landlock="$(printf '/\t%s\n/home/jail\t%s\n/tmp\t%s\n/run\t%s\n/dev\t%s\n/proc\t%s\n/sys\t%s' \
+            "$LANDLOCK_RX" "$LANDLOCK_FULL" "$LANDLOCK_FULL" "$LANDLOCK_FULL" \
+            "$LANDLOCK_FULL" "$LANDLOCK_FULL" "$LANDLOCK_FULL")"
     fi
     jail_lb="$(config_field "$cfg" loopback)"
     case "$jail_lb" in off|shared|disabled) jail_lb="" ;; esac
