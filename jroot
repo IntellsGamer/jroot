@@ -6766,8 +6766,13 @@ cmd_rm() {
     [ $# -eq 1 ] || err "Usage: jroot rm <name>"
     local name="$1" response
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
-    printf 'Delete jail "%s" and its rootfs (%s)? [y/N]: ' "$name" "$ROOTS_DIR/$name"
-    read -r response || response="N"
+    if [ -t 0 ] && [ -z "${CI:-}" ] && [ "${NONINTERACTIVE:-0}" != "1" ]; then
+        printf 'Delete jail "%s" and its rootfs (%s)? [y/N]: ' "$name" "$ROOTS_DIR/$name"
+        read -r response || response="N"
+    else
+        response="yes"
+        log "Non-interactive deletion confirmed automatically."
+    fi
     case "$response" in
         y|Y|yes|YES) ;;
         *) log "Aborted."; return 0 ;;
@@ -9558,6 +9563,7 @@ cmd_help_cmd() {
             printf '%bjroot rm%b - permanently delete a jail\n\n' "$H" "$N"
             printf '    %bjroot rm <name>%b\n' "$G" "$N"
             printf '\n    Deletes the rootfs, config, and all snapshots for the jail.\n'
+            printf '    CI and non-interactive use confirm deletion automatically.\n'
             ;;
         rename)
             printf '%bjroot rename%b - rename a jail\n\n' "$H" "$N"
