@@ -934,6 +934,22 @@ printf '%s\n' "$JROOT_BUNDLE_PASSWORD" \
 [1]: https://cryptography.io/en/latest/hazmat/primitives/ciphers/aead/
 [2]: https://www.rfc-editor.org/rfc/rfc9106.html
 
+#### Long-operation progress
+
+Interactive terminals show a live progress line for the long filesystem operations: incremental checkpoints, checkpoint restores, snapshots, snapshot restores, bundles, encrypted-bundle encryption/decryption, and bundle deployment. The numbers are measured from bytes actually copied or read from the archive; they are not timer-based percentages.
+
+For archive creation, JRoot first measures the exact tar stream—including archive headers and padding—then reports the same byte stream as it is compressed. Archive extraction reports compressed archive bytes consumed, while direct filesystem copying and incremental `rsync` checkpoints report bytes transferred. That distinction matters because a highly compressible jail can write much more filesystem data than the compressed archive size suggests.
+
+Progress is automatically quiet when stderr is not a terminal, so scripts and CI keep their previous output behavior. Set `JROOT_PROGRESS=off` to suppress the display in an interactive shell, or `JROOT_PROGRESS=force` when a terminal multiplexer or supervisor does not expose a TTY.
+
+```bash
+# Disable the live display once.
+JROOT_PROGRESS=off jroot snapshot dev before-migration
+
+# Force the display through a wrapper that hides the terminal.
+JROOT_PROGRESS=force jroot bundle dev dev-backup.tar.gz
+```
+
 ---
 
 # 🏷️ Rename a jail

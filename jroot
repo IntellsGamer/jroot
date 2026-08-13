@@ -2043,6 +2043,171 @@ filesystem_supports_hardlinks() {
     return 1
 }
 
+# Long operations report byte-based progress only to an interactive terminal.
+# `JROOT_PROGRESS=force` enables it in supervised terminals; `off` suppresses it.
+# Automation therefore keeps its existing, parseable stdout and stderr behavior.
+progress_enabled() {
+    [ "${JROOT_PROGRESS:-auto}" != "off" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    [ -t 2 ] || [ "${JROOT_PROGRESS:-}" = "force" ]
+}
+
+progress_paths_bytes() {
+    python3 - "$@" <<'PY'
+import os
+import stat
+import sys
+
+total = 0
+for root in sys.argv[1:]:
+    try:
+        info = os.lstat(root)
+    except OSError:
+        continue
+    if stat.S_ISREG(info.st_mode):
+        total += info.st_size
+        continue
+    if not stat.S_ISDIR(info.st_mode):
+        continue
+    for base, dirs, files in os.walk(root, followlinks=False):
+        for item in files:
+            try:
+                info = os.lstat(os.path.join(base, item))
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+print(total)
+PY
+}
+
+# Stream a file on stdout while showing exact bytes read from that file on stderr.
+# It is used before tar extraction, so the displayed unit is always the archive
+# actually being consumed rather than an estimated destination size.
+progress_file_stream() {
+    local source="$1" label="$2"
+    python3 - "$source" "$label" <<'PY'
+import os
+import sys
+import time
+
+source, label = sys.argv[1:]
+total = os.path.getsize(source)
+done = 0
+started = last = time.monotonic()
+
+def human(value):
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    n = float(value)
+    for unit in units:
+        if n < 1024 or unit == units[-1]:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+def display(final=False):
+    elapsed = max(time.monotonic() - started, 0.001)
+    rate = done / elapsed
+    percent = 100 if total == 0 else min(100, done * 100 / total)
+    remaining = max(total - done, 0)
+    eta = remaining / rate if rate else 0
+    width = 24
+    filled = int(width * percent / 100)
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = "done" if final else (f"ETA {int(eta)}s" if rate else "starting")
+    sys.stderr.write(f"\r    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.flush()
+
+with open(source, "rb", buffering=0) as handle:
+    while True:
+        chunk = handle.read(1024 * 1024)
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        done += len(chunk)
+        now = time.monotonic()
+        if now - last >= 0.15:
+            display()
+            last = now
+sys.stdout.buffer.flush()
+display(final=True)
+sys.stderr.write("\n")
+PY
+}
+
+# Read a tar stream on fd 3, gzip it to the requested output, and show exact
+# bytes consumed from that stream. The preflight pass uses the same tar command
+# to determine the real archive-stream total, including tar headers and padding.
+progress_gzip_stream() {
+    local output="$1" label="$2" total="$3"
+    python3 - "$output" "$label" "$total" 3<&0 <<'PY'
+import gzip
+import os
+import sys
+import time
+
+output, label, total_s = sys.argv[1:]
+total = max(0, int(total_s))
+source = os.fdopen(3, "rb", closefd=False)
+done = 0
+started = last = time.monotonic()
+
+def human(value):
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    n = float(value)
+    for unit in units:
+        if n < 1024 or unit == units[-1]:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+def display(final=False):
+    elapsed = max(time.monotonic() - started, 0.001)
+    rate = done / elapsed
+    percent = 100 if total == 0 else min(100, done * 100 / total)
+    width = 24
+    filled = int(width * percent / 100)
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = "done" if final else "writing"
+    sys.stderr.write(f"\r    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.flush()
+
+try:
+    with open(output, "xb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as dest:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            dest.write(chunk)
+            done += len(chunk)
+            now = time.monotonic()
+            if now - last >= 0.15:
+                display()
+                last = now
+except Exception as exc:
+    try:
+        os.unlink(output)
+    except FileNotFoundError:
+        pass
+    sys.stderr.write(f"\njroot: archive progress writer failed: {exc}\n")
+    raise SystemExit(1)
+display(final=True)
+sys.stderr.write("\n")
+PY
+}
+
+progress_tar_gzip() {
+    # $1 output, $2 display label, remaining arguments form the tar command.
+    # The first pass has no side effects and gives a mathematically exact total
+    # for the actual tar stream, rather than an estimate from du(1).
+    local output="$1" label="$2" total
+    shift 2
+    printf '    %s: calculating exact archive total...\n' "$label" >&2
+    total="$("$@" 2>/dev/null | wc -c)" || return 1
+    [[ "$total" =~ ^[0-9]+$ ]] || return 1
+    "$@" 2>/dev/null | progress_gzip_stream "$output" "$label" "$total"
+    local statuses=("${PIPESTATUS[@]}")
+    [ "${statuses[0]}" -eq 0 ] && [ "${statuses[1]}" -eq 0 ]
+}
+
 private_copy_tree() {
     # $1 is a directory and $2 must not exist. On a normal filesystem cp keeps
     # metadata efficiently; on link-hostile storage Python copies each file so
@@ -2053,7 +2218,7 @@ private_copy_tree() {
     [ -d "$source" ] || return 1
     [ ! -e "$destination" ] || return 1
     parent="$(dirname "$destination")"
-    if [ "${#exclude_relative[@]}" -eq 0 ] && filesystem_supports_hardlinks "$parent"; then
+    if [ "${#exclude_relative[@]}" -eq 0 ] && ! progress_enabled && filesystem_supports_hardlinks "$parent"; then
         if cp -a --reflink=auto "$source" "$destination" 2>/dev/null; then
             return 0
         fi
@@ -2064,28 +2229,110 @@ private_copy_tree() {
         rm -rf "$destination"
     fi
     command -v python3 >/dev/null 2>&1 || return 1
-    python3 - "$source" "$destination" "${exclude_relative[@]}" <<'PY'
+    local show_progress=0
+    progress_enabled && show_progress=1
+    JROOT_COPY_PROGRESS="$show_progress" python3 - "$source" "$destination" "${exclude_relative[@]}" <<'PY'
+import os
 import shutil
+import stat
 import sys
+import time
 from pathlib import Path
 
 source, destination = map(Path, sys.argv[1:3])
 excluded_paths = {Path(item.lstrip("/")) for item in sys.argv[3:] if item}
+show = os.environ.get("JROOT_COPY_PROGRESS") == "1"
+total = done = 0
+started = last = time.monotonic()
+
+def ignored(relative):
+    return relative in excluded_paths
+
+def scan_total():
+    global total
+    for base, dirs, files in os.walk(source, followlinks=False):
+        relative = Path(base).relative_to(source)
+        dirs[:] = [item for item in dirs if not ignored(relative / item)]
+        for item in files:
+            rel = relative / item
+            if ignored(rel):
+                continue
+            try:
+                info = os.lstat(Path(base) / item)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+
+def human(value):
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    n = float(value)
+    for unit in units:
+        if n < 1024 or unit == units[-1]:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+def display(final=False):
+    global last
+    if not show:
+        return
+    elapsed = max(time.monotonic() - started, 0.001)
+    rate = done / elapsed
+    percent = 100 if total == 0 else min(100, done * 100 / total)
+    width = 24
+    filled = int(width * percent / 100)
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = "done" if final else "copying"
+    sys.stderr.write(f"\r    Filesystem copy [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.flush()
+
+def copy_file(src, dst, *, follow_symlinks=True):
+    global done, last
+    if not show:
+        return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    with open(src, "rb") as inp, open(dst, "wb") as out:
+        while True:
+            chunk = inp.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            now = time.monotonic()
+            if now - last >= 0.15:
+                display()
+                last = now
+    shutil.copystat(src, dst, follow_symlinks=follow_symlinks)
+    return dst
 
 def ignore(directory, names):
-    if not excluded_paths:
-        return set()
     try:
         relative = Path(directory).relative_to(source)
     except ValueError:
         return set()
-    return {name for name in names if relative / name in excluded_paths}
+    return {name for name in names if ignored(relative / name)}
 
-# symlinks=True preserves the jail layout but copy2 creates private regular
-# files, intentionally expanding any hard-linked source files.
-shutil.copytree(source, destination, symlinks=True, copy_function=shutil.copy2,
+if show:
+    scan_total()
+# symlinks=True preserves the jail layout while the explicit copy function makes
+# every regular file private rather than recreating checkpoint hard links.
+shutil.copytree(source, destination, symlinks=True, copy_function=copy_file,
                 ignore=ignore)
+display(final=True)
+if show:
+    sys.stderr.write("\n")
 PY
+}
+
+extract_tar_native() {
+    # $1 archive, $2 destination, $3 stderr capture path, $4 display label.
+    local archive="$1" destination="$2" tar_error="$3" label="$4"
+    if progress_enabled; then
+        progress_file_stream "$archive" "$label" | tar --no-same-owner -xzf - -C "$destination" 2>"$tar_error"
+        local statuses=("${PIPESTATUS[@]}")
+        [ "${statuses[0]}" -eq 0 ] && [ "${statuses[1]}" -eq 0 ]
+    else
+        tar --no-same-owner -xzf "$archive" -C "$destination" 2>"$tar_error"
+    fi
 }
 
 extract_tar_compat() {
@@ -2094,7 +2341,7 @@ extract_tar_compat() {
     # materializes tar hard links as independent regular files.
     local archive="$1" destination="$2" context="$3" tar_error
     tar_error="$destination/.jroot-tar-error.$$"
-    if [ "${JROOT_FORCE_LINK_SAFE_EXTRACT:-0}" != "1" ] && tar --no-same-owner -xzf "$archive" -C "$destination" 2>"$tar_error"; then
+    if [ "${JROOT_FORCE_LINK_SAFE_EXTRACT:-0}" != "1" ] && extract_tar_native "$archive" "$destination" "$tar_error" "$context"; then
         rm -f "$tar_error"
         return 0
     fi
@@ -2106,15 +2353,42 @@ extract_tar_compat() {
         return 1
     }
     warn "$context: storage rejected archive links; extracting private file copies instead."
-    python3 - "$archive" "$destination" <<'PY'
+    local show_progress=0
+    progress_enabled && show_progress=1
+    JROOT_EXTRACT_PROGRESS="$show_progress" python3 - "$archive" "$destination" <<'PY'
 import os
 import shutil
 import stat
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 archive, destination = map(Path, sys.argv[1:])
+show = os.environ.get("JROOT_EXTRACT_PROGRESS") == "1"
+done = 0
+started = last = time.monotonic()
+
+def human(value):
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    n = float(value)
+    for unit in units:
+        if n < 1024 or unit == units[-1]:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+def display(total, final=False):
+    if not show:
+        return
+    elapsed = max(time.monotonic() - started, 0.001)
+    rate = done / elapsed
+    percent = 100 if total == 0 else min(100, done * 100 / total)
+    width = 24
+    filled = int(width * percent / 100)
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = "done" if final else "extracting"
+    sys.stderr.write(f"\r    Archive payload [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.flush()
 root = destination.resolve()
 force_no_links = os.environ.get("JROOT_FORCE_NO_HARDLINKS") == "1"
 
@@ -2139,6 +2413,7 @@ def unlink_path(path: Path) -> None:
 
 with tarfile.open(archive, "r:*") as tar:
     members = tar.getmembers()
+    total = sum(member.size for member in members if member.isfile())
     # Directories first, then payloads and links. Final directory metadata is
     # applied after children have been created.
     for member in members:
@@ -2176,7 +2451,16 @@ with tarfile.open(archive, "r:*") as tar:
                 raise ValueError(f"cannot read archive member: {member.name!r}")
             unlink_path(output)
             with source, open(output, "wb") as dst:
-                shutil.copyfileobj(source, dst, length=1024 * 1024)
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    done += len(chunk)
+                    now = time.monotonic()
+                    if now - last >= 0.15:
+                        display(total)
+                        last = now
             try:
                 os.chmod(output, stat.S_IMODE(member.mode))
                 os.utime(output, (member.mtime, member.mtime), follow_symlinks=False)
@@ -2194,6 +2478,9 @@ with tarfile.open(archive, "r:*") as tar:
             os.utime(directory, (member.mtime, member.mtime), follow_symlinks=False)
         except OSError:
             pass
+display(total, final=True)
+if show:
+    sys.stderr.write("\n")
 PY
 }
 
@@ -4460,13 +4747,15 @@ bundle_password() {
 bundle_crypt_file() {
     # $1 encrypt|decrypt, $2 input, $3 output, $4 password. The password is
     # supplied on a private file descriptor, never in the Python argv list.
-    local action="$1" input="$2" output="$3" password="$4"
-    python3 - "$action" "$input" "$output" 3<<< "$password" <<'PY'
+    local action="$1" input="$2" output="$3" password="$4" show_progress=0
+    progress_enabled && show_progress=1
+    JROOT_BUNDLE_CRYPTO_PROGRESS="$show_progress" python3 - "$action" "$input" "$output" 3<<< "$password" <<'PY'
 import base64
 import json
 import os
 import struct
 import sys
+import time
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -4479,6 +4768,32 @@ CHUNK = 1024 * 1024
 KDF_MEMORY_KIB = 64 * 1024
 KDF_ITERATIONS = 3
 KDF_LANES = 4
+SHOW_PROGRESS = os.environ.get("JROOT_BUNDLE_CRYPTO_PROGRESS") == "1"
+
+
+def human(value):
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    n = float(value)
+    for unit in units:
+        if n < 1024 or unit == units[-1]:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+
+def progress(label, done, total, started, final=False):
+    if not SHOW_PROGRESS:
+        return
+    elapsed = max(time.monotonic() - started, 0.001)
+    rate = done / elapsed
+    percent = 100 if total == 0 else min(100, done * 100 / total)
+    width = 24
+    filled = int(width * percent / 100)
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = "done" if final else "processing"
+    sys.stderr.write(f"\r    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
+    sys.stderr.flush()
+    if final:
+        sys.stderr.write("\n")
 
 
 def fail(message):
@@ -4517,6 +4832,9 @@ def encrypt(source, destination, password):
     aad = MAGIC + struct.pack(">I", len(raw)) + raw
     key = derive(password, salt, params)
     try:
+        total = os.path.getsize(source)
+        done = 0
+        started = last = time.monotonic()
         encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
         encryptor.authenticate_additional_data(aad)
         with open(source, "rb") as src, open(destination, "xb") as dst:
@@ -4526,8 +4844,14 @@ def encrypt(source, destination, password):
                 if not chunk:
                     break
                 dst.write(encryptor.update(chunk))
+                done += len(chunk)
+                now = time.monotonic()
+                if now - last >= 0.15:
+                    progress("Encrypting bundle", done, total, started)
+                    last = now
             dst.write(encryptor.finalize())
             dst.write(encryptor.tag)
+        progress("Encrypting bundle", done, total, started, final=True)
     except Exception as exc:
         fail("encryption failed (%s)" % exc)
 
@@ -4570,6 +4894,9 @@ def decrypt(source, destination, password):
             decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
             decryptor.authenticate_additional_data(MAGIC + struct.pack(">I", length) + raw)
             remaining = tag_offset - body_start
+            payload_total = remaining
+            done = 0
+            started = last = time.monotonic()
             with open(destination, "xb") as dst:
                 while remaining:
                     chunk = src.read(min(CHUNK, remaining))
@@ -4577,7 +4904,13 @@ def decrypt(source, destination, password):
                         fail("truncated encrypted payload")
                     remaining -= len(chunk)
                     dst.write(decryptor.update(chunk))
+                    done += len(chunk)
+                    now = time.monotonic()
+                    if now - last >= 0.15:
+                        progress("Decrypting bundle", done, payload_total, started)
+                        last = now
                 dst.write(decryptor.finalize())
+            progress("Decrypting bundle", done, payload_total, started, final=True)
     except InvalidTag:
         try:
             os.unlink(destination)
@@ -4669,11 +5002,15 @@ cmd_bundle() {
         password="$(bundle_password create "${BUNDLE_PASSWORD_MODE:-ask}" "$BUNDLE_PASSWORD_VALUE")"
         tmp="$(mktemp "$JROOT_HOME/.bundle.XXXXXX.tar.gz")"
         cipher_tmp="$(mktemp "${out}.jroot-encrypted.XXXXXX")"
-        rm -f "$cipher_tmp"
+        rm -f "$tmp" "$cipher_tmp"
         trap 'rm -f "$tmp" "$cipher_tmp"' RETURN
         log "Bundling and encrypting jail '$name' into '$out'..."
         jail_archive_exclude_options "$name"
-        tar -czf "$tmp" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+        if progress_enabled; then
+            progress_tar_gzip "$tmp" "Bundle archive" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" || err "Bundle failed."
+        else
+            tar -czf "$tmp" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+        fi
         bundle_crypt_file encrypt "$tmp" "$cipher_tmp" "$password" || err "Bundle encryption failed."
         mv -f "$cipher_tmp" "$out" || err "Could not save encrypted bundle to '$out'."
         rm -f "$tmp"
@@ -4681,9 +5018,17 @@ cmd_bundle() {
         log "Jail '$name' successfully encrypted and bundled to '$out'."
         record_event "$name" bundle "encrypted bundle to $out"
     else
+        local archive_tmp
+        archive_tmp="$(mktemp "${out}.jroot-archive.XXXXXX")"
+        rm -f "$archive_tmp"
         log "Bundling jail '$name' into '$out'..."
         jail_archive_exclude_options "$name"
-        tar -czf "$out" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+        if progress_enabled; then
+            progress_tar_gzip "$archive_tmp" "Bundle archive" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" || { rm -f "$archive_tmp"; err "Bundle failed."; }
+            mv -f "$archive_tmp" "$out" || err "Could not save bundle to '$out'."
+        else
+            tar -czf "$out" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$JROOT_HOME" "configs/$name.json" "roots/$name" 2>/dev/null || err "Bundle failed."
+        fi
         log "Jail '$name' successfully bundled to '$out'."
         record_event "$name" bundle "bundled to $out"
     fi
@@ -8345,7 +8690,7 @@ cmd_snapshot() {
     rm -f "$tmp"
     log "Snapshotting '$name' as '$label'..."
     jail_archive_exclude_options "$name"
-    if tar -czf "$tmp.tar.gz" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$ROOTS_DIR" "$name" 2>/dev/null; then
+    if { if progress_enabled; then progress_tar_gzip "$tmp.tar.gz" "Snapshot archive" tar -c "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$ROOTS_DIR" "$name"; else tar -czf "$tmp.tar.gz" "${JAIL_ARCHIVE_EXCLUDES[@]}" -C "$ROOTS_DIR" "$name" 2>/dev/null; fi; }; then
         mv "$tmp.tar.gz" "$dir/$label.tar.gz"
         cp "$CONFIGS_DIR/$name.json" "$dir/$label.json"
         log "Snapshot saved: $dir/$label.tar.gz"
@@ -8513,6 +8858,7 @@ cmd_checkpoint() {
     if command -v rsync >/dev/null 2>&1 && filesystem_supports_hardlinks "$dir"; then
         mkdir -p "$target" || err "Checkpoint directory creation failed."
         local rsync_args=(-a --delete)
+        progress_enabled && rsync_args+=("--info=progress2")
         [ -n "$previous" ] && rsync_args+=("--link-dest=$previous")
         rsync_args+=("${checkpoint_excludes[@]}")
         if ! rsync "${rsync_args[@]}" "$ROOTS_DIR/$name/" "$target/"; then

@@ -383,6 +383,8 @@ test: check
 	@bash tests/checkpoint.sh
 	@printf '$(CYAN)==>$(NC) tests/bundle.sh\n'
 	@bash tests/bundle.sh
+	@printf '$(CYAN)==>$(NC) tests/progress.sh\n'
+	@bash tests/progress.sh
 	@printf '$(CYAN)==>$(NC) tests/clone.sh\n'
 	@bash tests/clone.sh
 	@printf '$(CYAN)==>$(NC) tests/logs.sh\n'
