@@ -4769,6 +4769,7 @@ KDF_MEMORY_KIB = 64 * 1024
 KDF_ITERATIONS = 3
 KDF_LANES = 4
 SHOW_PROGRESS = os.environ.get("JROOT_BUNDLE_CRYPTO_PROGRESS") == "1"
+progress_active = False
 
 
 def human(value):
@@ -4781,6 +4782,7 @@ def human(value):
 
 
 def progress(label, done, total, started, final=False):
+    global progress_active
     if not SHOW_PROGRESS:
         return
     elapsed = max(time.monotonic() - started, 0.001)
@@ -4792,11 +4794,21 @@ def progress(label, done, total, started, final=False):
     suffix = "done" if final else "processing"
     sys.stderr.write(f"\r\x1b[2K    {label} [{bar}] {percent:5.1f}%  {human(done)} / {human(total)}  {human(rate)}/s  {suffix}")
     sys.stderr.flush()
+    progress_active = not final
     if final:
         sys.stderr.write("\n")
 
 
+def clear_progress():
+    global progress_active
+    if SHOW_PROGRESS and progress_active:
+        sys.stderr.write("\r\x1b[2K\n")
+        sys.stderr.flush()
+        progress_active = False
+
+
 def fail(message):
+    clear_progress()
     sys.stderr.write("jroot: encrypted bundle: %s\\n" % message)
     raise SystemExit(1)
 
@@ -4839,6 +4851,7 @@ def encrypt(source, destination, password):
         encryptor.authenticate_additional_data(aad)
         with open(source, "rb") as src, open(destination, "xb") as dst:
             dst.write(aad)
+            progress("Encrypting bundle", done, total, started)
             while True:
                 chunk = src.read(CHUNK)
                 if not chunk:
@@ -4898,6 +4911,7 @@ def decrypt(source, destination, password):
             done = 0
             started = last = time.monotonic()
             with open(destination, "xb") as dst:
+                progress("Decrypting bundle", done, payload_total, started)
                 while remaining:
                     chunk = src.read(min(CHUNK, remaining))
                     if not chunk:

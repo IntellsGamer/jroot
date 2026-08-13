@@ -32,10 +32,14 @@ cmd_bundle "$name" "$encrypted" --encrypt "--password=$password" >/dev/null
 cmd_deploy "$encrypted" encrypted-restored "--password=$password" >/dev/null
 [ "$(cat "$ROOTS_DIR/encrypted-restored/etc/bundle-state")" = "bundle-payload" ]
 
-if JROOT_HOME="$JROOT_HOME" bash "$ROOT/jroot" deploy "$encrypted" rejected "--password=wrong password" >/dev/null 2>&1; then
+wrong_log="$TMP/wrong-password.log"
+if JROOT_HOME="$JROOT_HOME" JROOT_PROGRESS=force bash "$ROOT/jroot" deploy "$encrypted" rejected "--password=wrong password" >"$wrong_log" 2>&1; then
     printf 'encrypted bundle accepted a wrong password\n' >&2
     exit 1
 fi
+grep -F 'wrong password or bundle authentication failed' "$wrong_log" >/dev/null
+grep -F $'\r\033[2K\njroot: encrypted bundle: wrong password or bundle authentication failed' "$wrong_log" >/dev/null
+! grep -F 'processingjroot:' "$wrong_log" >/dev/null
 [ ! -e "$CONFIGS_DIR/rejected.json" ]
 [ ! -e "$ROOTS_DIR/rejected" ]
 
