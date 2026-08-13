@@ -39,16 +39,16 @@ Just userspace.
 
 1. Download the assets:
 ```bash
-curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/install-jroot.sh
-curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
-curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot_sdk.py
+curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/main/install-jroot.sh
+curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/main/jroot
+curl -L -O https://raw.githubusercontent.com/IntellsGamer/jroot/main/jroot_sdk.py
 ```
 
 Or if you prefer using wget:
 ```bash
-wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/install-jroot.sh
-wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot
-wget https://raw.githubusercontent.com/IntellsGamer/jroot/refs/heads/main/jroot_sdk.py
+wget https://raw.githubusercontent.com/IntellsGamer/jroot/main/install-jroot.sh
+wget https://raw.githubusercontent.com/IntellsGamer/jroot/main/jroot
+wget https://raw.githubusercontent.com/IntellsGamer/jroot/main/jroot_sdk.py
 ```
 
 2. Run the installer:
