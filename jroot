@@ -585,8 +585,11 @@ PYEOF
 }
 
 ensure_runtime() {
-    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR" "$JROOT_HOME/pids"
+    mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$SNAPSHOTS_DIR" "$BIN_DIR" "$CACHE_DIR" "$HISTORY_DIR" "$JROOT_HOME/pids" "$JROOT_HOME/logs" "$JROOT_HOME/services"
     mkdir -p "$JROOT_HOME/.denied"; : > "$JROOT_HOME/.deniedbin"
+    if [ ! -x "$(service_watchdog_path)" ] || ! grep -q "jroot-service-watchdog-v1" "$(service_watchdog_path)" 2>/dev/null; then
+        write_service_watchdog
+    fi
     if [ ! -x "$SECCOMP_LAUNCHER" ] || ! grep -q "jroot-seccomp-v9" "$SECCOMP_LAUNCHER"; then
         write_seccomp_launcher
     fi
@@ -3138,6 +3141,7 @@ except Exception:
 c.update({"name": name, "image": image, "user": user,
           "mount_host": int(mh), "mount_home": int(mhome),
           "build_essential": int(be)})
+c.setdefault("persistent", 0)
 json.dump(c, open(cfg, "w"), indent=2)
 PYEOF
     fi
@@ -3148,7 +3152,8 @@ PYEOF
   "user": "$user_mode",
   "mount_host": $mount_host,
   "mount_home": $mount_home,
-  "build_essential": $build_essential
+  "build_essential": $build_essential,
+  "persistent": 0
 }
 EOF
 }
@@ -3248,6 +3253,10 @@ show_config() {
     printf '  mount_home (~):   %s   (host $HOME at /mnt/home)\n' "$(config_field "$cfg" mount_home)"
     printf '  loopback addr:    %s\n' "${lb:-auto (assigned on first enter)}"
     printf '  public ports:     %s\n' "$(config_ports "$cfg" | sed 's/^$/none/')"
+    printf '  persistent:       %s\n' "$([ "$(config_field "$cfg" persistent)" = "1" ] && printf enabled || printf disabled)"
+    if persist_is_running "$name"; then
+        printf '  persistent anchor: running (PID %s)\n' "$(persist_pid "$name")"
+    fi
     # SSH status
     if [ -f "$(ssh_pid_file "$name")" ]; then
         local ssh_pid ssh_port
@@ -4007,8 +4016,8 @@ require_unroot_protection() {
 
 cmd_init() {
     local image="" repo tag version codename name user_mode response distro=""
-    local mount_host=0 mount_home=0 build_essential=1
-    local cli_name="" cli_user="" cli_be="" cli_mh="" cli_mhomedir=""
+    local mount_host=0 mount_home=0 build_essential=1 persistent=0
+    local cli_name="" cli_user="" cli_be="" cli_mh="" cli_mhomedir="" cli_persistent=""
 
         while [ $# -gt 0 ]; do
         case "$1" in
@@ -4018,7 +4027,8 @@ cmd_init() {
             --build-essential=*)    cli_be="${1#*=}" ;;
             --mount-host=*)         cli_mh="${1#*=}" ;;
             --mount-home=*)         cli_mhomedir="${1#*=}" ;;
-            -h|--help)              err "Usage: jroot init <image> [--pull|-p] [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1]\n       jroot init --list  (show available images)" ;;
+            --persistent=*)         cli_persistent="${1#*=}" ;;
+            -h|--help)              err "Usage: jroot init <image> [--pull|-p] [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1] [--persistent=0/1]\n       jroot init --list  (show available images)" ;;
             *)                      [ -z "$image" ] && image="$1" || err "Unexpected argument: $1" ;;
         esac
         shift
@@ -4103,6 +4113,8 @@ cmd_init() {
     case "$build_essential" in 0|1) ;; *) err "--build-essential must be 0 or 1" ;; esac
     case "$mount_host" in 0|1) ;; *) err "--mount-host must be 0 or 1" ;; esac
     case "$mount_home" in 0|1) ;; *) err "--mount-home must be 0 or 1" ;; esac
+    [ -n "$cli_persistent" ] && persistent="$cli_persistent"
+    case "$persistent" in 0|1) ;; *) err "--persistent must be 0 or 1" ;; esac
 
     if [ "$mount_host" = "1" ]; then
         warn "SECURITY: host / will be readable/writable at /mnt/host inside the jail."
@@ -4131,8 +4143,9 @@ cmd_init() {
 
     write_rootfs_niceties "$name"
     write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
+    set_config_field "$CONFIGS_DIR/$name.json" persistent "$persistent" || err "Could not set persistent mode."
     record_event "$name" "created" \
-        "$image user=$user_mode build_essential=$build_essential mount_host=$mount_host mount_home=$mount_home"
+        "$image user=$user_mode build_essential=$build_essential mount_host=$mount_host mount_home=$mount_home persistent=$persistent"
     trigger_event_hooks "on_init" "$name" "$image"
 
     local bootstrapped=1
@@ -4628,6 +4641,11 @@ cmd_enter() {
 
     local enter_mode="shell"
     [ "${#cmd[@]}" -gt 0 ] && enter_mode="command"
+    if [ "${#cmd[@]}" -eq 0 ] && [ "$force_root" != 1 ] && persist_enabled "$name"; then
+        trigger_event_hooks "on_enter" "$name" "persistent-attach"
+        persist_attach "$name"
+        return $?
+    fi
     trigger_event_hooks "on_enter" "$name" "$enter_mode"
     # Keep a PID record for both interactive shells and foreground commands.
     # The record lets `jroot ps`, `monitor`, and `kill` operate on a real
@@ -4669,6 +4687,609 @@ cmd_exec() {
     fi
     [ "$(cat "$pidfile" 2>/dev/null || true)" = "$$" ] && rm -f "$pidfile"
     return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Persistent jail sessions
+#
+# Ordinary `jroot enter` remains tied to its PRoot invocation.  Persistent mode
+# is explicit: one detached PRoot anchor owns a tmux server, and later entries
+# attach to that same server.  That keeps the process tree alive without
+# turning every ordinary one-shot command into an accidental background daemon.
+# ---------------------------------------------------------------------------
+persist_pid_file() { printf '%s/pids/%s.persist\n' "$JROOT_HOME" "$1"; }
+persist_log_file() { printf '%s/logs/%s.persist.log\n' "$JROOT_HOME" "$1"; }
+persist_session_name() { printf 'jroot-%s\n' "$1"; }
+
+persist_enabled() {
+    [ "$(config_field "$CONFIGS_DIR/$1.json" persistent)" = "1" ]
+}
+
+persist_is_running() {
+    local file pid
+    file="$(persist_pid_file "$1")"
+    [ -f "$file" ] || return 1
+    pid="$(tr -d '[:space:]' < "$file" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+persist_pid() {
+    tr -d '[:space:]' < "$(persist_pid_file "$1")" 2>/dev/null || true
+}
+
+# The tmux socket must survive a separate `jroot enter` invocation.  Unroot
+# sessions cannot use /tmp because each protected PRoot entry gets a private
+# transient overlay, so their socket lives under the already-writable jail home.
+persist_tmux_dir() {
+    local name="$1" user_mode
+    user_mode="$(config_field "$CONFIGS_DIR/$name.json" user)"
+    if [ "$user_mode" = "unroot" ]; then
+        printf '/home/jail/.jroot-tmux\n'
+    else
+        printf '/tmp/.jroot-tmux-%s\n' "$name"
+    fi
+}
+
+persist_require_enabled() {
+    local name="$1"
+    persist_enabled "$name" && return 0
+    err "Persistent mode is disabled for '$name'. Enable it first:\n\n    jroot config $name --persistent=1\n    jroot persist $name start\n\nOrdinary jails intentionally stop their process tree when the session exits."
+}
+
+persist_anchor() {
+    local name="$1" cfg="$CONFIGS_DIR/$1.json" tmux_dir session q_dir q_session
+    [ -f "$cfg" ] || return 1
+    persist_enabled "$name" || return 1
+    tmux_dir="$(persist_tmux_dir "$name")"
+    session="$(persist_session_name "$name")"
+    printf -v q_dir '%q' "$tmux_dir"
+    printf -v q_session '%q' "$session"
+    run_in_jail "$name" /bin/sh -c "
+        mkdir -p $q_dir && chmod 700 $q_dir || exit 1
+        export TMUX_TMPDIR=$q_dir
+        tmux has-session -t $q_session 2>/dev/null || tmux new-session -d -s $q_session -n shell
+        tmux set-option -t $q_session remain-on-exit on 2>/dev/null || true
+        while tmux has-session -t $q_session 2>/dev/null; do sleep 1; done
+    "
+}
+
+persist_start() {
+    local name="$1" pidfile log_file pid
+    ensure_runtime
+    [ -x "$PROOT_BIN" ] || install_proot
+    persist_require_enabled "$name"
+    if persist_is_running "$name"; then
+        log "Persistent jail '$name' is already running (anchor PID $(persist_pid "$name"))."
+        return 0
+    fi
+    pidfile="$(persist_pid_file "$name")"
+    log_file="$(persist_log_file "$name")"
+    mkdir -p "$JROOT_HOME/pids" "$JROOT_HOME/logs"
+    rm -f "$pidfile"
+    if command -v setsid >/dev/null 2>&1; then
+        JROOT_HOME="$JROOT_HOME" setsid bash "$JROOT_LAUNCHER_PATH" __persist-anchor "$name" \
+            </dev/null >> "$log_file" 2>&1 &
+    else
+        JROOT_HOME="$JROOT_HOME" nohup bash "$JROOT_LAUNCHER_PATH" __persist-anchor "$name" \
+            </dev/null >> "$log_file" 2>&1 &
+    fi
+    pid=$!
+    sleep 0.2
+    if ! kill -0 "$pid" 2>/dev/null; then
+        warn "Could not start persistent jail '$name'. Inspect: $log_file"
+        return 1
+    fi
+    printf '%s\n' "$pid" > "$pidfile"
+    log "Persistent jail '$name' started (anchor PID $pid)."
+    record_event "$name" "persist" "started anchor=$pid"
+    trigger_event_hooks "on_start" "$name" "persistent"
+}
+
+persist_terminate_tmux_panes() {
+    local name="$1" tmux_dir session q_dir q_session panes tty pgid
+    tmux_dir="$(persist_tmux_dir "$name")"
+    session="$(persist_session_name "$name")"
+    printf -v q_dir '%q' "$tmux_dir"
+    printf -v q_session '%q' "$session"
+    panes="$(run_in_jail "$name" /bin/sh -c "export TMUX_TMPDIR=$q_dir; tmux list-panes -a -t $q_session -F '#{pane_tty}' 2>/dev/null" 2>/dev/null || true)"
+    while IFS= read -r tty; do
+        tty="${tty#/dev/}"
+        [ -n "$tty" ] || continue
+        while IFS= read -r pgid; do
+            [[ "$pgid" =~ ^[1-9][0-9]*$ ]] || continue
+            kill -TERM -- "-$pgid" 2>/dev/null || true
+        done < <(ps -eo pgid=,tty= 2>/dev/null | awk -v want="$tty" '$2 == want {print $1}' | sort -u)
+    done <<< "$panes"
+}
+
+persist_stop() {
+    local name="$1" pid pgid tmux_dir session q_dir q_session
+    if ! persist_is_running "$name"; then
+        rm -f "$(persist_pid_file "$name")"
+        log "Persistent jail '$name' is already stopped."
+        return 0
+    fi
+    # tmux double-forks and moves panes into their own process groups. Terminate
+    # those groups first, then ask tmux to close, and finally stop the PRoot
+    # anchor as a backstop. This prevents an app from becoming an orphaned host
+    # process when its retained jail is explicitly stopped.
+    persist_terminate_tmux_panes "$name"
+    tmux_dir="$(persist_tmux_dir "$name")"
+    session="$(persist_session_name "$name")"
+    printf -v q_dir '%q' "$tmux_dir"
+    printf -v q_session '%q' "$session"
+    run_in_jail "$name" /bin/sh -c "export TMUX_TMPDIR=$q_dir; tmux kill-session -t $q_session 2>/dev/null || true" >/dev/null 2>&1 || true
+    pid="$(persist_pid "$name")"
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    if [ -n "$pgid" ]; then
+        kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    else
+        kill -TERM "$pid" 2>/dev/null || true
+    fi
+    sleep 0.2
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    rm -f "$(persist_pid_file "$name")"
+    log "Persistent jail '$name' stopped."
+    record_event "$name" "persist" "stopped"
+    trigger_event_hooks "on_stop" "$name" "persistent"
+}
+
+persist_attach() {
+    local name="$1" tmux_dir session q_dir q_session
+    persist_require_enabled "$name"
+    persist_is_running "$name" || persist_start "$name" || return 1
+    tmux_dir="$(persist_tmux_dir "$name")"
+    session="$(persist_session_name "$name")"
+    printf -v q_dir '%q' "$tmux_dir"
+    printf -v q_session '%q' "$session"
+    run_in_jail "$name" /bin/sh -c "
+        export TMUX_TMPDIR=$q_dir
+        tmux list-panes -t $q_session -F '#{pane_dead}' 2>/dev/null | grep -qx 1 && tmux respawn-pane -k -t $q_session 2>/dev/null || true
+        exec tmux attach-session -t $q_session
+    "
+}
+
+persist_status() {
+    local name="$1" enabled=0 pid
+    persist_enabled "$name" && enabled=1
+    printf 'Persistent mode for %s: %s\n' "$name" "$([ "$enabled" = 1 ] && printf enabled || printf disabled)"
+    if persist_is_running "$name"; then
+        pid="$(persist_pid "$name")"
+        printf '  anchor: running (PID %s)\n' "$pid"
+        printf '  attach: jroot enter %s\n' "$name"
+    else
+        printf '  anchor: stopped\n'
+        [ "$enabled" = 0 ] || printf '  start:  jroot persist %s start\n' "$name"
+    fi
+}
+
+persist_usage() {
+    printf '%bjroot persist%b - keep an explicitly enabled jail alive across terminal exits\n\n' "$H" "$N"
+    printf '    %bjroot persist <name> enable|disable|start|stop|attach|status%b\n\n' "$G" "$N"
+    printf '    Persistent mode is disabled by default. Enable it with:\n'
+    printf '        %bjroot config <name> --persistent=1%b\n' "$G" "$N"
+    printf '    After start, plain %bjroot enter <name>%b attaches to its persistent shell.\n' "$G" "$N"
+}
+
+cmd_persist() {
+    [ $# -ge 1 ] || { persist_usage; return 1; }
+    local name="$1" op="${2:-status}" cfg="$CONFIGS_DIR/$1.json"
+    [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing."
+    case "$op" in
+        enable)
+            set_config_field "$cfg" persistent 1 || err "Persistent mode needs host Python 3 to update the jail config."
+            log "Persistent mode enabled for '$name'. Ordinary terminals now attach only after you start it: jroot persist $name start"
+            record_event "$name" "persist" "enabled"
+            ;;
+        disable)
+            if persist_is_running "$name"; then
+                err "Persistent jail '$name' is still running. Stop it first: jroot persist $name stop"
+            fi
+            set_config_field "$cfg" persistent 0 || err "Could not update persistent mode."
+            log "Persistent mode disabled for '$name'. New `jroot enter` sessions are session-bound again."
+            record_event "$name" "persist" "disabled"
+            ;;
+        start) persist_start "$name" ;;
+        stop) persist_stop "$name" ;;
+        attach) persist_attach "$name" ;;
+        status) persist_status "$name" ;;
+        -h|--help|help) persist_usage ;;
+        *) err "Usage: jroot persist <name> enable|disable|start|stop|attach|status" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Persistent-jail services
+#
+# A service is deliberately a watch registration, not a guessed restart command.
+# The user chooses an already-running in-jail PID after inspecting `ps aux`.
+# The watcher records its complete descendant tree, adopts a surviving child if
+# the registered parent exits, and refuses to observe unrelated host processes.
+# ---------------------------------------------------------------------------
+service_root() { printf '%s/services/%s\n' "$JROOT_HOME" "$1"; }
+service_config_file() { printf '%s/%s.json\n' "$(service_root "$1")" "$2"; }
+service_state_file() { printf '%s/%s.state.json\n' "$(service_root "$1")" "$2"; }
+service_pid_file() { printf '%s/pids/%s.service-%s.pid\n' "$JROOT_HOME" "$1" "$2"; }
+service_log_file() { printf '%s/logs/%s.service-%s.log\n' "$JROOT_HOME" "$1" "$2"; }
+service_watchdog_path() { printf '%s/service-watchdog.py\n' "$BIN_DIR"; }
+service_valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+
+# Is $1 in the host-visible descendant chain of the PRoot anchor $2?
+# PRoot preserves host PIDs on supported Linux hosts, which is also why `ps aux`
+# inside a jail is useful for selecting a service PID in the first place.
+service_pid_belongs_to_anchor() {
+    local pid="$1" anchor="$2" current="$pid" parent hops=0
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    while [ "$hops" -lt 256 ]; do
+        [ "$current" = "$anchor" ] && return 0
+        [ -r "/proc/$current/stat" ] || return 1
+        parent="$(awk '{print $4}' "/proc/$current/stat" 2>/dev/null || true)"
+        [[ "$parent" =~ ^[1-9][0-9]*$ ]] || return 1
+        [ "$parent" = "$current" ] && return 1
+        current="$parent"
+        hops=$((hops + 1))
+    done
+    return 1
+}
+
+# tmux double-forks its server, so normal PPID ancestry can end at host init even
+# though the process is still a pane child inside the retained PRoot session. In
+# that case, match the host process terminal to a pane owned by this jail's tmux
+# server. A detached arbitrary host process has neither relationship and fails.
+service_pid_belongs_to_persistent_jail() {
+    local name="$1" pid="$2" tty tmux_dir session q_dir q_session panes
+    service_pid_belongs_to_anchor "$pid" "$(persist_pid "$name")" && return 0
+    tty="$(ps -o tty= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$tty" ] && [ "$tty" != "?" ] && [ "$tty" != "-" ] || return 1
+    tmux_dir="$(persist_tmux_dir "$name")"
+    session="$(persist_session_name "$name")"
+    printf -v q_dir '%q' "$tmux_dir"
+    printf -v q_session '%q' "$session"
+    panes="$(run_in_jail "$name" /bin/sh -c "export TMUX_TMPDIR=$q_dir; tmux list-panes -a -t $q_session -F '#{pane_tty}' 2>/dev/null" 2>/dev/null || true)"
+    printf '%s\n' "$panes" | sed 's#^/dev/##' | grep -qxF "$tty"
+}
+
+write_service_watchdog() {
+    local target
+    target="$(service_watchdog_path)"
+    cat > "$target" <<'PYEOF'
+#!/usr/bin/env python3
+# jroot-service-watchdog-v1
+"""Track one host-visible process subtree created by a persistent JRoot anchor."""
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+active = True
+
+def stop(_signum, _frame):
+    global active
+    active = False
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--config", required=True)
+parser.add_argument("--state", required=True)
+parser.add_argument("--jail", required=True)
+parser.add_argument("--service", required=True)
+args = parser.parse_args()
+config_path = Path(args.config)
+state_path = Path(args.state)
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+def read_json(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+def proc_info(pid):
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        right = raw.rsplit(") ", 1)[1].split()
+        # right starts at stat field 3: state, then ppid; starttime is field 22.
+        ppid = int(right[1])
+        start_time = right[19]
+        state = right[0]
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        if not cmd:
+            cmd = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+        return {"pid": pid, "ppid": ppid, "start_time": start_time, "state": state, "command": cmd}
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
+        return None
+
+def descendants(root):
+    children = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        info = proc_info(int(entry))
+        if info:
+            children.setdefault(info["ppid"], []).append(info["pid"])
+    out, pending, seen = [], [root], set()
+    while pending:
+        pid = pending.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        info = proc_info(pid)
+        if not info:
+            continue
+        out.append(info)
+        pending.extend(sorted(children.get(pid, [])))
+    return out
+
+def live_previous(previous):
+    live = []
+    for item in previous:
+        if not isinstance(item, dict):
+            continue
+        try:
+            pid = int(item.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        current = proc_info(pid)
+        if current and current.get("start_time") == item.get("start_time"):
+            live.append(current)
+    ids = {item["pid"] for item in live}
+    roots = [item for item in live if item["ppid"] not in ids]
+    return sorted(roots or live, key=lambda item: item["pid"])
+
+last_members = []
+last_event = "registered"
+while active:
+    config = read_json(config_path)
+    if not config:
+        break
+    try:
+        tracked_pid = int(config.get("pid"))
+    except (TypeError, ValueError):
+        break
+    tracked_start = str(config.get("start_time", ""))
+    current = proc_info(tracked_pid)
+    event = None
+    if current and tracked_start and current.get("start_time") != tracked_start:
+        current = None
+        event = "pid-reused"
+    if current:
+        tree = descendants(tracked_pid)
+        if not any(item["pid"] == tracked_pid for item in tree):
+            tree.insert(0, current)
+        if last_members and len(tree) > len(last_members):
+            event = "children-detected"
+    else:
+        adopted = live_previous(last_members)
+        if adopted:
+            old_pid = tracked_pid
+            current = adopted[0]
+            tracked_pid = current["pid"]
+            tracked_start = current["start_time"]
+            config["pid"] = tracked_pid
+            config["start_time"] = tracked_start
+            config["adopted_from_pid"] = old_pid
+            atomic_json(config_path, config)
+            tree = descendants(tracked_pid)
+            event = "child-adopted"
+        else:
+            tree = []
+            event = event or "exited"
+    if event:
+        last_event = event
+    if tree:
+        last_members = tree
+    observed = current or {"pid": tracked_pid, "command": "", "start_time": tracked_start}
+    state = {
+        "schema": 1,
+        "jail": args.jail,
+        "service": args.service,
+        "status": "running" if tree else "exited",
+        "pid": observed.get("pid"),
+        "start_time": observed.get("start_time", tracked_start),
+        "command": observed.get("command", ""),
+        "members": tree,
+        "member_count": len(tree),
+        "last_event": last_event,
+        "observed_at": int(time.time()),
+    }
+    atomic_json(state_path, state)
+    if not tree:
+        break
+    time.sleep(0.5)
+
+# Keep a final durable record when stopped intentionally or the registration was removed.
+state = read_json(state_path)
+if state:
+    state["watcher_status"] = "stopped"
+    state["observed_at"] = int(time.time())
+    atomic_json(state_path, state)
+PYEOF
+    chmod 700 "$target"
+}
+
+service_watcher_is_running() {
+    local file pid
+    file="$(service_pid_file "$1" "$2")"
+    [ -f "$file" ] || return 1
+    pid="$(tr -d '[:space:]' < "$file" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+service_start_watcher() {
+    local name="$1" service="$2" cfg state pidfile logfile helper pid
+    cfg="$(service_config_file "$name" "$service")"
+    state="$(service_state_file "$name" "$service")"
+    pidfile="$(service_pid_file "$name" "$service")"
+    logfile="$(service_log_file "$name" "$service")"
+    helper="$(service_watchdog_path)"
+    [ -x "$helper" ] || write_service_watchdog
+    service_watcher_is_running "$name" "$service" && return 0
+    rm -f "$pidfile"
+    mkdir -p "$JROOT_HOME/pids" "$JROOT_HOME/logs"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid python3 "$helper" --config "$cfg" --state "$state" --jail "$name" --service "$service" \
+            </dev/null >> "$logfile" 2>&1 &
+    else
+        nohup python3 "$helper" --config "$cfg" --state "$state" --jail "$name" --service "$service" \
+            </dev/null >> "$logfile" 2>&1 &
+    fi
+    pid=$!
+    sleep 0.1
+    kill -0 "$pid" 2>/dev/null || { warn "Could not start watchdog for service '$service'. Inspect: $logfile"; return 1; }
+    printf '%s\n' "$pid" > "$pidfile"
+}
+
+service_stop_watcher() {
+    local name="$1" service="$2" pidfile pid
+    pidfile="$(service_pid_file "$name" "$service")"
+    pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -TERM "$pid" 2>/dev/null || true
+    rm -f "$pidfile"
+}
+
+service_stop_watchers_for_jail() {
+    local name="$1" pidfile service
+    for pidfile in "$JROOT_HOME/pids/$name.service-"*.pid; do
+        [ -f "$pidfile" ] || continue
+        service="$(basename "$pidfile" .pid)"
+        service="${service#"$name.service-"}"
+        service_stop_watcher "$name" "$service"
+    done
+}
+
+service_require_persistent() {
+    local name="$1"
+    persist_enabled "$name" && return 0
+    err "Services are locked for '$name' because persistent mode is disabled. Enable it first:\n\n    jroot config $name --persistent=1\n    jroot persist $name start\n\nThen inspect the running jail with `ps aux` and register a PID."
+}
+
+service_write_registration() {
+    local name="$1" service="$2" pid="$3" info
+    info="$(python3 - "$pid" <<'PY'
+import pathlib, sys
+pid = int(sys.argv[1])
+raw = pathlib.Path(f"/proc/{pid}/stat").read_text()
+right = raw.rsplit(") ", 1)[1].split()
+cmd = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+print(right[19])
+print(cmd)
+PY
+)" || return 1
+    local start_time="${info%%$'\n'*}" command="${info#*$'\n'}" path
+    path="$(service_config_file "$name" "$service")"
+    mkdir -p "$(service_root "$name")"
+    python3 - "$path" "$name" "$service" "$pid" "$start_time" "$command" <<'PY'
+import json, sys, time
+path, jail, service, pid, start_time, command = sys.argv[1:]
+value = {"schema": 1, "jail": jail, "service": service, "pid": int(pid),
+         "start_time": start_time, "command": command, "created_at": int(time.time())}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(value, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+}
+
+service_show_status() {
+    local name="$1" service="$2" state
+    state="$(service_state_file "$name" "$service")"
+    [ -f "$state" ] || { printf '%-20s %-10s %s\n' "$service" "pending" "watchdog has not written state yet"; return 0; }
+    python3 - "$state" <<'PY'
+import json, sys
+try:
+    s = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as exc:
+    print(f"state unreadable: {exc}")
+    raise SystemExit(0)
+print(f"{s.get('service', '?'):<20} {s.get('status', '?'):<10} pid={s.get('pid', '?')} members={s.get('member_count', 0)} event={s.get('last_event', '?')}")
+print(f"    {s.get('command', '')}")
+PY
+}
+
+service_usage() {
+    printf '%bjroot service%b - watch a process tree in an explicitly persistent jail\n\n' "$H" "$N"
+    printf '    %bjroot service <jail> add <service> <pid>%b\n' "$G" "$N"
+    printf '    %bjroot service <jail> list|status [service]|remove <service>|logs <service>%b\n\n' "$G" "$N"
+    printf '    Services are disabled until persistent mode is enabled:\n'
+    printf '        %bjroot config <jail> --persistent=1%b\n' "$G" "$N"
+    printf '        %bjroot persist <jail> start%b\n' "$G" "$N"
+    printf '\n    Select a running PID from inside the jail with %bps aux%b, then register it.\n' "$G" "$N"
+    printf '    The watchdog follows descendants, adopts a surviving child after the selected\n'
+    printf '    parent exits, and records a clean exited state when nothing remains.\n'
+}
+
+cmd_service() {
+    ensure_runtime
+    [ $# -ge 2 ] || { service_usage; return 1; }
+    local name="$1" op="$2" service="${3:-}" pid="${4:-}" cfg="$CONFIGS_DIR/$1.json" path
+    [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+    [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing."
+    case "$op" in
+        add)
+            service_require_persistent "$name"
+            persist_is_running "$name" || err "Persistent jail '$name' is not running. Start it first: jroot persist $name start"
+            service_valid_name "$service" || err "Invalid service name '$service'. Use letters, digits, dots, underscores, or dashes."
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || err "Usage: jroot service $name add <service> <pid>"
+            service_pid_belongs_to_persistent_jail "$name" "$pid" || err "PID $pid is not inside persistent jail '$name'. Run 'ps aux' inside that jail and choose a process attached to its persistent session."
+            path="$(service_config_file "$name" "$service")"
+            [ ! -e "$path" ] || err "Service '$service' already exists for '$name'. Remove it first or use status."
+            service_write_registration "$name" "$service" "$pid" || err "Could not inspect PID $pid. It may have already exited."
+            service_start_watcher "$name" "$service" || err "Could not start service watchdog."
+            log "Service '$service' now watches PID $pid in '$name'."
+            record_event "$name" "service" "added $service pid=$pid"
+            ;;
+        list)
+            service_require_persistent "$name"
+            printf '%-20s %-10s %s\n' "SERVICE" "STATUS" "DETAIL"
+            shopt -s nullglob
+            for path in "$(service_root "$name")"/*.json; do
+                case "$path" in *.state.json) continue ;; esac
+                service="$(basename "$path" .json)"
+                service_show_status "$name" "$service"
+            done
+            shopt -u nullglob
+            ;;
+        status)
+            service_require_persistent "$name"
+            if [ -n "$service" ]; then
+                [ -f "$(service_config_file "$name" "$service")" ] || err "Service '$service' is not registered for '$name'."
+                service_show_status "$name" "$service"
+            else
+                cmd_service "$name" list
+            fi
+            ;;
+        remove|rm)
+            service_require_persistent "$name"
+            service_valid_name "$service" || err "Usage: jroot service $name remove <service>"
+            [ -f "$(service_config_file "$name" "$service")" ] || err "Service '$service' is not registered for '$name'."
+            service_stop_watcher "$name" "$service"
+            rm -f "$(service_config_file "$name" "$service")" "$(service_state_file "$name" "$service")"
+            log "Service '$service' removed from '$name'. The watched process was left running."
+            record_event "$name" "service" "removed $service"
+            ;;
+        logs|log)
+            service_valid_name "$service" || err "Usage: jroot service $name logs <service>"
+            [ -f "$(service_log_file "$name" "$service")" ] || { log "No watchdog log for '$service'."; return 0; }
+            tail -n 80 "$(service_log_file "$name" "$service")"
+            ;;
+        -h|--help|help) service_usage ;;
+        *) err "Usage: jroot service <jail> add|list|status|remove|logs ..." ;;
+    esac
 }
 
 file_usage() {
@@ -6061,7 +6682,7 @@ PLUGIN_API_VERSION=1
 
 is_reserved_command() {
     case "$1" in
-        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -6720,7 +7341,7 @@ cmd_list() {
 }
 
 cmd_config() {
-    [ $# -ge 1 ] || err "Usage: jroot config <name> [--show|--mount-host=0/1|--mount-home=0/1|--build-essential=0/1|--user=root/unroot]"
+    [ $# -ge 1 ] || err "Usage: jroot config <name> [--show|--mount-host=0/1|--mount-home=0/1|--build-essential=0/1|--persistent=0/1|--user=root/unroot]"
     local name="$1"; shift
     local cfg="$CONFIGS_DIR/$name.json"
     [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
@@ -6729,15 +7350,16 @@ cmd_config() {
         *" --show "*) show_config "$name"; return 0 ;;
     esac
 
-    local image user_mode mount_host mount_home build_essential response mounts_pairs
+    local image user_mode mount_host mount_home build_essential persistent response mounts_pairs persistent_default
     image="$(config_field "$cfg" image)"
     user_mode="$(config_field "$cfg" user)";          [ -n "$user_mode" ]          || user_mode="root"
     mount_host="$(config_field "$cfg" mount_host)";   [ -n "$mount_host" ]         || mount_host=0
     mount_home="$(config_field "$cfg" mount_home)";   [ -n "$mount_home" ]         || mount_home=0
     build_essential="$(config_field "$cfg" build_essential)"; [ -n "$build_essential" ] || build_essential=1
+    persistent="$(config_field "$cfg" persistent)"; [ -n "$persistent" ] || persistent=0
     mounts_pairs="$(config_mounts "$cfg" 2>/dev/null | sed 's/\t/=/g' | tr '\n' ' ')"
 
-    local old_user="$user_mode" old_mh="$mount_host" old_mhome="$mount_home" old_be="$build_essential"
+    local old_user="$user_mode" old_mh="$mount_host" old_mhome="$mount_home" old_be="$build_essential" old_persistent="$persistent"
     if [ $# -eq 0 ]; then
         log "Current config for '$name':"
         show_config "$name"
@@ -6747,12 +7369,16 @@ cmd_config() {
         [[ "$response" =~ ^[Yy] ]] && mount_host=1 || mount_host=0
         response="$(ask "Mount host home to /mnt/home? [y/N] (current: $mount_home): " "N")"
         [[ "$response" =~ ^[Yy] ]] && mount_home=1 || mount_home=0
+        [ "$persistent" = "1" ] && persistent_default="Y" || persistent_default="N"
+        response="$(ask "Keep jail processes alive after terminal exit? [y/N] (current: $persistent): " "$persistent_default")"
+        [[ "$response" =~ ^[Yy] ]] && persistent=1 || persistent=0
     else
         for arg in "$@"; do
             case "$arg" in
                 --mount-host=1|--mount-host=0)      mount_host="${arg#*=}" ;;
                 --mount-home=1|--mount-home=0)      mount_home="${arg#*=}" ;;
                 --build-essential=1|--build-essential=0) build_essential="${arg#*=}" ;;
+                --persistent=1|--persistent=0)      persistent="${arg#*=}" ;;
                 --user=root|--user=unroot)          user_mode="${arg#*=}" ;;
                 *) err "Unknown option: $arg" ;;
             esac
@@ -6763,7 +7389,11 @@ cmd_config() {
         ensure_runtime
         require_unroot_protection
     fi
+    if [ "$old_persistent" = "1" ] && [ "$persistent" = "0" ] && persist_is_running "$name"; then
+        err "Persistent jail '$name' is still running. Stop it first: jroot persist $name stop"
+    fi
     write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
+    set_config_field "$cfg" persistent "$persistent" || err "Could not update persistent mode."
     if [ -n "$mounts_pairs" ]; then
         set_config_mounts "$cfg" $mounts_pairs >/dev/null 2>&1
     fi
@@ -6775,6 +7405,7 @@ cmd_config() {
     [ "$mount_host" = "$old_mh" ]        || changes="$changes mount_host=$old_mh->$mount_host"
     [ "$mount_home" = "$old_mhome" ]     || changes="$changes mount_home=$old_mhome->$mount_home"
     [ "$build_essential" = "$old_be" ]   || changes="$changes build_essential=$old_be->$build_essential"
+    [ "$persistent" = "$old_persistent" ] || changes="$changes persistent=$old_persistent->$persistent"
     [ -z "$changes" ] || record_event "$name" "config" "${changes# }"
     if [ "$user_mode" = "unroot" ]; then
         setup_unroot_user "$name"
@@ -6792,13 +7423,15 @@ cmd_rm() {
         log "Aborted."
         return 0
     fi
-    # Stop SSH daemon if running
+    # Stop persistent watchers, their anchor, and SSH before their rootfs disappears.
+    service_stop_watchers_for_jail "$name"
+    persist_is_running "$name" && persist_stop "$name" || true
     if [ -f "$(ssh_pid_file "$name")" ]; then
         ssh_stop "$name" 2>/dev/null || true
     fi
     # A removal handler runs after confirmation but before rootfs deletion.
     trigger_event_hooks "on_remove" "$name"
-    rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json"
+    rm -rf "$ROOTS_DIR/$name" "$CONFIGS_DIR/$name.json" "$JROOT_HOME/services/$name"
     rm -f "$(history_file "$name")"
     rm -f "$JROOT_HOME/pids/$name.pid" 2>/dev/null || true
     rm -f "$JROOT_HOME/pids/$name.sshd" "$JROOT_HOME/pids/$name.sshport" \
@@ -6825,6 +7458,11 @@ cmd_kill() {
         esac
     done
     [ -n "$name" ] || err "Usage: jroot kill <name> [--force|-f]"
+
+    if persist_is_running "$name"; then
+        persist_stop "$name"
+        return $?
+    fi
     
     local pidfile="$JROOT_HOME/pids/$name.pid"
     [ -f "$pidfile" ] || err "Jail '$name' is not running (no PID file)."
@@ -6884,7 +7522,7 @@ pids_dir = Path(sys.argv[1])
 processes = []
 for path in sorted(pids_dir.glob("*.pid")):
     # Plugin service pid files belong to the plugin runtime, not a jail.
-    if path.name.startswith("plugin-"):
+    if path.name.startswith("plugin-") or ".service-" in path.name:
         continue
     name = path.stem
     try:
@@ -6898,6 +7536,19 @@ for path in sorted(pids_dir.glob("*.pid")):
     except OSError:
         command = "unknown"
     processes.append({"jail": name, "pid": pid, "type": "shell", "command": command})
+for path in sorted(pids_dir.glob("*.persist")):
+    name = path.stem
+    try:
+        pid = int(path.read_text().strip())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        path.unlink(missing_ok=True)
+        continue
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode().strip()
+    except OSError:
+        command = "unknown"
+    processes.append({"jail": name, "pid": pid, "type": "persistent", "command": command})
 for path in sorted(pids_dir.glob("*.sshd")):
     name = path.stem
     try:
@@ -6919,11 +7570,23 @@ PY
     for pidfile in "$JROOT_HOME/pids"/*.pid; do
         [ -f "$pidfile" ] || continue
         name="$(basename "$pidfile" .pid)"
-        [[ "$name" == plugin-* ]] && continue
+        [[ "$name" == plugin-* || "$name" == *.service-* ]] && continue
         pid="$(tr -d '[:space:]' < "$pidfile")"
         if kill -0 "$pid" 2>/dev/null; then
             cmd="$(ps -o cmd= -p "$pid" 2>/dev/null | head -c 50)"
             printf '%-16s %-8s %-6s %s\n' "$name" "$pid" "shell" "${cmd:-unknown}"
+            found=1
+        else
+            rm -f "$pidfile"
+        fi
+    done
+    for pidfile in "$JROOT_HOME/pids"/*.persist; do
+        [ -f "$pidfile" ] || continue
+        name="$(basename "$pidfile" .persist)"
+        pid="$(tr -d '[:space:]' < "$pidfile")"
+        if kill -0 "$pid" 2>/dev/null; then
+            cmd="$(ps -o cmd= -p "$pid" 2>/dev/null | head -c 50)"
+            printf '%-16s %-8s %-10s %s\n' "$name" "$pid" "persistent" "${cmd:-unknown}"
             found=1
         else
             rm -f "$pidfile"
@@ -6952,6 +7615,8 @@ cmd_rename() {
     [ -f "$CONFIGS_DIR/$name.json" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
     [ -f "$CONFIGS_DIR/$newname.json" ] && err "Jail '$newname' already exists. Run 'jroot list' to see jails."
     [ -d "$ROOTS_DIR/$name" ] || err "Rootfs for '$name' is missing. Recreate it: jroot rm $name && jroot init <image>"
+    persist_is_running "$name" && err "Persistent jail '$name' is running. Stop it before renaming: jroot persist $name stop"
+    service_stop_watchers_for_jail "$name"
 
     local cfg="$CONFIGS_DIR/$name.json" newcfg="$CONFIGS_DIR/$newname.json"
 
@@ -6987,16 +7652,35 @@ cmd_rename() {
         mv "$SNAPSHOTS_DIR/$name" "$SNAPSHOTS_DIR/$newname" 2>/dev/null || true
     fi
 
-    # 4) Point the jail's hostname files at the new name.
+    # 4) Move dormant service registrations and rewrite their jail identity.
+    if [ -d "$JROOT_HOME/services/$name" ]; then
+        mv "$JROOT_HOME/services/$name" "$JROOT_HOME/services/$newname" 2>/dev/null || true
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - "$JROOT_HOME/services/$newname" "$newname" <<'PY' || true
+import json, pathlib, sys
+root, name = pathlib.Path(sys.argv[1]), sys.argv[2]
+for path in root.glob("*.json"):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            value["jail"] = name
+            path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+PY
+        fi
+    fi
+
+    # 5) Point the jail's hostname files at the new name.
     write_rootfs_niceties "$newname"
 
-    # 5) Carry the history over so provenance survives the rename.
+    # 6) Carry the history over so provenance survives the rename.
     if [ -f "$(history_file "$name")" ]; then
         mv "$(history_file "$name")" "$(history_file "$newname")" 2>/dev/null || true
     fi
     record_event "$newname" "rename" "was '$name'"
 
-    log "Renamed '$name' -> '$newname' (hostname, prompt, snapshots updated)."
+    log "Renamed '$name' -> '$newname' (hostname, prompt, snapshots, services updated)."
 }
 
 # Read-only probe of the two kernel features jroot depends on. Prints
@@ -8892,7 +9576,7 @@ clone_usage() {
     printf '    %bjroot clone snapshot <source> <label> <new-name>%b\n\n' "$G" "$N"
     printf '    Clones a saved checkpoint or snapshot without modifying the source jail.\n'
     printf '    The clone receives a fresh jail identity: host mounts, custom mounts,\n'
-    printf '    public ports, loopback allocation, and SSH host keys are not inherited.\n'
+    printf '    public ports, loopback allocation, persistent mode, and SSH host keys are not inherited.\n'
 }
 
 # Rewrite a saved configuration for a cloned jail. External host-facing state is
@@ -8915,6 +9599,8 @@ config["mount_host"] = 0
 config["mount_home"] = 0
 config["mounts"] = []
 config["ports"] = []
+# A retained session is host runtime state, not cloneable filesystem state.
+config["persistent"] = 0
 config.pop("loopback", None)
 config["clone_source"] = {"jail": source, "type": kind, "label": label}
 with open(target, "w", encoding="utf-8") as f:
@@ -9353,6 +10039,7 @@ cmd_help_cmd() {
             help_row "--build-essential=0/1" "" "Install gcc/g++/make (default 1)"
             help_row "--mount-host=0/1" "" "Bind host / to /mnt/host (default 0)"
             help_row "--mount-home=0/1" "" "Bind host \$HOME to /mnt/home (default 0)"
+            help_row "--persistent=0/1" "" "Keep a retained session available (default 0)"
             printf '\n    %bExample:%b jroot init ubuntu:22.04 --name=dev --user=unroot\n' "$G" "$N"
             printf '    %bExample:%b jroot init alpine:3.20 --name=alpine-dev\n' "$G" "$N"
             printf '    %bExample:%b jroot init --list\n' "$G" "$N"
@@ -9438,6 +10125,12 @@ cmd_help_cmd() {
         mnt)
             mnt_usage "<name>"
             ;;
+        persist)
+            persist_usage
+            ;;
+        service)
+            service_usage
+            ;;
         install)
             printf '%bjroot install%b - install packages inside a jail (apt or apk)\n\n' "$H" "$N"
             printf '    %bjroot install <name> <pkg...>%b\n' "$G" "$N"
@@ -9451,7 +10144,10 @@ cmd_help_cmd() {
             printf '    %bjroot config <name> --mount-host=0/1%b\n' "$G" "$N"
             printf '    %bjroot config <name> --mount-home=0/1%b\n' "$G" "$N"
             printf '    %bjroot config <name> --build-essential=0/1%b\n' "$G" "$N"
+            printf '    %bjroot config <name> --persistent=0/1%b\n' "$G" "$N"
             printf '    %bjroot config <name> --user=root|unroot%b\n' "$G" "$N"
+            printf '\n    Persistent mode is off by default, so an ordinary jail ends its process tree\n'
+            printf '    when its session exits. Enable it before registering services.\n'
             ;;
         list|ls)
             printf '%bjroot list%b - list all jails\n\n' "$H" "$N"
@@ -9579,7 +10275,8 @@ cmd_help_cmd() {
         ps)
             printf '%bjroot ps%b - list running jails\n\n' "$H" "$N"
             printf '    %bjroot ps%b\n' "$G" "$N"
-            printf '\n    Shows the PID and command for each running jail.\n'
+            printf '\n    Shows the PID and command for each running jail, including persistent anchors.\n'
+            printf '    Use %bjroot service <jail> status%b for watched application processes.\n' "$G" "$N"
             printf '    Stale PID files are automatically cleaned up.\n'
             ;;
         ssh)
@@ -9616,6 +10313,8 @@ cmd_help() {
     help_row "jroot enter" "<name> <cmd...>"       "Run one command inside a jail"
     help_row "jroot enter" "<name> --root <cmd>"   "Run a command as root (admin)"
     help_row "jroot exec" "<name> [--root] <cmd>"  "Run one command inside a jail"
+    help_row "jroot persist" "<name> enable|start|stop|attach" "Opt-in retained jail session"
+    help_row "jroot service" "<jail> add|list|status|remove" "Watch a process tree in a persistent jail"
     help_row "jroot file" "cp|mv <src> <dst>"      "Copy/move files between the host and jails"
     help_row "jroot sync" "[options] <src> <dst>"  "Synchronize directories between host and jails"
     help_row "jroot limit" "<name> [limits]"        "Set resource limits (mem, cpu, nofile)"
@@ -9629,7 +10328,7 @@ cmd_help() {
     help_row "jroot mnt" "<name> <label> <dir>"   "Bind-mount a host directory at /mnt/<label>"
     help_row "jroot ssh" "<name> start|stop|status" "SSH access into a jail (persistent daemon)"
     help_row "jroot install" "<name> <pkg...>"     "Install packages inside a jail (apt/apk)"
-    help_row "jroot config" "<name>"               "View or change a jail's settings"
+    help_row "jroot config" "<name>"               "View or change a jail's settings (including persistence)"
     help_row "jroot list" "[--json]"               "List all jails (JSON with --json)"
     help_row "jroot info" "[name]"                 "Show a jail's details and disk usage"
     help_row "jroot size" "[name]"                 "Show disk usage per jail"
@@ -9674,6 +10373,7 @@ cmd_help() {
     help_row "--build-essential=0/1" ""   "Install gcc/g++/make (default 1)"
     help_row "--mount-host=0/1" ""        "Bind host / to /mnt/host (default 0)"
     help_row "--mount-home=0/1" ""        "Bind host \$HOME to /mnt/home (default 0)"
+    help_row "--persistent=0/1" ""        "Opt into retained sessions (default 0)"
     printf '\n'
 
     printf '%bSUPPORTED IMAGES%b\n' "$H" "$N"
@@ -9748,7 +10448,7 @@ _jroot_home() { printf '%s' "${JROOT_HOME:-$HOME/.jroot}"; }
 
 _jroot_reserved_name() {
     case "$1" in
-        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -9781,6 +10481,17 @@ _jroot_checkpoints() {
     for f in "$(_jroot_home)"/snapshots/"$1"/checkpoints/*; do
         [ -d "$f" ] || continue
         n="${f##*/}"
+        printf '%s\n' "$n"
+    done
+}
+
+_jroot_services() {
+    local f n
+    [ -n "$1" ] || return 0
+    for f in "$(_jroot_home)"/services/"$1"/*.json; do
+        [ -f "$f" ] || continue
+        case "$f" in *.state.json) continue ;; esac
+        n="${f##*/}"; n="${n%.json}"
         printf '%s\n' "$n"
     done
 }
@@ -9905,7 +10616,7 @@ _jroot() {
     fi
     COMPREPLY=()
 
-    local cmds="init build enter exec shell install config file sync limit bundle deploy monitor compose
+    local cmds="init build enter exec persist service shell install config file sync limit bundle deploy monitor compose
         port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot
         snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill
         stop ps rm delete completion completions help plugin"
@@ -9939,7 +10650,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
             else
                 COMPREPLY=($(compgen -W "--name= --user=root --user=unroot
 --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1
---mount-home=0 --mount-home=1" -- "$cur"))
+--mount-home=0 --mount-home=1 --persistent=0 --persistent=1" -- "$cur"))
             fi
             ;;
         enter|exec)
@@ -9948,6 +10659,22 @@ alpine:3.22 alpine:edge" -- "$cur"))
             else
                 COMPREPLY=($(compgen -W "--root" -- "$cur"))
             fi
+            ;;
+        persist)
+            if [ "$idx" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$jails" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "enable disable start stop attach status" -- "$cur"))
+            fi
+            ;;
+        service)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "add list status remove rm logs" -- "$cur")) ;;
+                *) case "${w[3]:-}" in
+                       status|remove|rm|logs) COMPREPLY=($(compgen -W "$(_jroot_services "${w[2]}")" -- "$cur")) ;;
+                   esac ;;
+            esac
             ;;
         install|info|size|snapshots|checkpoints|update|snapshot|rename|rm|delete)
             if [ "$idx" -eq 2 ]; then
@@ -9963,7 +10690,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
             else
                 COMPREPLY=($(compgen -W "--show --user=root --user=unroot
 --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1
---mount-home=0 --mount-home=1" -- "$cur"))
+--mount-home=0 --mount-home=1 --persistent=0 --persistent=1" -- "$cur"))
             fi
             ;;
         file)
@@ -10192,7 +10919,7 @@ _jroot_home() { print -r -- "${JROOT_HOME:-$HOME/.jroot}" }
 
 _jroot_reserved_name() {
     case "$1" in
-        init|build|enter|exec|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -10230,6 +10957,18 @@ _jroot_checkpoints() {
     done
     (( ${#labels} )) || return 1
     _describe -t checkpoints 'checkpoint' labels
+}
+
+_jroot_services() {
+    local -a names
+    local f
+    [[ -n "$1" ]] || return 1
+    for f in $(_jroot_home)/services/$1/*.json(N); do
+        [[ "$f" == *.state.json ]] && continue
+        names+=("${f:t:r}")
+    done
+    (( ${#names} )) || return 1
+    _describe -t services 'service' names
 }
 
 _jroot_plugins() {
@@ -10303,6 +11042,8 @@ _jroot() {
         'build:build a jail from a JRootfile'
         'enter:open a shell, or run a command, inside a jail'
         'exec:run one command inside a jail'
+        'persist:retain a jail session after terminal exit'
+        'service:watch a process tree in a persistent jail'
         'shell:interactive jroot prompt'
         'install:install packages inside a jail'
         'config:view or change jail settings'
@@ -10375,11 +11116,21 @@ _jroot() {
                         alpine:3.21 alpine:3.22 alpine:edge)
                 compadd -- $images
             else
-                compadd -S '' -- --name= --user= --build-essential= --mount-host= --mount-home=
+                compadd -S '' -- --name= --user= --build-essential= --mount-host= --mount-home= --persistent=
             fi
             ;;
         enter|exec)
             if (( pos == 2 )); then _jroot_jails; else compadd -- --root; fi
+            ;;
+        persist)
+            if (( pos == 2 )); then _jroot_jails; else compadd -- enable disable start stop attach status; fi
+            ;;
+        service)
+            case $pos in
+                2) _jroot_jails ;;
+                3) compadd -- add list status remove rm logs ;;
+                *) case "${words[4]}" in status|remove|rm|logs) _jroot_services "${words[3]}" ;; esac ;;
+            esac
             ;;
         install|info|size|snapshots|update|snapshot|rename|rm|delete)
             (( pos == 2 )) && _jroot_jails
@@ -10392,7 +11143,7 @@ _jroot() {
                 _jroot_jails
             else
                 compadd -- --show
-                compadd -S '' -- --user= --build-essential= --mount-host= --mount-home=
+                compadd -S '' -- --user= --build-essential= --mount-host= --mount-home= --persistent=
             fi
             ;;
         file)
@@ -10598,6 +11349,16 @@ function __jroot_checkpoints -a jail
     end
 end
 
+function __jroot_services -a jail
+    test -n "$jail"; or return
+    set -l dir (__jroot_home)/services/$jail
+    test -d $dir; or return
+    for f in (command ls $dir 2>/dev/null)
+        string match -q '*.state.json' -- $f; and continue
+        string match -q '*.json' -- $f; and string replace -r '\.json$' '' -- $f
+    end
+end
+
 function __jroot_plugins
     set -l dir (__jroot_home)/plugins
     test -d $dir; or return
@@ -10709,6 +11470,8 @@ complete -c jroot -n '__jroot_at 1' -a init        -d 'Create a jail from an ima
 complete -c jroot -n '__jroot_at 1' -a build       -d 'Build a jail from a JRootfile'
 complete -c jroot -n '__jroot_at 1' -a enter       -d 'Open a shell inside a jail'
 complete -c jroot -n '__jroot_at 1' -a exec        -d 'Run one command inside a jail'
+complete -c jroot -n '__jroot_at 1' -a persist     -d 'Retain an explicitly enabled jail session'
+complete -c jroot -n '__jroot_at 1' -a service     -d 'Watch a process tree in a persistent jail'
 complete -c jroot -n '__jroot_at 1' -a shell       -d 'Interactive jroot prompt'
 complete -c jroot -n '__jroot_at 1' -a install     -d 'Install packages inside a jail'
 complete -c jroot -n '__jroot_at 1' -a config      -d 'View or change jail settings'
@@ -10758,7 +11521,7 @@ complete -c jroot -n '__jroot_at 1' -a help        -d 'Show help'
 # A jail name as the first argument. One long line per rule on purpose: fish
 # splits an -a list on whitespace and a backslash inside single quotes stays a
 # literal backslash, so there is no safe way to wrap these.
-complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount ssh which history logs compare kill stop rm-snapshot rm-checkpoint limit bundle' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_at 2; and __jroot_is enter exec persist service install config info size snapshots snapshot checkpoint checkpoints update rename rm delete clean port mnt mount ssh which history logs compare kill stop rm-snapshot rm-checkpoint limit bundle' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is clean; and __jroot_from 2' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is compare diff; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
 complete -c jroot -n '__jroot_is revert; and __jroot_at 2' -a 'snapshot checkpoint'
@@ -10770,11 +11533,14 @@ complete -c jroot -n '__jroot_is revert; and __jroot_arg_is 2 checkpoint; and __
 complete -c jroot -n '__jroot_is build; and __jroot_at 2' -a '--file= --tag= --build-arg= --no-cache' -F
 complete -c jroot -n '__jroot_is build; and __jroot_from 3' -a '-f --file= -t --tag= --build-arg= --no-cache' -F
 complete -c jroot -n '__jroot_is init; and __jroot_at 2' -a '--list ubuntu:16.04 ubuntu:18.04 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 ubuntu:24.10 alpine:3.19 alpine:3.20 alpine:3.21 alpine:3.22 alpine:edge'
-complete -c jroot -n '__jroot_is init; and __jroot_from 3' -a '--name= --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1'
+complete -c jroot -n '__jroot_is init; and __jroot_from 3' -a '--name= --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1 --persistent=0 --persistent=1'
 
 # enter / exec / config
 complete -c jroot -n '__jroot_is enter exec; and __jroot_from 3' -a --root
-complete -c jroot -n '__jroot_is config; and __jroot_from 3' -a '--show --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1'
+complete -c jroot -n '__jroot_is config; and __jroot_from 3' -a '--show --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1 --persistent=0 --persistent=1'
+complete -c jroot -n '__jroot_is persist; and __jroot_at 3' -a 'enable disable start stop attach status'
+complete -c jroot -n '__jroot_is service; and __jroot_at 3' -a 'add list status remove rm logs'
+complete -c jroot -n '__jroot_is service; and __jroot_arg_is 3 status remove rm logs; and __jroot_at 4' -a '(__jroot_services (__jroot_arg 2))' -d service
 
 # file and sync use jail-aware paths. -F keeps ordinary host paths available.
 complete -c jroot -n '__jroot_is file; and __jroot_at 2' -a 'cp mv'
@@ -10833,7 +11599,7 @@ complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
 complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
 complete -c jroot -n '__jroot_is doctor' -a '--fix --mute=7d --mute=forever --mute=off'
 complete -c jroot -n '__jroot_is completion completions; and __jroot_at 2' -a 'bash zsh fish'
-complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec shell install config file sync limit bundle deploy monitor compose port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec persist service shell install config file sync limit bundle deploy monitor compose port net mnt mount ssh list ls info size history logs compare diff which doctor snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
 complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
 FISH_COMPLETION_EOF
 }
@@ -10845,6 +11611,8 @@ jroot_cmd() {
         build)         shift; cmd_build "$@" ;;
         enter)         shift; cmd_enter "$@" ;;
         exec)          shift; cmd_exec "$@" ;;
+        persist)       shift; cmd_persist "$@" ;;
+        service)       shift; cmd_service "$@" ;;
         file)          shift; cmd_file "$@" ;;
         sync)          shift; cmd_sync "$@" ;;
         limit)         shift; cmd_limit "$@" ;;
@@ -10915,6 +11683,7 @@ cmd_shell() {
 main() {
     [ $# -ge 1 ] || { cmd_help; exit 0; }
     case "$1" in
+        __persist-anchor) shift; persist_anchor "$@" ;;
         shell)         shift; cmd_shell "$@" ;;
         *)             jroot_cmd "$@" ;;
     esac

@@ -11,7 +11,7 @@ export JROOT_HOME="$tmp/home"
 
 mkdir -p "$JROOT_HOME/configs" "$JROOT_HOME/roots/dev/etc" \
          "$JROOT_HOME/snapshots/dev/checkpoints/baseline" \
-         "$JROOT_HOME/plugins/ledger"
+         "$JROOT_HOME/plugins/ledger" "$JROOT_HOME/services/dev"
 : > "$JROOT_HOME/snapshots/dev/before-test.tar.gz"
 printf '%s\n' '{"name":"dev","image":"ubuntu:22.04"}' > "$JROOT_HOME/configs/dev.json"
 printf '%s\n' '{"name":"diff"}' > "$JROOT_HOME/configs/diff.json"
@@ -19,13 +19,14 @@ printf '%s\n' '{"name":"rename"}' > "$JROOT_HOME/configs/rename.json"
 printf '%s\n' '{"name":"init"}' > "$JROOT_HOME/configs/init.json"
 printf '%s\n' '{"name":"clone"}' > "$JROOT_HOME/configs/clone.json"
 printf '%s\n' '{"name":"ledger","version":"1.0.0"}' > "$JROOT_HOME/plugins/ledger/plugin.json"
+printf '%s\n' '{"service":"web","pid":4242}' > "$JROOT_HOME/services/dev/web.json"
 
 bash "$root/jroot" completion zsh > "$tmp/_jroot"
 bash "$root/jroot" completion fish > "$tmp/jroot.fish"
 
 if command -v zsh >/dev/null 2>&1; then
     zsh -n "$tmp/_jroot"
-    zsh -f -c 'autoload -Uz compinit; compinit -D; source "$1"; whence -w _jroot; whence -w _jroot_checkpoints; whence -w _jroot_plugins; for name in init build enter exec shell install file sync limit bundle deploy monitor compose port net mnt mount config list ls info history compare diff which size update clean snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh completion completions plugin help data logs status registry; do _jroot_reserved_name "$name" || exit 1; done; _jroot_reserved_name dev && exit 1; exit 0' zsh "$tmp/_jroot" >/dev/null
+    zsh -f -c 'autoload -Uz compinit; compinit -D; source "$1"; whence -w _jroot; whence -w _jroot_checkpoints; whence -w _jroot_plugins; for name in init build enter exec persist service shell install file sync limit bundle deploy monitor compose port net mnt mount config list ls info history compare diff which size update clean snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh completion completions plugin help data logs status registry; do _jroot_reserved_name "$name" || exit 1; done; _jroot_reserved_name dev && exit 1; exit 0' zsh "$tmp/_jroot" >/dev/null
     printf 'zsh completion parses and registers helpers\n'
 else
     printf 'zsh not installed; static completion coverage still checked\n'
@@ -79,6 +80,9 @@ require_candidate 'clone snapshot dev ' before-test
 require_candidate 'rm-checkpoint dev ' baseline
 require_candidate 'plugin service ' start
 require_candidate 'plugin service start ' ledger
+require_candidate 'persist dev ' start
+require_candidate 'service dev ' add
+require_candidate 'service dev status ' web
 FISH
     mkdir -p "$tmp/fish-config" "$tmp/fish-data"
     XDG_CONFIG_HOME="$tmp/fish-config" XDG_DATA_HOME="$tmp/fish-data" \

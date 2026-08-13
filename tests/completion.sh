@@ -16,7 +16,7 @@ rm -rf "$JROOT_HOME"
 mkdir -p "$JROOT_HOME/configs" "$JROOT_HOME/snapshots/dev/checkpoints/baseline" "$JROOT_HOME/snapshots/dev/checkpoints/changed" \
          "$JROOT_HOME/roots/dev/etc/nginx" "$JROOT_HOME/roots/dev/usr/local/bin" \
          "$JROOT_HOME/roots/dev/root" "$JROOT_HOME/roots/web/etc" \
-         "$JROOT_HOME/plugins/ledger"
+         "$JROOT_HOME/plugins/ledger" "$JROOT_HOME/services/dev"
 printf '%s\n' '{"name":"dev","image":"ubuntu:22.04","user":"root","ports":[3000,8080],"mounts":[["work","/tmp/w","ro"],["src","/tmp/s","rw"]]}' \
     > "$JROOT_HOME/configs/dev.json"
 printf '%s\n' '{"name":"web","image":"ubuntu:24.04","user":"unroot","ports":[],"mounts":[]}' \
@@ -25,6 +25,7 @@ printf '%s\n' '{"name":"web","image":"ubuntu:24.04","user":"unroot","ports":[],"
 : > "$JROOT_HOME/snapshots/dev/clean.tar.gz"
 : > "$JROOT_HOME/roots/dev/root/app.tar.gz"
 printf '%s\n' '{"name":"ledger","version":"1.0.0"}' > "$JROOT_HOME/plugins/ledger/plugin.json"
+printf '%s\n' '{"service":"web","pid":4242}' > "$JROOT_HOME/services/dev/web.json"
 : > "$JROOT_HOME/plugins/audit.py"
 : > "$root/.build/completion-bundle.tar.gz"
 : > "$root/.build/jroot-compose.yml"
@@ -66,6 +67,8 @@ try 'jroot delet'                     'delete'
 try 'jroot com'                       'compare'
 try 'jroot bui'                       'build'
 try 'jroot clo'                       'clone'
+try 'jroot pers'                      'persist'
+try 'jroot serv'                      'service'
 echo "jail names"
 try 'jroot enter '                    'dev'
 try 'jroot enter d'                   'dev'
@@ -122,12 +125,17 @@ try 'jroot net '                      'dev'
 try 'jroot net set '                  'web'
 try 'jroot net set web '              'auto'
 try 'jroot limit dev --'              '--mem='
+try 'jroot persist dev '              'start'
+try 'jroot service dev '              'add'
+try 'jroot service dev status '       'web'
 echo "flags"
 try 'jroot ssh dev '                  'status'
 try 'jroot ssh dev start --'          '--random-password'
 try 'jroot ssh dev start --p'         '--port='
 try 'jroot init '                     'ubuntu:22.04'
 try 'jroot init ubuntu:22.04 --u'     '--user=root'
+try 'jroot init ubuntu:22.04 --p'     '--persistent=1'
+try 'jroot config dev --p'            '--persistent=1'
 try 'jroot list --'                   '--json'
 try 'jroot history dev --l'           '--limit='
 try 'jroot logs '                      'dev'
@@ -142,6 +150,8 @@ try 'jroot completions '              'fish'
 try 'jroot help '                     'sync'
 try 'jroot help '                     'ssh'
 try 'jroot help '                     'clone'
+try 'jroot help '                     'persist'
+try 'jroot help '                     'service'
 try 'jroot help lo'                     'logs'
 try 'jroot help file '                'cp'
 

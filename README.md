@@ -863,7 +863,7 @@ jroot clone checkpoint dev pre-patch dev-investigation
 jroot clone snapshot dev before-major-upgrade dev-archive-test
 ```
 
-The clone receives the saved rootfs and configuration, but JRoot deliberately gives it a fresh host-facing identity. It clears public ports, host and custom mounts, and any assigned loopback address; it also removes inherited SSH host keys so `jroot ssh <clone> start` generates a distinct server identity. The source jail, checkpoint, and snapshot are not modified.
+The clone receives the saved rootfs and configuration, but JRoot deliberately gives it a fresh host-facing identity. It clears public ports, host and custom mounts, any assigned loopback address, and persistent-session mode; it also removes inherited SSH host keys so `jroot ssh <clone> start` generates a distinct server identity. The source jail, checkpoint, and snapshot are not modified.
 
 ### Useful commands
 
@@ -987,9 +987,55 @@ The jail's hostname, `/etc/hosts`, and shell prompt are also updated to reflect 
 
 # 🛑 Managing running jails
 
+### Persistent sessions and watched services
+
+An ordinary `jroot enter dev` session is deliberately **session-bound**. When its PRoot process exits, the associated process tree exits too. This is the default because it prevents a forgotten shell from becoming an accidental daemon.
+
+Enable persistence only for a jail that is meant to retain work after the terminal closes:
+
+```bash
+jroot config dev --persistent=1
+jroot persist dev start
+jroot enter dev
+```
+
+For a new jail, the same opt-in can be recorded at creation time without starting anything yet:
+
+```bash
+jroot init ubuntu:22.04 --name=dev --persistent=1
+```
+
+The first `persist start` launches one detached jail anchor and a retained `tmux` shell. Later plain `jroot enter dev` calls attach to that shell. Start the application there, then detach from tmux with `Ctrl-b d`; the application remains part of the retained jail. `jroot persist dev status` reports the anchor, `jroot persist dev stop` terminates every retained pane and its child processes, and `jroot config dev --persistent=0` is accepted only after the anchor has been stopped.
+
+> A persistent mode setting is saved with the jail configuration, including snapshots and bundles. The **live** process tree is never serialized: after a restore or deploy, explicitly run `jroot persist <name> start` before attaching again.
+
+`jroot service` is available only after persistence is enabled and the anchor is running. It intentionally registers a real process you have already inspected instead of guessing a restart command:
+
+```bash
+# Inside the persistent jail shell, start the application and inspect it.
+$ ps aux
+USER       PID  ... COMMAND
+root      4242  ... node server.js
+
+# On the host, attach the watchdog to that PID.
+jroot service dev add web 4242
+jroot service dev status web
+```
+
+The watchdog samples the selected process tree twice per second. It records spawned descendants, adopts a surviving descendant if the originally selected parent exits, and records an `exited` state when no member remains. The registration is updated to the adopted child PID and start time, so PID reuse cannot silently turn a dead service into an unrelated host process. Use `jroot service dev list`, `jroot service dev logs web`, or `jroot service dev remove web` to inspect or remove a registration; removing it leaves the application alone.
+
+| Command | Purpose |
+|---|---|
+| `jroot persist <name> enable` | Enable the explicit persistence setting. `jroot config <name> --persistent=1` is equivalent. |
+| `jroot persist <name> start` | Start the retained jail anchor. |
+| `jroot persist <name> attach` | Attach to the retained tmux shell; plain `jroot enter <name>` does the same. |
+| `jroot persist <name> stop` | Stop the anchor, panes, and their application child groups. |
+| `jroot service <name> add <service> <pid>` | Register a PID from the persistent jail for real-time process-tree observation. |
+| `jroot service <name> status [service]` | Show the watched PID, command, descendants, and latest transition. |
+
 ### `jroot ps` – list running jails
 
-Shows every jail that currently has an active interactive shell or SSH daemon:
+Shows every jail that currently has an active interactive shell, persistent anchor, or SSH daemon. Use `jroot service <name> status` for application-level watched processes:
 
 ```bash
 jroot ps
@@ -1019,7 +1065,7 @@ jroot kill dev --force
 
 The jail's rootfs and configuration are left intact — you can restart it with `jroot enter dev` later.
 
-Note that `jroot kill` targets the interactive shell. To stop an SSH daemon, use `jroot ssh <name> stop`.
+`jroot kill` targets an interactive shell when one exists; for a persistent jail it performs the same clean shutdown as `jroot persist <name> stop`. To stop only an SSH daemon, use `jroot ssh <name> stop`.
 
 
 ### Monitoring active jails
@@ -1471,6 +1517,8 @@ CREATE & USE
   jroot enter <name> <command>     Run a command inside a jail
   jroot enter <name> --root ...    Run a command as root
   jroot exec <name> [--root] <cmd> Run one command (no shell wrapping)
+  jroot persist <name> enable|start|stop|attach|status  Retain an opt-in jail session
+  jroot service <jail> add|list|status|remove           Watch a persistent process tree
   jroot shell                      Interactive jroot command shell
   jroot install <name> <packages>  Install apt packages
   jroot config <name>              Configure a jail
@@ -1524,7 +1572,8 @@ MAINTENANCE
   jroot clean <name>...            Free disk space inside a jail
   jroot rename <name> <newname>    Rename a jail
   jroot kill <name>                Terminate a running jail
-  jroot ps                         List running jails
+  jroot ps                         List running jails and persistent anchors
+  jroot persist <name> stop         Stop a retained jail and its child groups
   jroot ssh <name> start [port]    Start SSH daemon (persistent, auto port)
   jroot ssh <name> stop            Stop SSH daemon
   jroot ssh <name> status          Check SSH daemon status (verifies handshake)
