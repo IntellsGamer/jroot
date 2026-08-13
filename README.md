@@ -1007,6 +1007,8 @@ jroot init ubuntu:22.04 --name=dev --persistent=1
 
 The first `persist start` launches one detached jail anchor and a retained `tmux` shell. Later plain `jroot enter dev` calls attach to that shell. Start the application there, then detach from tmux with `Ctrl-b d`; the application remains part of the retained jail. `jroot persist dev status` reports the anchor, `jroot persist dev stop` terminates every retained pane and its child processes, and `jroot config dev --persistent=0` is accepted only after the anchor has been stopped.
 
+If `exit` has already closed the shell, tmux deliberately leaves a `Pane is dead (status 0)` display instead of silently ending the retained session. It is still safe to leave: press `Ctrl-b d` to detach. If the shortcut is unavailable, open the tmux command prompt with `Ctrl-b :`, type `detach-client`, and press `Enter`. A later `jroot enter <name>` respawns a fresh shell pane; use `jroot persist <name> stop` only when you intend to stop the entire retained jail.
+
 > A persistent mode setting is saved with the jail configuration, including snapshots and bundles. The **live** process tree is never serialized: after a restore or deploy, explicitly run `jroot persist <name> start` before attaching again.
 
 `jroot service` is available only after persistence is enabled and the anchor is running. It intentionally registers a real process you have already inspected instead of guessing a restart command:
