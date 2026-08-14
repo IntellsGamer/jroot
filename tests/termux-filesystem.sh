@@ -11,6 +11,8 @@ export JROOT_HOME="$TMP/home"
 export JROOT_FORCE_NO_HARDLINKS=1
 export JROOT_FORCE_LINK_SAFE_EXTRACT=1
 export JROOT_SKIP_BOOTSTRAP=1
+printf 'nameserver 1.1.1.1\n' > "$TMP/host-resolv.conf"
+export JROOT_HOST_RESOLV_CONF="$TMP/host-resolv.conf"
 
 sed '$d' "$ROOT/jroot" > "$TMP/jroot-lib.sh"
 # shellcheck disable=SC1090
@@ -30,7 +32,6 @@ export PYTHONPATH="$TMP/python-no-link${PYTHONPATH:+:$PYTHONPATH}"
 # path; the cached archive below contains a deliberate hard-link member.
 ensure_runtime() { mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$CACHE_DIR" "$SNAPSHOTS_DIR" "$HISTORY_DIR"; }
 install_proot() { :; }
-config_apt() { :; }
 write_sudoers() { :; }
 verify_jail() { [ -f "$ROOTS_DIR/$1/etc/os-release" ]; }
 record_event() { :; }
@@ -39,6 +40,9 @@ trigger_event_hooks() { :; }
 fixture="$TMP/rootfs"
 mkdir -p "$fixture/etc" "$fixture/bin" "$fixture/usr/bin"
 printf 'NAME=Termux fixture\n' > "$fixture/etc/os-release"
+# Ubuntu base archives often carry this link, but /run does not yet exist when
+# JRoot configures a fresh rootfs. Termux must receive a plain copied resolver.
+ln -s /run/systemd/resolve/stub-resolv.conf "$fixture/etc/resolv.conf"
 printf '#!/bin/sh\nexit 0\n' > "$fixture/bin/sh"
 chmod +x "$fixture/bin/sh"
 printf 'shared program data\n' > "$fixture/usr/bin/tool"
@@ -53,6 +57,25 @@ rootfs="$ROOTS_DIR/termux-init"
 [ "$(cat "$rootfs/usr/bin/tool")" = 'shared program data' ]
 [ "$(cat "$rootfs/usr/bin/tool-alias")" = 'shared program data' ]
 [ "$(stat -c '%i' "$rootfs/usr/bin/tool")" != "$(stat -c '%i' "$rootfs/usr/bin/tool-alias")" ]
+[ -f "$rootfs/etc/resolv.conf" ]
+[ ! -L "$rootfs/etc/resolv.conf" ]
+[ -s "$rootfs/etc/resolv.conf" ]
+
+# A failed network update must return a failed bootstrap. The old script ignored
+# apt-get update errors and reached its success marker regardless.
+printf '%s\n' '{"name":"bootstrap-failure","build_essential":0}' > "$CONFIGS_DIR/bootstrap-failure.json"
+run_in_jail() {
+    local script="${@: -1}"
+    apt-get() { return 1; }
+    dpkg() { return 0; }
+    export -f apt-get dpkg
+    bash -c "$script"
+}
+if bootstrap_ubuntu bootstrap-failure jammy >/dev/null 2>&1; then
+    printf 'bootstrap accepted a failed apt-get update\n' >&2
+    exit 1
+fi
+unset -f run_in_jail
 
 # Checkpoints, restore, and checkpoint clones must avoid rsync --link-dest on a
 # no-link filesystem and leave every mutable copy independent.
@@ -74,4 +97,4 @@ cmd_clone snapshot termux-init termux-snapshot termux-snapshot-clone >/dev/null
 [ "$(cat "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool")" = 'shared program data' ]
 [ "$(stat -c '%i' "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool")" != "$(stat -c '%i' "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool-alias")" ]
 
-printf '  ok    Termux-style no-hardlink and no-os.link init, checkpoints, restore, and clones work\n'
+printf '  ok    Termux resolver repair, no-hardlink init, bootstrap failure, checkpoints, restore, and clones work\n'
