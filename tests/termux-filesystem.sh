@@ -108,7 +108,13 @@ if (
     exit 1
 fi
 
-# A PRoot launch over this no-hardlink rootfs must use the native
+# Termux's CA bundle must be copied into the Ubuntu location APT expects.
+mkdir -p "$TMP/termux-prefix/etc/tls"
+printf 'termux-test-ca\n' > "$TMP/termux-prefix/etc/tls/cert.pem"
+TERMUX_VERSION=1 PREFIX="$TMP/termux-prefix" config_apt termux-init jammy
+cmp "$TMP/termux-prefix/etc/tls/cert.pem" "$rootfs/etc/ssl/certs/ca-certificates.crt"
+
+# A Termux PRoot launch over this no-hardlink rootfs must use the native
 # link-to-symlink compatibility flag so dpkg can create status-old safely.
 cat > "$TMP/fake-proot" <<'SH'
 #!/bin/sh
@@ -120,9 +126,16 @@ printf '%s\n' "$@" > "$JROOT_TEST_PROOT_ARGS"
 SH
 chmod +x "$TMP/fake-proot"
 export JROOT_TEST_PROOT_ARGS="$TMP/proot-args"
-PROOT_BIN="$TMP/fake-proot" SECCOMP_LAUNCHER="$TMP/no-seccomp" \
+TERMUX_VERSION=1 PROOT_BIN="$TMP/fake-proot" SECCOMP_LAUNCHER="$TMP/no-seccomp" \
     JROOT_SHIM_OFF=1 JROOT_LANDLOCK_OFF=1 run_in_jail termux-init /bin/true
 grep -qx -- '--link2symlink' "$JROOT_TEST_PROOT_ARGS"
+
+# A generic Linux filesystem may fail the same probe but must retain normal
+# PRoot semantics; only an actual Termux host receives --link2symlink.
+rm -f "$JROOT_TEST_PROOT_ARGS"
+TERMUX_VERSION= PROOT_BIN="$TMP/fake-proot" SECCOMP_LAUNCHER="$TMP/no-seccomp" \
+    JROOT_SHIM_OFF=1 JROOT_LANDLOCK_OFF=1 run_in_jail termux-init /bin/true
+! grep -qx -- '--link2symlink' "$JROOT_TEST_PROOT_ARGS"
 
 # Checkpoints, restore, and checkpoint clones must avoid rsync --link-dest on a
 # no-link filesystem and leave every mutable copy independent.
