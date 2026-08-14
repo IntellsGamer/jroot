@@ -2891,6 +2891,15 @@ copy_host_resolver() {
     [ -s "$dest" ]
 }
 
+repair_jail_resolver() {
+    local name="$1" rootfs="$ROOTS_DIR/$1" resolver="$ROOTS_DIR/$1/etc/resolv.conf"
+    # Do not replace a normal file or a functioning user-managed symlink. Only
+    # the broken image-default link into an absent /run needs intervention.
+    if [ -L "$resolver" ] && [ ! -e "$resolver" ]; then
+        copy_host_resolver "$rootfs" || warn "Could not repair DNS for '$name'; the host resolver is unavailable."
+    fi
+}
+
 config_apt() {
     local name="$1" codename="$2"
     local rootfs="$ROOTS_DIR/$name"
@@ -3682,6 +3691,10 @@ run_in_jail() {
     mount_host="$(config_field "$cfg" mount_host)"; [ -n "$mount_host" ] || mount_host=0
     mount_home="$(config_field "$cfg" mount_home)"; [ -n "$mount_home" ] || mount_home=0
     image="$(config_field "$cfg" image)"
+
+    # Repair only the broken image-default /run resolver link, so an upgraded
+    # JRoot heals existing Termux jails without overwriting valid DNS settings.
+    repair_jail_resolver "$name"
 
     # Keep /etc/hosts in step with the host on every entry: the kernel hostname
     # a jailed process sees is the host's, and it changes when the machine is

@@ -61,6 +61,15 @@ rootfs="$ROOTS_DIR/termux-init"
 [ ! -L "$rootfs/etc/resolv.conf" ]
 [ -s "$rootfs/etc/resolv.conf" ]
 
+# Existing Termux jails created before the repair are healed on their next run
+# only when their resolver remains the broken image-default symlink.
+rm -f "$rootfs/etc/resolv.conf"
+ln -s /run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf"
+repair_jail_resolver termux-init
+[ -f "$rootfs/etc/resolv.conf" ]
+[ ! -L "$rootfs/etc/resolv.conf" ]
+grep -qx 'nameserver 1.1.1.1' "$rootfs/etc/resolv.conf"
+
 # A failed network update must return a failed bootstrap. The old script ignored
 # apt-get update errors and reached its success marker regardless.
 printf '%s\n' '{"name":"bootstrap-failure","build_essential":0}' > "$CONFIGS_DIR/bootstrap-failure.json"
