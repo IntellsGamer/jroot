@@ -3724,6 +3724,10 @@ cmd_volume() {
 # ---------------------------------------------------------------------------
 # Run a command inside a jail (proot wrapper, migrated from fakeroot3.sh)
 # ---------------------------------------------------------------------------
+proot_link2symlink_supported() {
+    "$PROOT_BIN" --help 2>&1 | grep -q -- '--link2symlink'
+}
+
 run_in_jail() {
     local force_root=0
     if [ "$1" = "--root" ]; then
@@ -3755,6 +3759,12 @@ run_in_jail() {
     jail_lb="$(jail_loopback_addr "$name")"
 
     local proot_args=(-k "$PROOT_KERNEL_RELEASE")
+    # Termux's app-data filesystem can create files but rejects hard links.
+    # dpkg uses one for status-old before changing its database; PRoot's native
+    # link-to-symlink emulation preserves the intended backup semantics there.
+    if ! filesystem_supports_hardlinks "$rootfs" && proot_link2symlink_supported; then
+        proot_args+=(--link2symlink)
+    fi
     HOSTNAME="$name"
     # Only the ordinary unroot user is constrained here. Explicit --root
     # maintenance remains fully writable. SSH needs a private runtime overlay

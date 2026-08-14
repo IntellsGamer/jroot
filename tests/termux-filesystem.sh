@@ -94,18 +94,35 @@ grep -qx 'nameserver 10.23.0.2' "$rootfs/etc/resolv.conf"
 # A failed network update must return a failed bootstrap. The old script ignored
 # apt-get update errors and reached its success marker regardless.
 printf '%s\n' '{"name":"bootstrap-failure","build_essential":0}' > "$CONFIGS_DIR/bootstrap-failure.json"
-run_in_jail() {
-    local script="${@: -1}"
-    apt-get() { return 1; }
-    dpkg() { return 0; }
-    export -f apt-get dpkg
-    bash -c "$script"
-}
-if bootstrap_ubuntu bootstrap-failure jammy >/dev/null 2>&1; then
+if (
+    run_in_jail() {
+        local script="${@: -1}"
+        apt-get() { return 1; }
+        dpkg() { return 0; }
+        export -f apt-get dpkg
+        bash -c "$script"
+    }
+    bootstrap_ubuntu bootstrap-failure jammy
+) >/dev/null 2>&1; then
     printf 'bootstrap accepted a failed apt-get update\n' >&2
     exit 1
 fi
-unset -f run_in_jail
+
+# A PRoot launch over this no-hardlink rootfs must use the native
+# link-to-symlink compatibility flag so dpkg can create status-old safely.
+cat > "$TMP/fake-proot" <<'SH'
+#!/bin/sh
+if [ "${1:-}" = "--help" ]; then
+    printf '%s\n' '  -l, --link2symlink'
+    exit 0
+fi
+printf '%s\n' "$@" > "$JROOT_TEST_PROOT_ARGS"
+SH
+chmod +x "$TMP/fake-proot"
+export JROOT_TEST_PROOT_ARGS="$TMP/proot-args"
+PROOT_BIN="$TMP/fake-proot" SECCOMP_LAUNCHER="$TMP/no-seccomp" \
+    JROOT_SHIM_OFF=1 JROOT_LANDLOCK_OFF=1 run_in_jail termux-init /bin/true
+grep -qx -- '--link2symlink' "$JROOT_TEST_PROOT_ARGS"
 
 # Checkpoints, restore, and checkpoint clones must avoid rsync --link-dest on a
 # no-link filesystem and leave every mutable copy independent.
@@ -127,4 +144,4 @@ cmd_clone snapshot termux-init termux-snapshot termux-snapshot-clone >/dev/null
 [ "$(cat "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool")" = 'shared program data' ]
 [ "$(stat -c '%i' "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool")" != "$(stat -c '%i' "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool-alias")" ]
 
-printf '  ok    Termux resolver repair, no-hardlink init, bootstrap failure, checkpoints, restore, and clones work\n'
+printf '  ok    Termux DNS, link-to-symlink dpkg support, no-hardlink init, bootstrap failure, checkpoints, restore, and clones work\n'
