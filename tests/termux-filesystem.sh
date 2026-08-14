@@ -28,6 +28,19 @@ if hasattr(os, "link"):
 PY
 export PYTHONPATH="$TMP/python-no-link${PYTHONPATH:+:$PYTHONPATH}"
 
+# Simulate Android's DNS-property interface when no readable resolver file is
+# available; real Termux exposes this through getprop or /system/bin/getprop.
+mkdir -p "$TMP/android-bin"
+cat > "$TMP/android-bin/getprop" <<'SH'
+#!/bin/sh
+case "$1" in
+  net.dns1) printf '10.23.0.1\n' ;;
+  net.dns2) printf '10.23.0.2\n' ;;
+esac
+SH
+chmod +x "$TMP/android-bin/getprop"
+export PATH="$TMP/android-bin:$PATH"
+
 # Keep cmd_init deterministic while retaining the real get_ubuntu extraction
 # path; the cached archive below contains a deliberate hard-link member.
 ensure_runtime() { mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$CACHE_DIR" "$SNAPSHOTS_DIR" "$HISTORY_DIR"; }
@@ -69,6 +82,14 @@ repair_jail_resolver termux-init
 [ -f "$rootfs/etc/resolv.conf" ]
 [ ! -L "$rootfs/etc/resolv.conf" ]
 grep -qx 'nameserver 1.1.1.1' "$rootfs/etc/resolv.conf"
+
+# When Termux has no readable resolver file, Android DNS properties supply the
+# nameservers instead of leaving the jail without networking.
+rm -f "$rootfs/etc/resolv.conf"
+ln -s /run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf"
+JROOT_HOST_RESOLV_CONF="$TMP/no-such-resolver" repair_jail_resolver termux-init
+grep -qx 'nameserver 10.23.0.1' "$rootfs/etc/resolv.conf"
+grep -qx 'nameserver 10.23.0.2' "$rootfs/etc/resolv.conf"
 
 # A failed network update must return a failed bootstrap. The old script ignored
 # apt-get update errors and reached its success marker regardless.
