@@ -2700,12 +2700,21 @@ with tarfile.open(archive, "r:*") as tar:
                 target = member_path(str(Path(member.name).parent / member.linkname))
             unlink_path(output)
             try:
-                if force_no_links:
-                    raise OSError("forced no-hardlink mode")
-                os.link(target, output)
-            except OSError:
+                link = getattr(os, "link", None)
+                if force_no_links or not callable(link):
+                    raise OSError("hard links unavailable")
+                link(target, output)
+            except (OSError, AttributeError):
+                # Some Termux Python builds omit os.link entirely. A private
+                # copy is deliberate here: this fallback runs only after the
+                # filesystem rejected tar's hard links, and it preserves a
+                # usable rootfs without requiring link support in Python.
                 with open(target, "rb") as src, open(output, "wb") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
+                try:
+                    shutil.copystat(target, output, follow_symlinks=False)
+                except OSError:
+                    pass
             continue
         if member.isfile():
             source = tar.extractfile(member)

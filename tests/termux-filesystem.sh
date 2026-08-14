@@ -16,6 +16,16 @@ sed '$d' "$ROOT/jroot" > "$TMP/jroot-lib.sh"
 # shellcheck disable=SC1090
 source "$TMP/jroot-lib.sh"
 
+# Some Termux Python builds omit os.link rather than exposing a syscall that
+# fails. Make the embedded extractor see that exact API surface.
+mkdir -p "$TMP/python-no-link"
+cat > "$TMP/python-no-link/sitecustomize.py" <<'PY'
+import os
+if hasattr(os, "link"):
+    del os.link
+PY
+export PYTHONPATH="$TMP/python-no-link${PYTHONPATH:+:$PYTHONPATH}"
+
 # Keep cmd_init deterministic while retaining the real get_ubuntu extraction
 # path; the cached archive below contains a deliberate hard-link member.
 ensure_runtime() { mkdir -p "$ROOTS_DIR" "$CONFIGS_DIR" "$CACHE_DIR" "$SNAPSHOTS_DIR" "$HISTORY_DIR"; }
@@ -64,4 +74,4 @@ cmd_clone snapshot termux-init termux-snapshot termux-snapshot-clone >/dev/null
 [ "$(cat "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool")" = 'shared program data' ]
 [ "$(stat -c '%i' "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool")" != "$(stat -c '%i' "$ROOTS_DIR/termux-snapshot-clone/usr/bin/tool-alias")" ]
 
-printf '  ok    Termux-style no-hardlink init, checkpoints, restore, and clones work\n'
+printf '  ok    Termux-style no-hardlink and no-os.link init, checkpoints, restore, and clones work\n'
