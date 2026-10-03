@@ -363,6 +363,11 @@ Setting a mirror rewrites the jail's `sources.list` immediately; run
 `apt-get update` inside afterwards. Invalid URLs are rejected, and a stored
 invalid value falls back to the default instead of poisoning APT.
 
+On Ubuntu 24.04+ the image ships a DEB822 `ubuntu.sources` file: JRoot
+removes that stock file when it writes its own list, otherwise APT sees the
+same archive URL twice with different `Trusted` values and refuses to read
+any sources at all.
+
 ---
 
 # 🌐 Networking
