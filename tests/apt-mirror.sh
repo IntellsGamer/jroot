@@ -42,7 +42,7 @@ unset JROOT_APT_MIRROR
 # 2) Debian-only host config -> builtin default.
 mkdir -p "$TMP/debian-apt/sources.list.d"
 printf 'deb https://deb.debian.org/debian/ bookworm main\n' > "$TMP/debian-apt/sources.list"
-JROOT_HOST_APT_DIR="$TMP/debian-apt" jail_apt_mirror m1 | grep -qx 'https://mirrors.mit.edu/ubuntu'
+JROOT_HOST_APT_DIR="$TMP/debian-apt" jail_apt_mirror m1 | grep -qx 'https://archive.ubuntu.com/ubuntu'
 JROOT_HOST_APT_DIR="$TMP/debian-apt" host_apt_mirror && { printf 'debian host produced a mirror\n' >&2; exit 1; } || true
 export JROOT_HOST_APT_DIR="$TMP/host-apt"
 
@@ -59,7 +59,7 @@ unset JROOT_APT_MIRROR
 
 # 5) non-http(s) garbage falls back to builtin, never poisons apt.
 set_config_field "$CONFIGS_DIR/m1.json" apt_mirror "ftp://evil.example/ubuntu"
-[ "$(jail_apt_mirror m1)" = "https://mirrors.mit.edu/ubuntu" ]
+[ "$(jail_apt_mirror m1)" = "https://archive.ubuntu.com/ubuntu" ]
 
 # 6) `jroot apt config` show/set/reset through the real CLI.
 set_config_field "$CONFIGS_DIR/m1.json" apt_mirror ""

@@ -151,7 +151,7 @@ UBUNTU_VERSIONS="16.04:xenial 18.04:bionic 20.04:focal 22.04:jammy 23.04:lunar 2
 # Default Ubuntu archive mirror. Per-jail override via `jroot config <name>
 # --mirror=<url>` (or --mirror on init, or JROOT_APT_MIRROR). Any http(s) host
 # works; the default is unchanged unless overridden.
-DEFAULT_APT_MIRROR="https://mirrors.mit.edu/ubuntu"
+DEFAULT_APT_MIRROR="https://archive.ubuntu.com/ubuntu"
 
 # Normalize + validate a mirror base URL. Prints the canonical URL (no
 # trailing slash) or fails. Only http/https are accepted.
