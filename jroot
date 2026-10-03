@@ -3768,7 +3768,13 @@ run_in_jail() {
     local jail_lb
     jail_lb="$(jail_loopback_addr "$name")"
 
-    local proot_args=(-k "$PROOT_KERNEL_RELEASE")
+    # -k fakes uname for the guest. Only pass it when JROOT_KERNEL is set
+    # explicitly: the bundled proot mishandles the override on some
+    # host/guest combos (Ubuntu 22.04 guest loader dies with EINVAL on
+    # *any* -k value, including the real release). Omitting it reports the
+    # real kernel, which works.
+    local proot_args=()
+    [ -n "${JROOT_KERNEL:-}" ] && proot_args+=(-k "$PROOT_KERNEL_RELEASE")
     # Only Termux's app-data filesystem needs PRoot link-to-symlink emulation.
     # Other no-hardlink filesystems use JRoot's private-copy lifecycle fallback
     # without changing PRoot's normal hard-link semantics.
@@ -3989,10 +3995,17 @@ run_in_jail() {
         landlock_allow /dev "$LANDLOCK_FULL"
         landlock_allow /proc "$LANDLOCK_FULL"
         landlock_allow /sys "$LANDLOCK_FULL"
-        # proot itself is exec'd from BIN_DIR *after* restrict_self, and the shim
-        # is dlopen'd from there, so read+execute here is mandatory - without it
-        # the execv() of proot fails with EACCES and nothing runs.
+        # proot itself is exec'd from BIN_DIR *after* restrict_self, and the
+        # shim is dlopen'd from there, so read+execute here is mandatory.
+        # Additionally, proot is a dynamic binary: the kernel must also open
+        # its ELF interpreter and shared libraries from the HOST. Without
+        # read+execute on those directories the execv() of proot fails with
+        # EACCES and nothing runs (observed on Debian 12 / kernel 6.1:
+        # zero warnings, just EACCES).
         landlock_allow "$BIN_DIR" "$LANDLOCK_RX"
+        for _ld in /lib64 /lib /usr/lib /usr/lib64; do
+            [ -e "$_ld" ] && landlock_allow "$_ld" "$LANDLOCK_RX"
+        done
         # proot builds its "glue rootfs" in a temp dir on the HOST before it can
         # run anything. Without write access there it dies with
         #   can't create temporary directory: Permission denied
