@@ -147,6 +147,57 @@ case "$ARCH" in
 esac
 
 UBUNTU_VERSIONS="16.04:xenial 18.04:bionic 20.04:focal 22.04:jammy 23.04:lunar 23.10:mantic 24.04:noble 24.10:oracular 25.04:plucky 25.10:questing 26.04:resolute"
+
+# Default Ubuntu archive mirror. Per-jail override via `jroot config <name>
+# --mirror=<url>` (or --mirror on init, or JROOT_APT_MIRROR). Any http(s) host
+# works; the default is unchanged unless overridden.
+DEFAULT_APT_MIRROR="https://archive.ubuntu.com/ubuntu"
+
+# Normalize + validate a mirror base URL. Prints the canonical URL (no
+# trailing slash) or fails. Only http/https are accepted.
+normalize_apt_mirror() {
+    local m="${1%/}"
+    case "$m" in
+        http://*|https://*) printf '%s' "$m" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Effective archive mirror for a jail, in priority order:
+#   1. explicit JROOT_APT_MIRROR env override (tests, one-off runs),
+#   2. the jail's own apt_mirror field (`jroot apt config <jail> <url>`),
+#   3. the host's Ubuntu archive mirror (same LAN/campus mirror as the host),
+#   4. the builtin default.
+# Never prints garbage: anything invalid falls back to the default.
+jail_apt_mirror() {
+    local cfg="$CONFIGS_DIR/$1.json" m="${JROOT_APT_MIRROR:-}"
+    [ -n "$m" ] || { [ -f "$cfg" ] && m="$(config_field "$cfg" apt_mirror)"; }
+    if [ -z "$m" ]; then
+        m="$(host_apt_mirror 2>/dev/null || true)"
+    fi
+    [ -n "$m" ] || m="$DEFAULT_APT_MIRROR"
+    normalize_apt_mirror "$m" 2>/dev/null || printf '%s' "$DEFAULT_APT_MIRROR"
+}
+
+# Best-effort host default: the first Ubuntu archive URL in the host APT
+# config. Only URLs containing "ubuntu" qualify, so a Debian host's
+# deb.debian.org lines are never adopted for an Ubuntu jail. Prints nothing
+# when the host has no Ubuntu archive configured.
+# Test seam: JROOT_HOST_APT_DIR overrides /etc/apt.
+host_apt_mirror() {
+    local dir="${JROOT_HOST_APT_DIR:-/etc/apt}" f line url
+    for f in "$dir/sources.list" "$dir"/sources.list.d/*.list "$dir"/sources.list.d/*.sources; do
+        [ -f "$f" ] && [ -r "$f" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in \#*|'') continue ;; esac
+            url="$(printf '%s\n' "$line" | grep -oE 'https?://[^[:space:]"]+' | head -n1)"
+            case "$url" in
+                *[Uu][Bb][Uu][Nn][Tt][Uu]*) normalize_apt_mirror "$url" && return 0 ;;
+            esac
+        done < "$f"
+    done
+    return 1
+}
 ALPINE_VERSIONS="3.18 3.19 3.20 3.21 3.22 edge"
 SUPPORTED_IMAGES="ubuntu alpine"
 
@@ -2954,14 +3005,21 @@ repair_jail_resolver() {
 
 config_apt() {
     local name="$1" codename="$2"
-    local rootfs="$ROOTS_DIR/$name"
+    local rootfs="$ROOTS_DIR/$name" mirror
+    mirror="$(jail_apt_mirror "$name")"
 
     mkdir -p "$rootfs/etc/apt" "$rootfs/etc/apt/apt.conf.d" "$rootfs/etc/apt/trusted.gpg.d" "$rootfs/usr/local/bin"
 
+    # Noble+ images ship a DEB822 ubuntu.sources with the stock archive URL.
+    # Leaving it next to our legacy list makes APT see the same URI twice
+    # with different Trusted values and refuse to read any sources at all.
+    # JRoot owns the APT config, so the stock file goes.
+    rm -f "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+
     cat > "$rootfs/etc/apt/sources.list" << EOF
-deb [arch=${ROOTFS_ARCH} trusted=yes] https://mirrors.mit.edu/ubuntu/ ${codename} main restricted universe multiverse
-deb [arch=${ROOTFS_ARCH} trusted=yes] https://mirrors.mit.edu/ubuntu/ ${codename}-updates main restricted universe multiverse
-deb [arch=${ROOTFS_ARCH} trusted=yes] https://mirrors.mit.edu/ubuntu/ ${codename}-security main restricted universe multiverse
+deb [arch=${ROOTFS_ARCH} trusted=yes] ${mirror}/ ${codename} main restricted universe multiverse
+deb [arch=${ROOTFS_ARCH} trusted=yes] ${mirror}/ ${codename}-updates main restricted universe multiverse
+deb [arch=${ROOTFS_ARCH} trusted=yes] ${mirror}/ ${codename}-security main restricted universe multiverse
 EOF
 
     # deadsnakes PPA (python3.11/3.12/3.13). trusted=yes avoids the
@@ -3341,6 +3399,10 @@ show_config() {
     printf '  image:            %s\n' "$(config_field "$cfg" image)"
     printf '  user:             %s\n' "$(config_field "$cfg" user)"
     printf '  build_essential:  %s\n' "$(config_field "$cfg" build_essential)"
+    local _mirror
+    _mirror="$(jail_apt_mirror "$name")"
+    [ "$_mirror" = "$DEFAULT_APT_MIRROR" ] && _mirror="$_mirror (default)"
+    printf '  apt mirror:       %s\n' "$_mirror"
     printf '  mount_host (/):   %s   (host / at /mnt/host)\n' "$(config_field "$cfg" mount_host)"
     printf '  mount_home (~):   %s   (host $HOME at /mnt/home)\n' "$(config_field "$cfg" mount_home)"
     printf '  loopback addr:    %s\n' "${lb:-auto (assigned on first enter)}"
@@ -3768,7 +3830,13 @@ run_in_jail() {
     local jail_lb
     jail_lb="$(jail_loopback_addr "$name")"
 
-    local proot_args=(-k "$PROOT_KERNEL_RELEASE")
+    # -k fakes uname for the guest. Only pass it when JROOT_KERNEL is set
+    # explicitly: the bundled proot mishandles the override on some
+    # host/guest combos (Ubuntu 22.04 guest loader dies with EINVAL on
+    # *any* -k value, including the real release). Omitting it reports the
+    # real kernel, which works.
+    local proot_args=()
+    [ -n "${JROOT_KERNEL:-}" ] && proot_args+=(-k "$PROOT_KERNEL_RELEASE")
     # Only Termux's app-data filesystem needs PRoot link-to-symlink emulation.
     # Other no-hardlink filesystems use JRoot's private-copy lifecycle fallback
     # without changing PRoot's normal hard-link semantics.
@@ -3989,10 +4057,17 @@ run_in_jail() {
         landlock_allow /dev "$LANDLOCK_FULL"
         landlock_allow /proc "$LANDLOCK_FULL"
         landlock_allow /sys "$LANDLOCK_FULL"
-        # proot itself is exec'd from BIN_DIR *after* restrict_self, and the shim
-        # is dlopen'd from there, so read+execute here is mandatory - without it
-        # the execv() of proot fails with EACCES and nothing runs.
+        # proot itself is exec'd from BIN_DIR *after* restrict_self, and the
+        # shim is dlopen'd from there, so read+execute here is mandatory.
+        # Additionally, proot is a dynamic binary: the kernel must also open
+        # its ELF interpreter and shared libraries from the HOST. Without
+        # read+execute on those directories the execv() of proot fails with
+        # EACCES and nothing runs (observed on Debian 12 / kernel 6.1:
+        # zero warnings, just EACCES).
         landlock_allow "$BIN_DIR" "$LANDLOCK_RX"
+        for _ld in /lib64 /lib /usr/lib /usr/lib64; do
+            [ -e "$_ld" ] && landlock_allow "$_ld" "$LANDLOCK_RX"
+        done
         # proot builds its "glue rootfs" in a temp dir on the HOST before it can
         # run anything. Without write access there it dies with
         #   can't create temporary directory: Permission denied
@@ -4309,7 +4384,7 @@ require_unroot_protection() {
 cmd_init() {
     local image="" repo tag version codename name user_mode response distro=""
     local mount_host=0 mount_home=0 build_essential=1 persistent=0
-    local cli_name="" cli_user="" cli_be="" cli_mh="" cli_mhomedir="" cli_persistent=""
+    local cli_name="" cli_user="" cli_be="" cli_mh="" cli_mhomedir="" cli_persistent="" cli_mirror=""
 
         while [ $# -gt 0 ]; do
         case "$1" in
@@ -4320,7 +4395,12 @@ cmd_init() {
             --mount-host=*)         cli_mh="${1#*=}" ;;
             --mount-home=*)         cli_mhomedir="${1#*=}" ;;
             --persistent=*)         cli_persistent="${1#*=}" ;;
-            -h|--help)              err "Usage: jroot init <image> [--pull|-p] [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1] [--persistent=0/1]\n       jroot init --list  (show available images)" ;;
+            --mirror=*)
+                if [ -n "${1#*=}" ]; then
+                    cli_mirror="$(normalize_apt_mirror "${1#*=}")" \
+                        || err "Mirror must be an http(s) URL, got: ${1#*=}"
+                fi ;;
+            -h|--help)              err "Usage: jroot init <image> [--pull|-p] [--name=<n>] [--user=root|unroot] [--build-essential=0/1] [--mount-host=0/1] [--mount-home=0/1] [--persistent=0/1] [--mirror=<url>]\n       jroot init --list  (show available images)" ;;
             *)                      [ -z "$image" ] && image="$1" || err "Unexpected argument: $1" ;;
         esac
         shift
@@ -4436,6 +4516,9 @@ cmd_init() {
     write_rootfs_niceties "$name"
     write_config "$name" "$image" "$user_mode" "$mount_host" "$mount_home" "$build_essential"
     set_config_field "$CONFIGS_DIR/$name.json" persistent "$persistent" || err "Could not set persistent mode."
+    if [ -n "$cli_mirror" ]; then
+        set_config_field "$CONFIGS_DIR/$name.json" apt_mirror "$cli_mirror" || err "Could not set apt mirror."
+    fi
     record_event "$name" "created" \
         "$image user=$user_mode build_essential=$build_essential mount_host=$mount_host mount_home=$mount_home persistent=$persistent"
     trigger_event_hooks "on_init" "$name" "$image"
@@ -6986,7 +7069,7 @@ PLUGIN_API_VERSION=1
 
 is_reserved_command() {
     case "$1" in
-        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|apt|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -7054,7 +7137,7 @@ except Exception as exc:
     print(f"Invalid plugin.json: {exc}", file=sys.stderr)
     raise SystemExit(1)
 errors = []
-reserved = {"init","build","enter","exec","persist","service","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","volume","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","clone","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","completion","completions","plugin","help","data","logs","status","registry"}
+reserved = {"init","build","enter","exec","persist","service","shell","install","file","sync","limit","bundle","deploy","monitor","compose","port","net","mnt","mount","volume","config","list","ls","info","history","compare","diff","which","size","update","clean","snapshot","snapshots","clone","checkpoint","checkpoints","revert","rm-snapshot","rm-checkpoint","doctor","rm","delete","rename","kill","stop","ps","ssh","apt","completion","completions","plugin","help","data","logs","status","registry"}
 
 name = manifest.get("name")
 if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
@@ -7642,6 +7725,72 @@ cmd_list() {
         build_essential="$(config_field "$cfg" build_essential)"; [ -n "$build_essential" ] || build_essential=1
         printf '%-16s %-14s %-8s %-5s %-5s %-5s %s\n' "$name" "${image:-?}" "$user_mode" "$mount_host" "$mount_home" "$build_essential" "$ROOTS_DIR/$name"
     done
+}
+
+# ---------------------------------------------------------------------------
+# APT mirror management: `jroot apt config <jail> [reset|<url>]`
+# ---------------------------------------------------------------------------
+cmd_apt() {
+    [ $# -ge 1 ] || err "Usage: jroot apt config <jail> [reset|<url>]"
+    case "$1" in
+        config) shift; cmd_apt_config "$@" ;;
+        ""|-h|--help) err "Usage: jroot apt config <jail> [reset|<url>]" ;;
+        *) err "Unknown apt command: $1 (try 'jroot help apt')" ;;
+    esac
+}
+
+cmd_apt_config() {
+    [ $# -ge 1 ] || err "Usage: jroot apt config <jail> [reset|<url>]"
+    local name="$1"; shift
+    local cfg="$CONFIGS_DIR/$name.json"
+    [ -f "$cfg" ] || err "Jail '$name' not found. Run 'jroot list' to see jails."
+
+    if [ $# -eq 0 ]; then
+        local cur src host
+        cur="$(jail_apt_mirror "$name")"
+        src="builtin default"
+        if [ -n "${JROOT_APT_MIRROR:-}" ]; then
+            src="JROOT_APT_MIRROR env override"
+        elif [ -n "$(config_field "$cfg" apt_mirror)" ]; then
+            src="this jail's setting"
+        else
+            host="$(host_apt_mirror 2>/dev/null || true)"
+            [ -n "$host" ] && src="host default"
+        fi
+        printf 'mirror: %s\nsource: %s\n' "$cur" "$src"
+        return 0
+    fi
+
+    local image repo tag codename
+    image="$(config_field "$cfg" image)"
+    repo="${image%%:*}"
+    [ "$repo" = "ubuntu" ] || err "apt mirror only applies to Ubuntu jails (jail '$name' is '$repo')."
+    tag="${image#*:}"
+    if codename="$(version_to_codename "$tag" 2>/dev/null)"; then
+        :
+    elif codename_to_version "$tag" >/dev/null 2>&1; then
+        codename="$tag"
+    else
+        err "Cannot determine the Ubuntu codename for image '$image'."
+    fi
+
+    case "$1" in
+        reset)
+            set_config_field "$cfg" apt_mirror "" >/dev/null 2>&1 || err "Could not reset the mirror."
+            record_event "$name" "apt" "mirror reset to default" >/dev/null 2>&1 || true
+            ;;
+        *)
+            local url
+            url="$(normalize_apt_mirror "$1")" \
+                || err "Mirror must be an http(s) URL, got: $1"
+            set_config_field "$cfg" apt_mirror "$url" >/dev/null 2>&1 \
+                || err "Could not save the mirror."
+            record_event "$name" "apt" "mirror set to $url" >/dev/null 2>&1 || true
+            ;;
+    esac
+    config_apt "$name" "$codename"
+    log "APT mirror for '$name' is now $(jail_apt_mirror "$name") (sources.list rewritten)."
+    log "Run 'jroot exec $name apt-get update' to use it."
 }
 
 cmd_config() {
@@ -10466,6 +10615,15 @@ cmd_help_cmd() {
             printf '\n    Persistent mode is off by default, so an ordinary jail ends its process tree\n'
             printf '    when its session exits. Enable it before registering services.\n'
             ;;
+        apt)
+            printf '%bjroot apt%b - manage a jail'"'"'s Ubuntu archive mirror\n\n' "$H" "$N"
+            printf '    %bjroot apt config <name>%b                 (show effective mirror + source)\n' "$G" "$N"
+            printf '    %bjroot apt config <name> <url>%b          (set any http(s) mirror, rewrites sources.list)\n' "$G" "$N"
+            printf '    %bjroot apt config <name> reset%b          (drop the override, back to host/builtin default)\n' "$G" "$N"
+            printf '\n    With no override the jail inherits your host'"'"'s Ubuntu mirror when the host\n'
+            printf '    has one configured, otherwise the builtin default. Run apt-get update\n'
+            printf '    inside the jail afterwards to use the new mirror.\n'
+            ;;
         list|ls)
             printf '%bjroot list%b - list all jails\n\n' "$H" "$N"
             printf '    %bjroot list%b\n' "$G" "$N"
@@ -10645,6 +10803,7 @@ cmd_help() {
     help_row "jroot mnt" "<name> <label> <dir>"   "Bind-mount a host directory at /mnt/<label>"
     help_row "jroot volume" "<name> create|attach|detach|..." "Manage JRoot-owned storage"
     help_row "jroot ssh" "<name> start|stop|status" "SSH access into a jail (persistent daemon)"
+    help_row "jroot apt" "config <name> [reset|<url>]" "View or set a jail's Ubuntu archive mirror"
     help_row "jroot install" "<name> <pkg...>"     "Install packages inside a jail (apt/apk)"
     help_row "jroot config" "<name>"               "View or change a jail's settings (including persistence)"
     help_row "jroot list" "[--json]"               "List all jails (JSON with --json)"
@@ -10677,6 +10836,7 @@ cmd_help() {
     help_row "jroot kill" "<name>"      "Terminate a running jail"
     help_row "jroot ps" ""              "List running jails"
     help_row "jroot ssh" "<name> start|stop|status" "SSH access into a jail (persistent daemon)"
+    help_row "jroot apt" "config <name> [reset|<url>]" "View or set a jail's Ubuntu archive mirror"
     help_row "jroot completion" "bash|zsh|fish" "Print a shell completion script"
     help_row "jroot plugin" "[list|install|rm]"  "Manage and execute plugins"
     help_row "jroot help" "[command]"     "Show help (for one command too)"
@@ -10692,6 +10852,7 @@ cmd_help() {
     help_row "--mount-host=0/1" ""        "Bind host / to /mnt/host (default 0)"
     help_row "--mount-home=0/1" ""        "Bind host \$HOME to /mnt/home (default 0)"
     help_row "--persistent=0/1" ""        "Opt into retained sessions (default 0)"
+    help_row "--mirror=<url>" ""          "Ubuntu archive mirror (default: host mirror, else builtin)"
     printf '\n'
 
     printf '%bSUPPORTED IMAGES%b\n' "$H" "$N"
@@ -10766,7 +10927,7 @@ _jroot_home() { printf '%s' "${JROOT_HOME:-$HOME/.jroot}"; }
 
 _jroot_reserved_name() {
     case "$1" in
-        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|apt|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -10945,7 +11106,7 @@ _jroot() {
     COMPREPLY=()
 
     local cmds="init build enter exec persist service shell install config file sync limit bundle deploy monitor compose
-        port net mnt mount volume ssh list ls info size history logs compare diff which doctor snapshot
+        port net mnt mount volume ssh apt list ls info size history logs compare diff which doctor snapshot
         snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill
         stop ps rm delete completion completions help plugin"
 
@@ -10978,7 +11139,7 @@ alpine:3.22 alpine:edge" -- "$cur"))
             else
                 COMPREPLY=($(compgen -W "--name= --user=root --user=unroot
 --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1
---mount-home=0 --mount-home=1 --persistent=0 --persistent=1" -- "$cur"))
+--mount-home=0 --mount-home=1 --persistent=0 --persistent=1 --mirror=" -- "$cur"))
             fi
             ;;
         enter|exec)
@@ -11142,6 +11303,13 @@ alpine:3.22 alpine:edge" -- "$cur"))
                    fi ;;
             esac
             ;;
+        apt)
+            case "$idx" in
+                2) COMPREPLY=($(compgen -W "config" -- "$cur")) ;;
+                3) COMPREPLY=($(compgen -W "$jails" -- "$cur")) ;;
+                4) COMPREPLY=($(compgen -W "reset" -- "$cur")) ;;
+            esac
+            ;;
         revert)
             case "$idx" in
                 2) COMPREPLY=($(compgen -W "snapshot checkpoint" -- "$cur")) ;;
@@ -11257,7 +11425,7 @@ _jroot_home() { print -r -- "${JROOT_HOME:-$HOME/.jroot}" }
 
 _jroot_reserved_name() {
     case "$1" in
-        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|completion|completions|plugin|help|data|logs|status|registry)
+        init|build|enter|exec|persist|service|shell|install|file|sync|limit|bundle|deploy|monitor|compose|port|net|mnt|mount|volume|config|list|ls|info|history|compare|diff|which|size|update|clean|snapshot|snapshots|clone|checkpoint|checkpoints|revert|rm-snapshot|rm-checkpoint|doctor|rm|delete|rename|kill|stop|ps|ssh|apt|completion|completions|plugin|help|data|logs|status|registry)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -11409,6 +11577,7 @@ _jroot() {
         'mount:alias for mnt'
         'volume:managed persistent storage for a jail'
         'ssh:SSH access into a jail'
+        'apt:manage a jail APT mirror'
         'list:list all jails'
         'ls:alias for list'
         'info:show jail details'
@@ -11466,7 +11635,7 @@ _jroot() {
                         alpine:3.21 alpine:3.22 alpine:edge)
                 compadd -- $images
             else
-                compadd -S '' -- --name= --user= --build-essential= --mount-host= --mount-home= --persistent=
+                compadd -S '' -- --name= --user= --build-essential= --mount-host= --mount-home= --persistent= --mirror=
             fi
             ;;
         enter|exec)
@@ -11581,6 +11750,13 @@ _jroot() {
                    fi ;;
             esac
             ;;
+        apt)
+            case $pos in
+                2) compadd -- config ;;
+                3) _jroot_jails ;;
+                4) compadd -- reset ;;
+            esac
+            ;;
         revert)
             case $pos in
                 2) compadd -- snapshot checkpoint ;;
@@ -11678,7 +11854,7 @@ end
 # 'ls' rather than a glob: an unmatched glob is an error in fish, and "no jails
 # yet" is a completely normal state.
 function __jroot_reserved_name -a name
-    contains -- $name init build enter exec persist service shell install file sync limit bundle deploy monitor compose port net mnt mount volume config list ls info history compare diff which size update clean snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh completion completions plugin help data logs status registry
+    contains -- $name init build enter exec persist service shell install file sync limit bundle deploy monitor compose port net mnt mount volume config list ls info history compare diff which size update clean snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint doctor rm delete rename kill stop ps ssh apt completion completions plugin help data logs status registry
 end
 
 function __jroot_jails
@@ -11858,6 +12034,7 @@ complete -c jroot -n '__jroot_at 1' -a mnt         -d 'Bind-mount a host directo
 complete -c jroot -n '__jroot_at 1' -a mount       -d 'Alias for mnt'
 complete -c jroot -n '__jroot_at 1' -a volume      -d 'Managed persistent storage'
 complete -c jroot -n '__jroot_at 1' -a ssh         -d 'SSH access into a jail'
+complete -c jroot -n '__jroot_at 1' -a apt         -d 'Manage a jail APT mirror'
 complete -c jroot -n '__jroot_at 1' -a list        -d 'List all jails'
 complete -c jroot -n '__jroot_at 1' -a ls          -d 'Alias for list'
 complete -c jroot -n '__jroot_at 1' -a info        -d 'Show jail details'
@@ -11904,7 +12081,7 @@ complete -c jroot -n '__jroot_is revert; and __jroot_arg_is 2 checkpoint; and __
 complete -c jroot -n '__jroot_is build; and __jroot_at 2' -a '--file= --tag= --build-arg= --no-cache' -F
 complete -c jroot -n '__jroot_is build; and __jroot_from 3' -a '-f --file= -t --tag= --build-arg= --no-cache' -F
 complete -c jroot -n '__jroot_is init; and __jroot_at 2' -a '--list ubuntu:16.04 ubuntu:18.04 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 ubuntu:24.10 alpine:3.19 alpine:3.20 alpine:3.21 alpine:3.22 alpine:edge'
-complete -c jroot -n '__jroot_is init; and __jroot_from 3' -a '--name= --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1 --persistent=0 --persistent=1'
+complete -c jroot -n '__jroot_is init; and __jroot_from 3' -a '--name= --user=root --user=unroot --build-essential=0 --build-essential=1 --mount-host=0 --mount-host=1 --mount-home=0 --mount-home=1 --persistent=0 --persistent=1 --mirror='
 
 # enter / exec / config
 complete -c jroot -n '__jroot_is enter exec; and __jroot_from 3' -a --root
@@ -11947,6 +12124,9 @@ complete -c jroot -n '__jroot_is volume; and __jroot_arg_is 3 create attach set;
 # --port=22001 and not --port 22001.
 complete -c jroot -n '__jroot_is ssh; and __jroot_at 3' -a 'start stop status passwd log'
 complete -c jroot -n '__jroot_is ssh; and __jroot_arg_is 3 start' -a '--password-stdin --random-password --ask-password --no-password --permit-root --port= --user= --key= --password='
+complete -c jroot -n '__jroot_is apt; and __jroot_at 2' -a config -d 'Configure the archive mirror'
+complete -c jroot -n '__jroot_is apt; and __jroot_arg_is 2 config; and __jroot_at 3' -a '(__jroot_jails)' -d Jail
+complete -c jroot -n '__jroot_is apt; and __jroot_arg_is 2 config; and __jroot_at 4' -a reset -d 'Reset to the default mirror'
 
 # snapshots, checkpoints, and plugins
 complete -c jroot -n '__jroot_is clone; and __jroot_at 2' -a 'checkpoint snapshot'
@@ -11973,7 +12153,7 @@ complete -c jroot -n '__jroot_is which; and __jroot_from 3' -a --all
 complete -c jroot -n '__jroot_is kill stop; and __jroot_from 3' -a --force
 complete -c jroot -n '__jroot_is doctor' -a '--fix --mute=7d --mute=forever --mute=off'
 complete -c jroot -n '__jroot_is completion completions; and __jroot_at 2' -a 'bash zsh fish'
-complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec persist service shell install config file sync limit bundle deploy monitor compose port net mnt mount volume ssh list ls info size history logs compare diff which doctor snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
+complete -c jroot -n '__jroot_is help; and __jroot_at 2' -a 'init build enter exec persist service shell install config file sync limit bundle deploy monitor compose port net mnt mount volume ssh apt list ls info size history logs compare diff which doctor snapshot snapshots clone checkpoint checkpoints revert rm-snapshot rm-checkpoint update clean rename kill stop ps rm delete completion completions plugin help'
 complete -c jroot -n '__jroot_is help; and __jroot_at 3; and __jroot_arg_is 2 file' -a 'cp mv'
 FISH_COMPLETION_EOF
 }
@@ -12024,6 +12204,7 @@ jroot_cmd() {
         kill|stop)     shift; cmd_kill "$@" ;;
         ps)            shift; cmd_ps "$@" ;;
         ssh)           shift; cmd_ssh "$@" ;;
+        apt)           shift; cmd_apt "$@" ;;
         completion|completions) shift; cmd_completion "$@" ;;
         plugin)        shift; cmd_plugin "$@" ;;
         help|--help|-h) shift; cmd_help "$@" ;;
