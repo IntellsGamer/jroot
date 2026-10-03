@@ -344,6 +344,25 @@ JRoot's job is not to invent another Linux package manager.
 
 Its job is to make the existing one work in a rootless userspace.
 
+### APT mirror
+
+No mirror is hardcoded. With no override, a jail inherits your host's Ubuntu
+archive mirror when the host has one configured, otherwise a builtin default.
+Point a jail at any `http(s)` mirror — plain `http` is accepted, `https` is
+not forced:
+
+```bash
+jroot apt config dev                            # show effective mirror + source
+jroot apt config dev http://archive.ubuntu.com/ubuntu
+jroot apt config dev https://mirror.example/ubuntu/
+jroot apt config dev reset                      # drop the override
+jroot init ubuntu:22.04 --mirror=http://archive.ubuntu.com/ubuntu
+```
+
+Setting a mirror rewrites the jail's `sources.list` immediately; run
+`apt-get update` inside afterwards. Invalid URLs are rejected, and a stored
+invalid value falls back to the default instead of poisoning APT.
+
 ---
 
 # 🌐 Networking
@@ -1258,6 +1277,13 @@ jroot doctor --fix
 ```
 
 The normal diagnostic recommends `--fix` only when it finds a real fault. Capability notices such as a missing compiler, unavailable Landlock support, or an intentionally muted warning do not trigger that recommendation.
+
+### Launch compatibility notes
+
+Two environment-sensitive behaviors and their overrides:
+
+* **Kernel version.** JRoot reports the host's real kernel to guests by default. If a guest needs a different version string, opt in explicitly: `JROOT_KERNEL=6.8.0 jroot enter dev`. (An unconditional fake version broke some guest loaders, so faking is now opt-in only.)
+* **Landlock + dynamic proot.** The Landlock policy allowlists the host loader/library directories proot itself needs to start; without those, launching fails with a bare `Permission denied` and no other message. If the policy still misbehaves on your kernel, `JROOT_LANDLOCK_OFF=1` skips that layer (seccomp + proot still apply).
 
 ---
 
