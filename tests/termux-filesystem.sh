@@ -3,6 +3,7 @@
 # filesystems can reject archive or rsync hard links. Every lifecycle path must
 # still work by materializing independent private file copies.
 set -euo pipefail
+trap 'printf "termux-filesystem FAILED at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/jroot-termux-test.XXXXXX")"
