@@ -3010,6 +3010,12 @@ config_apt() {
 
     mkdir -p "$rootfs/etc/apt" "$rootfs/etc/apt/apt.conf.d" "$rootfs/etc/apt/trusted.gpg.d" "$rootfs/usr/local/bin"
 
+    # Noble+ images ship a DEB822 ubuntu.sources with the stock archive URL.
+    # Leaving it next to our legacy list makes APT see the same URI twice
+    # with different Trusted values and refuse to read any sources at all.
+    # JRoot owns the APT config, so the stock file goes.
+    rm -f "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+
     cat > "$rootfs/etc/apt/sources.list" << EOF
 deb [arch=${ROOTFS_ARCH} trusted=yes] ${mirror}/ ${codename} main restricted universe multiverse
 deb [arch=${ROOTFS_ARCH} trusted=yes] ${mirror}/ ${codename}-updates main restricted universe multiverse

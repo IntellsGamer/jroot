@@ -21,6 +21,10 @@ ensure_runtime
 
 mkdir -p "$ROOTS_DIR/m1"
 printf '{"name":"m1","image":"ubuntu:22.04","user":"root"}\n' > "$CONFIGS_DIR/m1.json"
+# A Noble-style stock DEB822 file with the same URL must not survive next to
+# our legacy list: APT rejects the duplicate URI (Trusted conflict).
+mkdir -p "$ROOTS_DIR/m1/etc/apt/sources.list.d"
+printf 'Types: deb\nURIs: https://archive.ubuntu.com/ubuntu\nSuites: jammy jammy-updates\n' > "$ROOTS_DIR/m1/etc/apt/sources.list.d/ubuntu.sources"
 
 # Fake host APT config: one Ubuntu mirror (http, not https) plus Debian noise
 # and a commented-out line that must be ignored.
@@ -47,9 +51,11 @@ JROOT_HOST_APT_DIR="$TMP/debian-apt" host_apt_mirror && { printf 'debian host pr
 export JROOT_HOST_APT_DIR="$TMP/host-apt"
 
 # 3) explicit jail setting beats the host default; trailing slash stripped.
+# The stock DEB822 file is removed so its duplicate URI cannot clash.
 set_config_field "$CONFIGS_DIR/m1.json" apt_mirror "https://mirror.example/ubuntu/"
 [ "$(jail_apt_mirror m1)" = "https://mirror.example/ubuntu" ]
 config_apt m1 jammy
+[ ! -e "$ROOTS_DIR/m1/etc/apt/sources.list.d/ubuntu.sources" ]
 grep -qx 'deb \[arch=amd64 trusted=yes\] https://mirror.example/ubuntu/ jammy main restricted universe multiverse' "$ROOTS_DIR/m1/etc/apt/sources.list"
 grep -qx 'deb \[arch=amd64 trusted=yes\] https://mirror.example/ubuntu/ jammy-security main restricted universe multiverse' "$ROOTS_DIR/m1/etc/apt/sources.list"
 
