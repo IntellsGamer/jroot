@@ -54,9 +54,13 @@ trigger_event_hooks() { :; }
 fixture="$TMP/rootfs"
 mkdir -p "$fixture/etc" "$fixture/bin" "$fixture/usr/bin"
 printf 'NAME=Termux fixture\n' > "$fixture/etc/os-release"
-# Ubuntu base archives often carry this link, but /run does not yet exist when
-# JRoot configures a fresh rootfs. Termux must receive a plain copied resolver.
-ln -s /run/systemd/resolve/stub-resolv.conf "$fixture/etc/resolv.conf"
+# Ubuntu base archives often carry a symlink into /run, which does not exist
+# when JRoot configures a fresh rootfs. Termux must receive a plain copied
+# resolver. The target is deliberately fake-but-absent (not the real
+# stub-resolv.conf): repair only touches DANGLING links, and on hosts with
+# systemd-resolved the realistic target resolves, making this test
+# host-dependent.
+ln -s /run/systemd/resolve/jroot-test-absent-stub "$fixture/etc/resolv.conf"
 printf '#!/bin/sh\nexit 0\n' > "$fixture/bin/sh"
 chmod +x "$fixture/bin/sh"
 printf 'shared program data\n' > "$fixture/usr/bin/tool"
@@ -78,7 +82,7 @@ rootfs="$ROOTS_DIR/termux-init"
 # Existing Termux jails created before the repair are healed on their next run
 # only when their resolver remains the broken image-default symlink.
 rm -f "$rootfs/etc/resolv.conf"
-ln -s /run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf"
+ln -s /run/systemd/resolve/jroot-test-absent-stub "$rootfs/etc/resolv.conf"
 repair_jail_resolver termux-init
 [ -f "$rootfs/etc/resolv.conf" ]
 [ ! -L "$rootfs/etc/resolv.conf" ]
@@ -87,7 +91,7 @@ grep -qx 'nameserver 1.1.1.1' "$rootfs/etc/resolv.conf"
 # When Termux has no readable resolver file, Android DNS properties supply the
 # nameservers instead of leaving the jail without networking.
 rm -f "$rootfs/etc/resolv.conf"
-ln -s /run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf"
+ln -s /run/systemd/resolve/jroot-test-absent-stub "$rootfs/etc/resolv.conf"
 JROOT_HOST_RESOLV_CONF="$TMP/no-such-resolver" repair_jail_resolver termux-init
 grep -qx 'nameserver 10.23.0.1' "$rootfs/etc/resolv.conf"
 grep -qx 'nameserver 10.23.0.2' "$rootfs/etc/resolv.conf"
