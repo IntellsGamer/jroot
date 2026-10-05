@@ -1,0 +1,21 @@
+{
+  "api_version": 1,
+  "name": "ssh-guard",
+  "version": "0.1.0",
+  "description": "Watches jail SSH daemons: restarts nothing, but reports dead daemons and brute-force offenders, with optional auto-stop.",
+  "author": "IntellsGamer",
+  "entrypoint": "main.py",
+  "hooks": [
+    "on_stop",
+    "on_watch"
+  ],
+  "permissions": [
+    "jails.read",
+    "state.read",
+    "state.write"
+  ],
+  "requires": {
+    "python": ">=3.8",
+    "commands": ["python3"]
+  }
+}
