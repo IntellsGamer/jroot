@@ -4305,19 +4305,37 @@ verify_jail() {
 # ---------------------------------------------------------------------------
 setup_unroot_user() {
     local name="$1"
-    local host_uid host_gid
+    local host_uid host_gid want_uid
     host_uid="$(id -u)"; host_gid="$(id -g)"
-    log "Setting up non-root user for '$name' (uid $host_uid, root gets locked)..."
+    want_uid="$host_uid"
+    # A uid-0 invoker (real root or any uid-0 account) must NOT produce a
+    # uid-0 "jail" user: sshd treats every uid-0 login as root, and unroot
+    # jails ship PermitRootLogin no, so SSH as jail fails with "Permission
+    # denied" while root-mode jails work fine. Fall back to the first free
+    # uid >= 1000 inside the jail instead (JROOT_JAIL_UID pins one).
+    if [ "$host_uid" = "0" ] && [ -z "${JROOT_JAIL_UID:-}" ]; then
+        want_uid="auto"
+    elif [ -n "${JROOT_JAIL_UID:-}" ]; then
+        want_uid="$JROOT_JAIL_UID"
+    fi
+    log "Setting up non-root user for '$name' (uid $want_uid, root gets locked)..."
     run_in_jail --root "$name" /bin/sh -c "
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        # Match the host uid so whoami resolves inside the jail.
-        useradd -o -m -u $host_uid -s /bin/bash jail 2>/dev/null || true
+        # Match the host uid so whoami resolves inside the jail - unless the
+        # invoker is uid 0, where the first free uid >= 1000 is used (see above).
+        _uid=$want_uid
+        if [ \"\$_uid\" = auto ]; then
+            _uid=1000
+            while getent passwd \"\$_uid\" >/dev/null 2>&1; do _uid=\$((_uid + 1)); done
+        fi
+        useradd -o -m -u \"\$_uid\" -s /bin/bash jail 2>/dev/null || true
         mkdir -p /home/jail 2>/dev/null || true
-        chown $host_uid:$host_gid /home/jail 2>/dev/null || true
+        _gid=\$(id -g jail 2>/dev/null || echo $host_gid)
+        chown \"\$_uid:\$_gid\" /home/jail 2>/dev/null || true
         cp -f /root/.bashrc /home/jail/.bashrc 2>/dev/null || true
         cp -f /root/.profile /home/jail/.profile 2>/dev/null || true
-        chown $host_uid:$host_gid /home/jail/.bashrc 2>/dev/null || true
-        chown $host_uid:$host_gid /home/jail/.profile 2>/dev/null || true
+        chown \"\$_uid:\$_gid\" /home/jail/.bashrc 2>/dev/null || true
+        chown \"\$_uid:\$_gid\" /home/jail/.profile 2>/dev/null || true
         passwd -l root 2>/dev/null || true
         echo UNROOT-READY
     " || warn "Could not create non-root user in '$name'."
@@ -4328,19 +4346,33 @@ setup_unroot_user() {
 
 setup_unroot_alpine() {
     local name="$1"
-    local host_uid host_gid
+    local host_uid host_gid want_uid
     host_uid="$(id -u)"; host_gid="$(id -g)"
-    log "Setting up non-root user for '$name' (uid $host_uid, root gets locked)..."
+    want_uid="$host_uid"
+    # Same uid-0 rule as setup_unroot_user: never create a uid-0 "jail" user,
+    # sshd would treat it as root and block it under PermitRootLogin no.
+    if [ "$host_uid" = "0" ] && [ -z "${JROOT_JAIL_UID:-}" ]; then
+        want_uid="auto"
+    elif [ -n "${JROOT_JAIL_UID:-}" ]; then
+        want_uid="$JROOT_JAIL_UID"
+    fi
+    log "Setting up non-root user for '$name' (uid $want_uid, root gets locked)..."
     run_in_jail --root "$name" /bin/sh -c "
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         # Alpine uses adduser (busybox or shadow)
-        adduser -D -u $host_uid -s /bin/bash jail 2>/dev/null || true
+        _uid=$want_uid
+        if [ \"\$_uid\" = auto ]; then
+            _uid=1000
+            while getent passwd \"\$_uid\" >/dev/null 2>&1; do _uid=\$((_uid + 1)); done
+        fi
+        adduser -D -u \"\$_uid\" -s /bin/bash jail 2>/dev/null || true
         mkdir -p /home/jail 2>/dev/null || true
-        chown $host_uid:$host_gid /home/jail 2>/dev/null || true
+        _gid=\$(id -g jail 2>/dev/null || echo $host_gid)
+        chown \"\$_uid:\$_gid\" /home/jail 2>/dev/null || true
         cp -f /root/.profile /home/jail/.profile 2>/dev/null || true
         cp -f /root/.bashrc /home/jail/.bashrc 2>/dev/null || true
-        chown $host_uid:$host_gid /home/jail/.profile 2>/dev/null || true
-        chown $host_uid:$host_gid /home/jail/.bashrc 2>/dev/null || true
+        chown \"\$_uid:\$_gid\" /home/jail/.profile 2>/dev/null || true
+        chown \"\$_uid:\$_gid\" /home/jail/.bashrc 2>/dev/null || true
         # Also ensure /home/jail/.profile sources .bashrc
         cat > /home/jail/.profile << 'EOFPROFILE'
 # ~/.profile: executed by Bourne-compatible login shells.
@@ -4348,7 +4380,7 @@ if [ -n \"\$BASH\" ] && [ -f ~/.bashrc ]; then
     . ~/.bashrc
 fi
 EOFPROFILE
-        chown $host_uid:$host_gid /home/jail/.profile 2>/dev/null || true
+        chown \"\$_uid:\$_gid\" /home/jail/.profile 2>/dev/null || true
         # Lock root (Alpine uses /etc/shadow)
         passwd -l root 2>/dev/null || true
         echo UNROOT-READY
