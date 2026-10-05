@@ -2586,6 +2586,15 @@ def display(final=False):
 
 def copy_file(src, dst, *, follow_symlinks=True):
     global done, last
+    try:
+        if not stat.S_ISREG(os.lstat(src).st_mode):
+            # Sockets, fifos and device nodes cannot be copied (e.g. a live
+            # D-Bus socket bound into the jail's /run). The rsync checkpoint
+            # path skips such files the same way; dying here would make
+            # checkpoints impossible while any daemon runs.
+            return dst
+    except OSError:
+        return dst
     if not show:
         return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
     with open(src, "rb") as inp, open(dst, "wb") as out:
@@ -10377,7 +10386,7 @@ cmd_checkpoint() {
         # immutable and lets normal init/checkpoint/clone workflows work.
         private_copy_tree "$ROOTS_DIR/$name" "$target" "$guard_rel" "$shim_rel" || {
             rm -rf "$target"
-            err "Checkpoint failed. On Termux, install Python with: pkg install python"
+            err "Checkpoint failed while copying the rootfs (see errors above). On Termux this often means Python is missing: pkg install python"
         }
     fi
     cp "$CONFIGS_DIR/$name.json" "$target.json"
