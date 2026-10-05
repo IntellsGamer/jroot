@@ -59,4 +59,15 @@ restore_checkpoint_now "$name" baseline
 printf 'after-restore\n' > "$ROOTS_DIR/$name/etc/state.txt"
 [ "$(cat "$SNAPSHOTS_DIR/$name/checkpoints/baseline/etc/state.txt")" = "original" ]
 
+# Live runtime specials (a D-Bus socket bound into /run, a fifo) must not
+# abort the copy: like the rsync path, they are skipped, regular files land.
+mkdir -p "$ROOTS_DIR/$name/run/user/0" "$ROOTS_DIR/$name/tmp"
+python3 -c 'import socket; s=socket.socket(socket.AF_UNIX); s.bind("'"$ROOTS_DIR/$name"'/run/user/0/bus")'
+mkfifo "$ROOTS_DIR/$name/tmp/test-fifo"
+printf 'payload\n' > "$ROOTS_DIR/$name/tmp/normal.txt"
+private_copy_tree "$ROOTS_DIR/$name" "$TMP/sock-copy"
+[ "$(cat "$TMP/sock-copy/tmp/normal.txt")" = "payload" ]
+[ ! -e "$TMP/sock-copy/run/user/0/bus" ]
+[ ! -e "$TMP/sock-copy/tmp/test-fifo" ]
+
 printf '  ok    checkpoint contents remain isolated from live-jail writes and checkpoint diff output\n'
